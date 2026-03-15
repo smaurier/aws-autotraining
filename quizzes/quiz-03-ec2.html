@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Quiz 03 — EC2</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #1a1a2e; color: #e0e0e0; min-height: 100vh; padding: 2rem 1rem; }
+    .container { max-width: 800px; margin: 0 auto; }
+    h1 { text-align: center; margin-bottom: 0.5rem; font-size: 1.8rem; color: #ffffff; }
+    .subtitle { text-align: center; color: #8892b0; margin-bottom: 2rem; font-size: 1rem; }
+    .progress-bar-container { background: #0d1117; border-radius: 10px; height: 14px; margin-bottom: 2rem; overflow: hidden; }
+    .progress-bar { background: linear-gradient(90deg, #0d6efd, #4dabf7); height: 100%; width: 0%; border-radius: 10px; transition: width 0.4s ease; }
+    .progress-text { text-align: center; color: #8892b0; margin-bottom: 1rem; font-size: 0.9rem; }
+    .card { background: #16213e; border-radius: 12px; padding: 2rem; margin-bottom: 1.5rem; box-shadow: 0 4px 20px rgba(0,0,0,0.3); }
+    .question-label { font-size: 0.85rem; color: #4dabf7; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 0.5rem; }
+    .question-text { font-size: 1.15rem; margin-bottom: 1.2rem; line-height: 1.5; color: #ffffff; }
+    .hint { font-size: 0.85rem; color: #f0ad4e; margin-bottom: 1rem; }
+    pre { background: #0d1117; border: 1px solid #30363d; border-radius: 8px; padding: 1rem; margin-bottom: 1.2rem; overflow-x: auto; font-size: 0.95rem; }
+    code { font-family: 'Consolas', 'Fira Code', 'Courier New', monospace; color: #c9d1d9; }
+    .options { list-style: none; }
+    .options li { margin-bottom: 0.5rem; }
+    .options label { display: flex; align-items: center; gap: 0.75rem; padding: 0.8rem 1rem; background: #0d1117; border: 2px solid #30363d; border-radius: 8px; cursor: pointer; transition: border-color 0.2s, background 0.2s; font-size: 1rem; }
+    .options label:hover { border-color: #4dabf7; background: #1c2a4a; }
+    .options input[type="radio"], .options input[type="checkbox"] { accent-color: #0d6efd; width: 18px; height: 18px; flex-shrink: 0; }
+    .btn { display: inline-block; padding: 0.7rem 2rem; border: none; border-radius: 8px; font-size: 1rem; font-weight: 600; cursor: pointer; transition: background 0.2s, transform 0.1s; }
+    .btn-primary { background: #0d6efd; color: #fff; }
+    .btn-primary:hover { background: #3b82f6; }
+    .btn-primary:disabled { background: #374151; cursor: not-allowed; }
+    .btn-restart { background: #238636; color: #fff; margin-top: 1rem; padding: 0.7rem 2rem; border: none; border-radius: 8px; font-size: 1rem; font-weight: 600; cursor: pointer; }
+    .btn-restart:hover { background: #2ea043; }
+    .feedback { margin-top: 1rem; padding: 1rem 1.2rem; border-radius: 8px; font-size: 0.95rem; line-height: 1.5; display: none; }
+    .feedback.correct { background: #0f5132; border: 1px solid #198754; color: #d1fae5; display: block; }
+    .feedback.wrong { background: #842029; border: 1px solid #dc3545; color: #fdd; display: block; }
+    .score-card { text-align: center; padding: 3rem 2rem; }
+    .score-card .score { font-size: 3rem; font-weight: 700; color: #4dabf7; margin-bottom: 0.5rem; }
+    .score-card .score-label { font-size: 1.2rem; color: #8892b0; margin-bottom: 1.5rem; }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Quiz 03 — EC2</h1>
+    <p class="subtitle">Types d'instances, AMI, EBS, Auto Scaling, modèles de tarification</p>
+    <div class="progress-bar-container"><div class="progress-bar" id="progressBar"></div></div>
+    <p class="progress-text" id="progressText">Question 1 / 12</p>
+    <div id="quizContainer"></div>
+    <div id="scoreContainer" class="card score-card hidden"></div>
+  </div>
+  <script>
+    const questions = [
+      {
+        label: "Question 1",
+        text: "Que signifie EC2 ?",
+        options: [
+          "Elastic Cloud Computing",
+          "Elastic Compute Cloud",
+          "Enterprise Cloud Container",
+          "Elastic Container Cluster"
+        ],
+        answer: 1,
+        explanation: "<strong>EC2</strong> signifie Elastic Compute Cloud. C'est le service de machines virtuelles (instances) d'AWS."
+      },
+      {
+        label: "Question 2",
+        text: "Qu'est-ce qu'une AMI (Amazon Machine Image) ?",
+        options: [
+          "Un type d'instance EC2 optimisé pour le machine learning",
+          "Un template contenant la configuration logicielle (OS, applications) pour lancer une instance",
+          "Un service de monitoring des instances",
+          "Un format de fichier de configuration réseau"
+        ],
+        answer: 1,
+        explanation: "Une <strong>AMI</strong> est un modèle pré-configuré qui contient le système d'exploitation, les applications et la configuration nécessaires pour lancer une instance EC2."
+      },
+      {
+        label: "Question 3",
+        text: "Quelle famille d'instances EC2 est optimisée pour le calcul intensif (compute-optimized) ?",
+        options: [
+          "Famille T (t3, t3a)",
+          "Famille M (m5, m6i)",
+          "Famille C (c5, c6i)",
+          "Famille R (r5, r6i)"
+        ],
+        answer: 2,
+        explanation: "La famille <strong>C</strong> (Compute) est optimisée pour les charges de travail nécessitant beaucoup de CPU. La famille T est « burstable », M est « general purpose » et R est optimisée pour la mémoire."
+      },
+      {
+        label: "Question 4",
+        text: "Quels sont les différents modèles de tarification EC2 ?",
+        multi: true,
+        options: [
+          "On-Demand (à la demande)",
+          "Reserved Instances (instances réservées)",
+          "Spot Instances",
+          "Savings Plans",
+          "Free Forever Instances"
+        ],
+        answer: [0, 1, 2, 3],
+        explanation: "AWS propose 4 modèles principaux : <strong>On-Demand</strong> (paiement à l'heure/seconde), <strong>Reserved Instances</strong> (engagement 1 ou 3 ans, jusqu'à 72% de réduction), <strong>Spot</strong> (jusqu'à 90% de réduction, interruptible) et <strong>Savings Plans</strong> (engagement de dépense horaire)."
+      },
+      {
+        label: "Question 5",
+        text: "Quel est le risque principal des Spot Instances ?",
+        options: [
+          "Elles coûtent plus cher que les On-Demand",
+          "Elles ne supportent pas les volumes EBS",
+          "AWS peut les interrompre avec un préavis de 2 minutes lorsque la capacité est nécessaire",
+          "Elles ne peuvent pas être lancées dans un VPC"
+        ],
+        answer: 2,
+        explanation: "Les <strong>Spot Instances</strong> peuvent être interrompues par AWS avec un préavis de 2 minutes. Elles sont idéales pour les workloads tolérants aux interruptions (batch, CI/CD, traitement de données)."
+      },
+      {
+        label: "Question 6",
+        text: "Quelle est la différence entre un volume EBS et un instance store ?",
+        options: [
+          "Il n'y a aucune différence",
+          "EBS est un stockage réseau persistant, l'instance store est un stockage local éphémère",
+          "L'instance store est plus lent mais plus fiable",
+          "EBS ne peut stocker que 10 Go maximum"
+        ],
+        answer: 1,
+        explanation: "<strong>EBS</strong> (Elastic Block Store) est un stockage réseau persistant qui survit à l'arrêt d'une instance. L'<strong>instance store</strong> est un stockage local physiquement attaché au serveur hôte — très rapide mais les données sont perdues si l'instance est arrêtée ou terminée."
+      },
+      {
+        label: "Question 7",
+        text: "Quels types de volumes EBS existent ?",
+        multi: true,
+        options: [
+          "gp3 (General Purpose SSD)",
+          "io2 (Provisioned IOPS SSD)",
+          "st1 (Throughput Optimized HDD)",
+          "sc1 (Cold HDD)",
+          "ep1 (Enterprise Premium)"
+        ],
+        answer: [0, 1, 2, 3],
+        explanation: "Les types de volumes EBS sont : <strong>gp3/gp2</strong> (SSD usage général), <strong>io2/io1</strong> (SSD hautes performances IOPS), <strong>st1</strong> (HDD débit optimisé) et <strong>sc1</strong> (HDD froid, archives). Le type ep1 n'existe pas."
+      },
+      {
+        label: "Question 8",
+        text: "Qu'est-ce qu'un groupe Auto Scaling (ASG) ?",
+        options: [
+          "Un groupe de sécurité réseau",
+          "Un ensemble d'instances EC2 qui s'ajuste automatiquement en fonction de la demande",
+          "Un groupe de volumes EBS qui s'agrandit automatiquement",
+          "Un service de sauvegarde automatique"
+        ],
+        answer: 1,
+        explanation: "Un <strong>Auto Scaling Group</strong> gère automatiquement le nombre d'instances EC2 en fonction de règles de scaling (CPU, requêtes, métriques personnalisées) pour maintenir la disponibilité et optimiser les coûts."
+      },
+      {
+        label: "Question 9",
+        text: "Quels paramètres sont configurés dans un Launch Template pour un Auto Scaling Group ?",
+        multi: true,
+        options: [
+          "L'AMI à utiliser",
+          "Le type d'instance",
+          "Les Security Groups",
+          "La configuration du user data (script de démarrage)",
+          "Le nom de domaine Route 53"
+        ],
+        answer: [0, 1, 2, 3],
+        explanation: "Un <strong>Launch Template</strong> contient : l'AMI, le type d'instance, les Security Groups, la clé SSH, le user data et d'autres paramètres de configuration de l'instance. Route 53 est configuré séparément."
+      },
+      {
+        label: "Question 10",
+        text: "Quelle politique de scaling ajuste le nombre d'instances pour maintenir une métrique à une valeur cible ?",
+        options: [
+          "Simple Scaling",
+          "Step Scaling",
+          "Target Tracking Scaling",
+          "Scheduled Scaling"
+        ],
+        answer: 2,
+        explanation: "<strong>Target Tracking Scaling</strong> ajuste automatiquement la capacité pour maintenir une métrique (ex : CPU à 50%). AWS gère les alarmes CloudWatch en arrière-plan. C'est le type de scaling le plus simple à configurer."
+      },
+      {
+        label: "Question 11",
+        text: "Qu'est-ce qu'une Elastic IP ?",
+        options: [
+          "Une adresse IP privée dynamique",
+          "Une adresse IPv4 publique statique que vous pouvez associer à une instance EC2",
+          "Un service de résolution DNS",
+          "Un protocole de chiffrement réseau"
+        ],
+        answer: 1,
+        explanation: "Une <strong>Elastic IP</strong> est une adresse IPv4 publique statique allouée à votre compte AWS. Elle peut être associée/dissociée à une instance EC2 à tout moment. Attention : une Elastic IP non associée est facturée."
+      },
+      {
+        label: "Question 12",
+        text: "Quel service AWS permet de se connecter à une instance EC2 sans ouvrir le port SSH (22) dans le Security Group ?",
+        options: [
+          "AWS CloudShell",
+          "AWS Systems Manager Session Manager",
+          "AWS Direct Connect",
+          "Amazon Inspector"
+        ],
+        answer: 1,
+        explanation: "<strong>SSM Session Manager</strong> permet de se connecter à une instance EC2 via le navigateur ou la CLI sans ouvrir de port SSH, sans gérer de clés SSH et avec un audit complet des sessions via CloudTrail."
+      }
+    ];
+    let currentQuestion = 0, score = 0, answered = false;
+    function renderQuestion() {
+      const q = questions[currentQuestion];
+      const total = questions.length;
+      document.getElementById('progressBar').style.width = ((currentQuestion / total) * 100) + '%';
+      document.getElementById('progressText').textContent = `Question ${currentQuestion + 1} / ${total}`;
+      const inputType = q.multi ? 'checkbox' : 'radio';
+      let html = `<div class="card"><p class="question-label">${q.label}</p><p class="question-text">${q.text}</p>`;
+      if (q.multi) html += `<p class="hint">⚠ Plusieurs réponses possibles</p>`;
+      if (q.code) html += `<pre><code>${q.code}</code></pre>`;
+      html += `<ul class="options">`;
+      q.options.forEach((opt, i) => { html += `<li><label><input type="${inputType}" name="q" value="${i}"> ${opt}</label></li>`; });
+      html += `</ul><button class="btn btn-primary" id="validateBtn" onclick="validate()" disabled>Valider</button><div class="feedback" id="feedback"></div></div>`;
+      document.getElementById('quizContainer').innerHTML = html;
+      document.querySelectorAll('input[name="q"]').forEach(r => { r.addEventListener('change', () => { document.getElementById('validateBtn').disabled = false; }); });
+      answered = false;
+    }
+    function validate() {
+      if (answered) { currentQuestion++; if (currentQuestion < questions.length) renderQuestion(); else showScore(); return; }
+      answered = true;
+      const q = questions[currentQuestion];
+      const fb = document.getElementById('feedback');
+      const btn = document.getElementById('validateBtn');
+      document.querySelectorAll('input[name="q"]').forEach(r => r.disabled = true);
+      let correct = false;
+      if (q.multi) {
+        const selected = Array.from(document.querySelectorAll('input[name="q"]:checked')).map(el => parseInt(el.value)).sort();
+        const expected = [...q.answer].sort();
+        correct = selected.length === expected.length && selected.every((v, i) => v === expected[i]);
+      } else {
+        const selected = document.querySelector('input[name="q"]:checked');
+        if (!selected) return;
+        correct = parseInt(selected.value) === q.answer;
+      }
+      if (correct) { score++; fb.className = 'feedback correct'; fb.innerHTML = `<strong>Correct !</strong> ${q.explanation}`; }
+      else { fb.className = 'feedback wrong'; fb.innerHTML = `<strong>Incorrect.</strong> ${q.explanation}`; }
+      btn.textContent = currentQuestion < questions.length - 1 ? 'Suivant' : 'Voir le score';
+    }
+    function showScore() {
+      document.getElementById('quizContainer').classList.add('hidden');
+      document.getElementById('progressBar').style.width = '100%';
+      document.getElementById('progressText').textContent = 'Terminé !';
+      const sc = document.getElementById('scoreContainer');
+      sc.classList.remove('hidden');
+      const pct = Math.round((score / questions.length) * 100);
+      let msg = pct === 100 ? 'Parfait !' : pct >= 60 ? 'Bien joué !' : 'Continuez à réviser !';
+      sc.innerHTML = `<div class="score">${score} / ${questions.length}</div><div class="score-label">${msg} (${pct}%)</div><button class="btn-restart" onclick="restart()">Recommencer</button>`;
+    }
+    function restart() { currentQuestion = 0; score = 0; answered = false; document.getElementById('scoreContainer').classList.add('hidden'); document.getElementById('quizContainer').classList.remove('hidden'); renderQuestion(); }
+    renderQuestion();
+  </script>
+</body>
+</html>

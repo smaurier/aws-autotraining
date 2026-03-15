@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Quiz 08 — Messaging</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #1a1a2e; color: #e0e0e0; min-height: 100vh; padding: 2rem 1rem; }
+    .container { max-width: 800px; margin: 0 auto; }
+    h1 { text-align: center; margin-bottom: 0.5rem; font-size: 1.8rem; color: #ffffff; }
+    .subtitle { text-align: center; color: #8892b0; margin-bottom: 2rem; font-size: 1rem; }
+    .progress-bar-container { background: #0d1117; border-radius: 10px; height: 14px; margin-bottom: 2rem; overflow: hidden; }
+    .progress-bar { background: linear-gradient(90deg, #0d6efd, #4dabf7); height: 100%; width: 0%; border-radius: 10px; transition: width 0.4s ease; }
+    .progress-text { text-align: center; color: #8892b0; margin-bottom: 1rem; font-size: 0.9rem; }
+    .card { background: #16213e; border-radius: 12px; padding: 2rem; margin-bottom: 1.5rem; box-shadow: 0 4px 20px rgba(0,0,0,0.3); }
+    .question-label { font-size: 0.85rem; color: #4dabf7; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 0.5rem; }
+    .question-text { font-size: 1.15rem; margin-bottom: 1.2rem; line-height: 1.5; color: #ffffff; }
+    .hint { font-size: 0.85rem; color: #f0ad4e; margin-bottom: 1rem; }
+    pre { background: #0d1117; border: 1px solid #30363d; border-radius: 8px; padding: 1rem; margin-bottom: 1.2rem; overflow-x: auto; font-size: 0.95rem; }
+    code { font-family: 'Consolas', 'Fira Code', 'Courier New', monospace; color: #c9d1d9; }
+    .options { list-style: none; }
+    .options li { margin-bottom: 0.5rem; }
+    .options label { display: flex; align-items: center; gap: 0.75rem; padding: 0.8rem 1rem; background: #0d1117; border: 2px solid #30363d; border-radius: 8px; cursor: pointer; transition: border-color 0.2s, background 0.2s; font-size: 1rem; }
+    .options label:hover { border-color: #4dabf7; background: #1c2a4a; }
+    .options input[type="radio"], .options input[type="checkbox"] { accent-color: #0d6efd; width: 18px; height: 18px; flex-shrink: 0; }
+    .btn { display: inline-block; padding: 0.7rem 2rem; border: none; border-radius: 8px; font-size: 1rem; font-weight: 600; cursor: pointer; transition: background 0.2s, transform 0.1s; }
+    .btn-primary { background: #0d6efd; color: #fff; }
+    .btn-primary:hover { background: #3b82f6; }
+    .btn-primary:disabled { background: #374151; cursor: not-allowed; }
+    .btn-restart { background: #238636; color: #fff; margin-top: 1rem; padding: 0.7rem 2rem; border: none; border-radius: 8px; font-size: 1rem; font-weight: 600; cursor: pointer; }
+    .btn-restart:hover { background: #2ea043; }
+    .feedback { margin-top: 1rem; padding: 1rem 1.2rem; border-radius: 8px; font-size: 0.95rem; line-height: 1.5; display: none; }
+    .feedback.correct { background: #0f5132; border: 1px solid #198754; color: #d1fae5; display: block; }
+    .feedback.wrong { background: #842029; border: 1px solid #dc3545; color: #fdd; display: block; }
+    .score-card { text-align: center; padding: 3rem 2rem; }
+    .score-card .score { font-size: 3rem; font-weight: 700; color: #4dabf7; margin-bottom: 0.5rem; }
+    .score-card .score-label { font-size: 1.2rem; color: #8892b0; margin-bottom: 1.5rem; }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Quiz 08 — Messaging</h1>
+    <p class="subtitle">SQS vs SNS vs EventBridge, DLQ, fan-out, FIFO</p>
+    <div class="progress-bar-container"><div class="progress-bar" id="progressBar"></div></div>
+    <p class="progress-text" id="progressText">Question 1 / 11</p>
+    <div id="quizContainer"></div>
+    <div id="scoreContainer" class="card score-card hidden"></div>
+  </div>
+  <script>
+    const questions = [
+      {
+        label: "Question 1",
+        text: "Quelle est la différence fondamentale entre SQS et SNS ?",
+        options: [
+          "SQS est un service de notification push, SNS est une file d'attente",
+          "SQS est une file d'attente (queue) pour le découplage point-à-point, SNS est un service pub/sub pour le fan-out",
+          "SQS est plus cher que SNS",
+          "SNS ne supporte pas Lambda comme abonné"
+        ],
+        answer: 1,
+        explanation: "<strong>SQS</strong> est une file d'attente (un producteur, un consommateur) pour le découplage. <strong>SNS</strong> est un service pub/sub : un message publié est distribué à tous les abonnés (fan-out) — Lambda, SQS, email, HTTP, etc."
+      },
+      {
+        label: "Question 2",
+        text: "Qu'est-ce qu'une Dead Letter Queue (DLQ) ?",
+        options: [
+          "Une file d'attente pour les messages chiffrés",
+          "Une file d'attente qui reçoit les messages qui n'ont pas pu être traités après un nombre maximal de tentatives",
+          "Une file d'attente prioritaire",
+          "Une file d'attente temporaire pour le batch processing"
+        ],
+        answer: 1,
+        explanation: "Une <strong>DLQ</strong> (Dead Letter Queue) recueille les messages qui ont échoué au traitement après le nombre maximal de retries configuré (maxReceiveCount). Cela permet d'isoler et d'analyser les messages problématiques."
+      },
+      {
+        label: "Question 3",
+        text: "Quelle est la différence entre une file SQS Standard et une file SQS FIFO ?",
+        multi: true,
+        options: [
+          "SQS Standard offre un débit quasi illimité, FIFO est limité à 3 000 msg/s avec batching",
+          "SQS FIFO garantit l'ordre exact des messages (First-In-First-Out)",
+          "SQS Standard peut livrer un message en double (at-least-once), FIFO garantit exactly-once",
+          "SQS Standard ne supporte pas les DLQ",
+          "Le nom d'une file FIFO doit se terminer par .fifo"
+        ],
+        answer: [0, 1, 2, 4],
+        explanation: "SQS <strong>Standard</strong> : débit illimité, at-least-once, ordre non garanti. SQS <strong>FIFO</strong> : 3 000 msg/s (avec batching), exactly-once, ordre strict. Les deux supportent les DLQ. Le nom FIFO doit se terminer par <code>.fifo</code>."
+      },
+      {
+        label: "Question 4",
+        text: "Qu'est-ce que le pattern fan-out avec SNS + SQS ?",
+        options: [
+          "Envoyer un message directement de SQS à SNS",
+          "Publier un message sur un topic SNS qui distribue ce message à plusieurs files SQS abonnées, chacune traitant le message indépendamment",
+          "Créer plusieurs topics SNS pour un seul consommateur",
+          "Utiliser SNS comme file d'attente de backup"
+        ],
+        answer: 1,
+        explanation: "Le pattern <strong>fan-out</strong> consiste à publier sur un <strong>topic SNS</strong> qui distribue le message à plusieurs <strong>files SQS</strong> abonnées. Chaque consommateur traite le message indépendamment, de manière découplée et asynchrone."
+      },
+      {
+        label: "Question 5",
+        text: "Qu'est-ce qu'Amazon EventBridge ?",
+        options: [
+          "Un service de base de données événementielle",
+          "Un bus d'événements serverless permettant de router des événements entre services AWS, SaaS et applications personnalisées selon des règles",
+          "Un service de monitoring d'événements",
+          "Un outil de migration de messages"
+        ],
+        answer: 1,
+        explanation: "<strong>EventBridge</strong> est un bus d'événements serverless. Il permet de définir des règles qui filtrent les événements (par source, type, contenu) et les routent vers des cibles (Lambda, SQS, Step Functions, etc.). Il supporte les événements AWS natifs, SaaS et custom."
+      },
+      {
+        label: "Question 6",
+        text: "Quelle est la durée maximale de rétention d'un message dans SQS ?",
+        options: [
+          "1 jour",
+          "7 jours",
+          "14 jours",
+          "30 jours"
+        ],
+        answer: 2,
+        explanation: "La durée de rétention maximale dans SQS est de <strong>14 jours</strong>. La valeur par défaut est 4 jours. Après la période de rétention, les messages non consommés sont automatiquement supprimés."
+      },
+      {
+        label: "Question 7",
+        text: "Qu'est-ce que le Visibility Timeout dans SQS ?",
+        options: [
+          "Le délai avant qu'un message devienne visible dans la console AWS",
+          "La période pendant laquelle un message reçu par un consommateur est invisible aux autres consommateurs",
+          "Le délai de chiffrement d'un message",
+          "Le temps maximum de rétention"
+        ],
+        answer: 1,
+        explanation: "Le <strong>Visibility Timeout</strong> est la période pendant laquelle un message, une fois reçu par un consommateur, est masqué aux autres consommateurs. Si le message n'est pas supprimé avant l'expiration du timeout, il redevient visible et peut être traité par un autre consommateur."
+      },
+      {
+        label: "Question 8",
+        text: "Quels types d'abonnés (subscribers) SNS supporte-t-il ?",
+        multi: true,
+        options: [
+          "Lambda",
+          "SQS",
+          "Email / Email-JSON",
+          "HTTP / HTTPS endpoint",
+          "SMS"
+        ],
+        answer: [0, 1, 2, 3, 4],
+        explanation: "SNS supporte de nombreux types d'abonnés : <strong>Lambda</strong>, <strong>SQS</strong>, <strong>Email</strong>, <strong>HTTP/HTTPS</strong>, <strong>SMS</strong>, Kinesis Data Firehose et les notifications push mobiles (APNs, FCM)."
+      },
+      {
+        label: "Question 9",
+        text: "Qu'est-ce qu'une EventBridge Rule ?",
+        options: [
+          "Une politique IAM pour EventBridge",
+          "Un filtre qui correspond à des événements entrants et les route vers une ou plusieurs cibles",
+          "Un mécanisme de chiffrement des événements",
+          "Un outil de visualisation des événements"
+        ],
+        answer: 1,
+        explanation: "Une <strong>EventBridge Rule</strong> définit un pattern de filtrage (event pattern) qui match certains événements et les route vers une ou plusieurs cibles. On peut aussi créer des règles planifiées (schedule) comme des cron jobs."
+      },
+      {
+        label: "Question 10",
+        text: "Quel est l'avantage d'EventBridge par rapport à SNS pour le routage d'événements ?",
+        options: [
+          "EventBridge est gratuit, SNS est payant",
+          "EventBridge permet un filtrage avancé basé sur le contenu de l'événement (content-based filtering), SNS se limite au filtrage par attributs",
+          "EventBridge supporte plus d'abonnés que SNS",
+          "EventBridge garantit l'ordre des événements, pas SNS"
+        ],
+        answer: 1,
+        explanation: "<strong>EventBridge</strong> offre un filtrage basé sur le contenu complet de l'événement (JSON path matching), l'intégration native avec les événements AWS et les sources SaaS, et des fonctionnalités avancées comme le schema registry et l'archive/replay."
+      },
+      {
+        label: "Question 11",
+        text: "Dans quel scénario utiliser SQS plutôt que SNS ?",
+        options: [
+          "Quand on veut notifier plusieurs services simultanément",
+          "Quand on veut découpler un producteur d'un consommateur unique avec un buffer de messages et des retries",
+          "Quand on veut envoyer des emails de notification",
+          "Quand on veut déclencher une fonction Lambda en temps réel"
+        ],
+        answer: 1,
+        explanation: "SQS est idéal pour le <strong>découplage point-à-point</strong> : un producteur envoie des messages dans la file, un consommateur les traite à son rythme. Le buffer absorbe les pics de charge et les messages sont conservés en cas de panne du consommateur."
+      }
+    ];
+    let currentQuestion = 0, score = 0, answered = false;
+    function renderQuestion() {
+      const q = questions[currentQuestion];
+      const total = questions.length;
+      document.getElementById('progressBar').style.width = ((currentQuestion / total) * 100) + '%';
+      document.getElementById('progressText').textContent = `Question ${currentQuestion + 1} / ${total}`;
+      const inputType = q.multi ? 'checkbox' : 'radio';
+      let html = `<div class="card"><p class="question-label">${q.label}</p><p class="question-text">${q.text}</p>`;
+      if (q.multi) html += `<p class="hint">⚠ Plusieurs réponses possibles</p>`;
+      if (q.code) html += `<pre><code>${q.code}</code></pre>`;
+      html += `<ul class="options">`;
+      q.options.forEach((opt, i) => { html += `<li><label><input type="${inputType}" name="q" value="${i}"> ${opt}</label></li>`; });
+      html += `</ul><button class="btn btn-primary" id="validateBtn" onclick="validate()" disabled>Valider</button><div class="feedback" id="feedback"></div></div>`;
+      document.getElementById('quizContainer').innerHTML = html;
+      document.querySelectorAll('input[name="q"]').forEach(r => { r.addEventListener('change', () => { document.getElementById('validateBtn').disabled = false; }); });
+      answered = false;
+    }
+    function validate() {
+      if (answered) { currentQuestion++; if (currentQuestion < questions.length) renderQuestion(); else showScore(); return; }
+      answered = true;
+      const q = questions[currentQuestion];
+      const fb = document.getElementById('feedback');
+      const btn = document.getElementById('validateBtn');
+      document.querySelectorAll('input[name="q"]').forEach(r => r.disabled = true);
+      let correct = false;
+      if (q.multi) {
+        const selected = Array.from(document.querySelectorAll('input[name="q"]:checked')).map(el => parseInt(el.value)).sort();
+        const expected = [...q.answer].sort();
+        correct = selected.length === expected.length && selected.every((v, i) => v === expected[i]);
+      } else {
+        const selected = document.querySelector('input[name="q"]:checked');
+        if (!selected) return;
+        correct = parseInt(selected.value) === q.answer;
+      }
+      if (correct) { score++; fb.className = 'feedback correct'; fb.innerHTML = `<strong>Correct !</strong> ${q.explanation}`; }
+      else { fb.className = 'feedback wrong'; fb.innerHTML = `<strong>Incorrect.</strong> ${q.explanation}`; }
+      btn.textContent = currentQuestion < questions.length - 1 ? 'Suivant' : 'Voir le score';
+    }
+    function showScore() {
+      document.getElementById('quizContainer').classList.add('hidden');
+      document.getElementById('progressBar').style.width = '100%';
+      document.getElementById('progressText').textContent = 'Terminé !';
+      const sc = document.getElementById('scoreContainer');
+      sc.classList.remove('hidden');
+      const pct = Math.round((score / questions.length) * 100);
+      let msg = pct === 100 ? 'Parfait !' : pct >= 60 ? 'Bien joué !' : 'Continuez à réviser !';
+      sc.innerHTML = `<div class="score">${score} / ${questions.length}</div><div class="score-label">${msg} (${pct}%)</div><button class="btn-restart" onclick="restart()">Recommencer</button>`;
+    }
+    function restart() { currentQuestion = 0; score = 0; answered = false; document.getElementById('scoreContainer').classList.add('hidden'); document.getElementById('quizContainer').classList.remove('hidden'); renderQuestion(); }
+    renderQuestion();
+  </script>
+</body>
+</html>

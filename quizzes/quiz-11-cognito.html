@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Quiz 09 — Cognito</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #1a1a2e; color: #e0e0e0; min-height: 100vh; padding: 2rem 1rem; }
+    .container { max-width: 800px; margin: 0 auto; }
+    h1 { text-align: center; margin-bottom: 0.5rem; font-size: 1.8rem; color: #ffffff; }
+    .subtitle { text-align: center; color: #8892b0; margin-bottom: 2rem; font-size: 1rem; }
+    .progress-bar-container { background: #0d1117; border-radius: 10px; height: 14px; margin-bottom: 2rem; overflow: hidden; }
+    .progress-bar { background: linear-gradient(90deg, #0d6efd, #4dabf7); height: 100%; width: 0%; border-radius: 10px; transition: width 0.4s ease; }
+    .progress-text { text-align: center; color: #8892b0; margin-bottom: 1rem; font-size: 0.9rem; }
+    .card { background: #16213e; border-radius: 12px; padding: 2rem; margin-bottom: 1.5rem; box-shadow: 0 4px 20px rgba(0,0,0,0.3); }
+    .question-label { font-size: 0.85rem; color: #4dabf7; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 0.5rem; }
+    .question-text { font-size: 1.15rem; margin-bottom: 1.2rem; line-height: 1.5; color: #ffffff; }
+    .hint { font-size: 0.85rem; color: #f0ad4e; margin-bottom: 1rem; }
+    pre { background: #0d1117; border: 1px solid #30363d; border-radius: 8px; padding: 1rem; margin-bottom: 1.2rem; overflow-x: auto; font-size: 0.95rem; }
+    code { font-family: 'Consolas', 'Fira Code', 'Courier New', monospace; color: #c9d1d9; }
+    .options { list-style: none; }
+    .options li { margin-bottom: 0.5rem; }
+    .options label { display: flex; align-items: center; gap: 0.75rem; padding: 0.8rem 1rem; background: #0d1117; border: 2px solid #30363d; border-radius: 8px; cursor: pointer; transition: border-color 0.2s, background 0.2s; font-size: 1rem; }
+    .options label:hover { border-color: #4dabf7; background: #1c2a4a; }
+    .options input[type="radio"], .options input[type="checkbox"] { accent-color: #0d6efd; width: 18px; height: 18px; flex-shrink: 0; }
+    .btn { display: inline-block; padding: 0.7rem 2rem; border: none; border-radius: 8px; font-size: 1rem; font-weight: 600; cursor: pointer; transition: background 0.2s, transform 0.1s; }
+    .btn-primary { background: #0d6efd; color: #fff; }
+    .btn-primary:hover { background: #3b82f6; }
+    .btn-primary:disabled { background: #374151; cursor: not-allowed; }
+    .btn-restart { background: #238636; color: #fff; margin-top: 1rem; padding: 0.7rem 2rem; border: none; border-radius: 8px; font-size: 1rem; font-weight: 600; cursor: pointer; }
+    .btn-restart:hover { background: #2ea043; }
+    .feedback { margin-top: 1rem; padding: 1rem 1.2rem; border-radius: 8px; font-size: 0.95rem; line-height: 1.5; display: none; }
+    .feedback.correct { background: #0f5132; border: 1px solid #198754; color: #d1fae5; display: block; }
+    .feedback.wrong { background: #842029; border: 1px solid #dc3545; color: #fdd; display: block; }
+    .score-card { text-align: center; padding: 3rem 2rem; }
+    .score-card .score { font-size: 3rem; font-weight: 700; color: #4dabf7; margin-bottom: 0.5rem; }
+    .score-card .score-label { font-size: 1.2rem; color: #8892b0; margin-bottom: 1.5rem; }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Quiz 09 — Cognito</h1>
+    <p class="subtitle">User Pools, Identity Pools, JWT, fédération, Lambda triggers</p>
+    <div class="progress-bar-container"><div class="progress-bar" id="progressBar"></div></div>
+    <p class="progress-text" id="progressText">Question 1 / 10</p>
+    <div id="quizContainer"></div>
+    <div id="scoreContainer" class="card score-card hidden"></div>
+  </div>
+  <script>
+    const questions = [
+      {
+        label: "Question 1",
+        text: "Quelle est la différence entre un Cognito User Pool et un Cognito Identity Pool ?",
+        options: [
+          "Il n'y a aucune différence",
+          "Un User Pool gère l'authentification (sign-up, sign-in, JWT), un Identity Pool fournit des credentials AWS temporaires pour accéder aux services AWS",
+          "Un Identity Pool gère les mots de passe, un User Pool gère les rôles IAM",
+          "Un User Pool est gratuit, un Identity Pool est payant"
+        ],
+        answer: 1,
+        explanation: "Un <strong>User Pool</strong> est un annuaire d'utilisateurs pour l'authentification (inscription, connexion, MFA, tokens JWT). Un <strong>Identity Pool</strong> échange des tokens (de User Pool ou de fédérés) contre des <strong>credentials AWS temporaires</strong> (STS)."
+      },
+      {
+        label: "Question 2",
+        text: "Quels tokens sont émis par un Cognito User Pool après une authentification réussie ?",
+        multi: true,
+        options: [
+          "ID Token (informations sur l'utilisateur)",
+          "Access Token (autorisations d'accès)",
+          "Refresh Token (pour renouveler les tokens expirés)",
+          "API Key Token",
+          "Session Token AWS"
+        ],
+        answer: [0, 1, 2],
+        explanation: "Cognito User Pool émet 3 tokens JWT : l'<strong>ID Token</strong> (claims utilisateur), l'<strong>Access Token</strong> (scopes d'autorisation) et le <strong>Refresh Token</strong> (pour obtenir de nouveaux ID/Access tokens sans re-authentification)."
+      },
+      {
+        label: "Question 3",
+        text: "Quels fournisseurs d'identité externes Cognito User Pool supporte-t-il pour la fédération ?",
+        multi: true,
+        options: [
+          "Google",
+          "Facebook",
+          "Apple",
+          "SAML 2.0 (Active Directory, Okta...)",
+          "OpenID Connect (OIDC)"
+        ],
+        answer: [0, 1, 2, 3, 4],
+        explanation: "Cognito supporte la fédération avec : <strong>Google</strong>, <strong>Facebook</strong>, <strong>Apple</strong>, <strong>Amazon</strong>, tout fournisseur <strong>SAML 2.0</strong> et tout fournisseur <strong>OIDC</strong>. Les utilisateurs fédérés sont créés dans le User Pool lors de leur première connexion."
+      },
+      {
+        label: "Question 4",
+        text: "Qu'est-ce qu'un Lambda Trigger dans Cognito ?",
+        options: [
+          "Un mécanisme pour déclencher Lambda depuis DynamoDB",
+          "Une fonction Lambda invoquée automatiquement par Cognito à certaines étapes du flux d'authentification (pré-inscription, post-confirmation, etc.)",
+          "Un outil de déploiement Lambda",
+          "Un mécanisme de monitoring"
+        ],
+        answer: 1,
+        explanation: "Les <strong>Lambda Triggers</strong> permettent de personnaliser le flux Cognito : validation pré-inscription (Pre Sign-up), migration d'utilisateurs (User Migration), personnalisation du token (Pre Token Generation), message personnalisé (Custom Message), etc."
+      },
+      {
+        label: "Question 5",
+        text: "Quelle est la durée de validité par défaut d'un Access Token Cognito ?",
+        options: [
+          "5 minutes",
+          "1 heure",
+          "24 heures",
+          "7 jours"
+        ],
+        answer: 1,
+        explanation: "Par défaut, l'Access Token et l'ID Token Cognito expirent après <strong>1 heure</strong>. Le Refresh Token expire par défaut après 30 jours (configurable de 1 heure à 3 650 jours)."
+      },
+      {
+        label: "Question 6",
+        text: "Comment Cognito Identity Pool détermine-t-il quel rôle IAM attribuer à un utilisateur ?",
+        options: [
+          "Il attribue toujours le même rôle à tous les utilisateurs",
+          "Il utilise des règles basées sur les claims du token ou les groupes Cognito pour mapper l'utilisateur à un rôle IAM spécifique",
+          "Le rôle est choisi aléatoirement",
+          "L'utilisateur choisit son rôle dans l'interface"
+        ],
+        answer: 1,
+        explanation: "Identity Pool peut utiliser des <strong>rules-based mapping</strong> (basées sur les claims du token) ou le <strong>default role</strong> pour déterminer le rôle IAM. On peut aussi différencier les rôles pour les utilisateurs authentifiés vs non authentifiés (guest access)."
+      },
+      {
+        label: "Question 7",
+        text: "Qu'est-ce que l'Hosted UI de Cognito ?",
+        options: [
+          "Un dashboard de monitoring Cognito",
+          "Une interface de connexion/inscription pré-construite et hébergée par AWS, personnalisable avec CSS",
+          "Un outil de gestion des utilisateurs IAM",
+          "Une page d'accueil pour l'application"
+        ],
+        answer: 1,
+        explanation: "L'<strong>Hosted UI</strong> est une interface web pré-construite par AWS pour la connexion, l'inscription, le mot de passe oublié et la fédération. Elle est personnalisable via CSS et accessible via une URL Cognito dédiée."
+      },
+      {
+        label: "Question 8",
+        text: "Quel mécanisme Cognito utilise-t-il pour protéger contre les attaques par force brute ?",
+        options: [
+          "Cognito ne propose aucune protection",
+          "Advanced Security Features : détection de compromission, adaptive authentication, blocage IP",
+          "Un WAF intégré",
+          "Un captcha obligatoire"
+        ],
+        answer: 1,
+        explanation: "Les <strong>Advanced Security Features</strong> de Cognito détectent les tentatives de connexion risquées (nouvelle localisation, appareil inconnu), proposent l'adaptive authentication (MFA conditionnel) et détectent les credentials compromis."
+      },
+      {
+        label: "Question 9",
+        text: "Comment utiliser Cognito avec API Gateway pour protéger une API ?",
+        options: [
+          "En configurant un Cognito User Pool Authorizer sur les méthodes API Gateway",
+          "En configurant un VPN entre Cognito et API Gateway",
+          "En utilisant des API Keys uniquement",
+          "Ce n'est pas possible, Cognito ne s'intègre pas avec API Gateway"
+        ],
+        answer: 0,
+        explanation: "On configure un <strong>Cognito User Pool Authorizer</strong> sur API Gateway. Le client envoie le JWT (ID Token ou Access Token) dans l'en-tête Authorization. API Gateway le valide automatiquement auprès du User Pool."
+      },
+      {
+        label: "Question 10",
+        text: "Quel Lambda Trigger permet de modifier les claims d'un token JWT avant qu'il ne soit renvoyé au client ?",
+        options: [
+          "Pre Sign-up",
+          "Post Confirmation",
+          "Pre Token Generation",
+          "Custom Message"
+        ],
+        answer: 2,
+        explanation: "Le trigger <strong>Pre Token Generation</strong> permet d'ajouter, modifier ou supprimer des claims dans le token JWT avant qu'il ne soit renvoyé au client. Utile pour ajouter des rôles applicatifs, des permissions personnalisées, etc."
+      }
+    ];
+    let currentQuestion = 0, score = 0, answered = false;
+    function renderQuestion() {
+      const q = questions[currentQuestion];
+      const total = questions.length;
+      document.getElementById('progressBar').style.width = ((currentQuestion / total) * 100) + '%';
+      document.getElementById('progressText').textContent = `Question ${currentQuestion + 1} / ${total}`;
+      const inputType = q.multi ? 'checkbox' : 'radio';
+      let html = `<div class="card"><p class="question-label">${q.label}</p><p class="question-text">${q.text}</p>`;
+      if (q.multi) html += `<p class="hint">⚠ Plusieurs réponses possibles</p>`;
+      if (q.code) html += `<pre><code>${q.code}</code></pre>`;
+      html += `<ul class="options">`;
+      q.options.forEach((opt, i) => { html += `<li><label><input type="${inputType}" name="q" value="${i}"> ${opt}</label></li>`; });
+      html += `</ul><button class="btn btn-primary" id="validateBtn" onclick="validate()" disabled>Valider</button><div class="feedback" id="feedback"></div></div>`;
+      document.getElementById('quizContainer').innerHTML = html;
+      document.querySelectorAll('input[name="q"]').forEach(r => { r.addEventListener('change', () => { document.getElementById('validateBtn').disabled = false; }); });
+      answered = false;
+    }
+    function validate() {
+      if (answered) { currentQuestion++; if (currentQuestion < questions.length) renderQuestion(); else showScore(); return; }
+      answered = true;
+      const q = questions[currentQuestion];
+      const fb = document.getElementById('feedback');
+      const btn = document.getElementById('validateBtn');
+      document.querySelectorAll('input[name="q"]').forEach(r => r.disabled = true);
+      let correct = false;
+      if (q.multi) {
+        const selected = Array.from(document.querySelectorAll('input[name="q"]:checked')).map(el => parseInt(el.value)).sort();
+        const expected = [...q.answer].sort();
+        correct = selected.length === expected.length && selected.every((v, i) => v === expected[i]);
+      } else {
+        const selected = document.querySelector('input[name="q"]:checked');
+        if (!selected) return;
+        correct = parseInt(selected.value) === q.answer;
+      }
+      if (correct) { score++; fb.className = 'feedback correct'; fb.innerHTML = `<strong>Correct !</strong> ${q.explanation}`; }
+      else { fb.className = 'feedback wrong'; fb.innerHTML = `<strong>Incorrect.</strong> ${q.explanation}`; }
+      btn.textContent = currentQuestion < questions.length - 1 ? 'Suivant' : 'Voir le score';
+    }
+    function showScore() {
+      document.getElementById('quizContainer').classList.add('hidden');
+      document.getElementById('progressBar').style.width = '100%';
+      document.getElementById('progressText').textContent = 'Terminé !';
+      const sc = document.getElementById('scoreContainer');
+      sc.classList.remove('hidden');
+      const pct = Math.round((score / questions.length) * 100);
+      let msg = pct === 100 ? 'Parfait !' : pct >= 60 ? 'Bien joué !' : 'Continuez à réviser !';
+      sc.innerHTML = `<div class="score">${score} / ${questions.length}</div><div class="score-label">${msg} (${pct}%)</div><button class="btn-restart" onclick="restart()">Recommencer</button>`;
+    }
+    function restart() { currentQuestion = 0; score = 0; answered = false; document.getElementById('scoreContainer').classList.add('hidden'); document.getElementById('quizContainer').classList.remove('hidden'); renderQuestion(); }
+    renderQuestion();
+  </script>
+</body>
+</html>

@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Quiz 00 — Prérequis AWS</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #1a1a2e; color: #e0e0e0; min-height: 100vh; padding: 2rem 1rem; }
+    .container { max-width: 800px; margin: 0 auto; }
+    h1 { text-align: center; margin-bottom: 0.5rem; font-size: 1.8rem; color: #ffffff; }
+    .subtitle { text-align: center; color: #8892b0; margin-bottom: 2rem; font-size: 1rem; }
+    .progress-bar-container { background: #0d1117; border-radius: 10px; height: 14px; margin-bottom: 2rem; overflow: hidden; }
+    .progress-bar { background: linear-gradient(90deg, #0d6efd, #4dabf7); height: 100%; width: 0%; border-radius: 10px; transition: width 0.4s ease; }
+    .progress-text { text-align: center; color: #8892b0; margin-bottom: 1rem; font-size: 0.9rem; }
+    .card { background: #16213e; border-radius: 12px; padding: 2rem; margin-bottom: 1.5rem; box-shadow: 0 4px 20px rgba(0,0,0,0.3); }
+    .question-label { font-size: 0.85rem; color: #4dabf7; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 0.5rem; }
+    .question-text { font-size: 1.15rem; margin-bottom: 1.2rem; line-height: 1.5; color: #ffffff; }
+    .hint { font-size: 0.85rem; color: #f0ad4e; margin-bottom: 1rem; }
+    pre { background: #0d1117; border: 1px solid #30363d; border-radius: 8px; padding: 1rem; margin-bottom: 1.2rem; overflow-x: auto; font-size: 0.95rem; }
+    code { font-family: 'Consolas', 'Fira Code', 'Courier New', monospace; color: #c9d1d9; }
+    .options { list-style: none; }
+    .options li { margin-bottom: 0.5rem; }
+    .options label { display: flex; align-items: center; gap: 0.75rem; padding: 0.8rem 1rem; background: #0d1117; border: 2px solid #30363d; border-radius: 8px; cursor: pointer; transition: border-color 0.2s, background 0.2s; font-size: 1rem; }
+    .options label:hover { border-color: #4dabf7; background: #1c2a4a; }
+    .options input[type="radio"], .options input[type="checkbox"] { accent-color: #0d6efd; width: 18px; height: 18px; flex-shrink: 0; }
+    .btn { display: inline-block; padding: 0.7rem 2rem; border: none; border-radius: 8px; font-size: 1rem; font-weight: 600; cursor: pointer; transition: background 0.2s, transform 0.1s; }
+    .btn-primary { background: #0d6efd; color: #fff; }
+    .btn-primary:hover { background: #3b82f6; }
+    .btn-primary:disabled { background: #374151; cursor: not-allowed; }
+    .btn-restart { background: #238636; color: #fff; margin-top: 1rem; padding: 0.7rem 2rem; border: none; border-radius: 8px; font-size: 1rem; font-weight: 600; cursor: pointer; }
+    .btn-restart:hover { background: #2ea043; }
+    .feedback { margin-top: 1rem; padding: 1rem 1.2rem; border-radius: 8px; font-size: 0.95rem; line-height: 1.5; display: none; }
+    .feedback.correct { background: #0f5132; border: 1px solid #198754; color: #d1fae5; display: block; }
+    .feedback.wrong { background: #842029; border: 1px solid #dc3545; color: #fdd; display: block; }
+    .score-card { text-align: center; padding: 3rem 2rem; }
+    .score-card .score { font-size: 3rem; font-weight: 700; color: #4dabf7; margin-bottom: 0.5rem; }
+    .score-card .score-label { font-size: 1.2rem; color: #8892b0; margin-bottom: 1.5rem; }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Quiz 00 — Prérequis AWS</h1>
+    <p class="subtitle">Régions, Zones de disponibilité, infrastructure globale, modèle de tarification</p>
+    <div class="progress-bar-container"><div class="progress-bar" id="progressBar"></div></div>
+    <p class="progress-text" id="progressText">Question 1 / 10</p>
+    <div id="quizContainer"></div>
+    <div id="scoreContainer" class="card score-card hidden"></div>
+  </div>
+  <script>
+    const questions = [
+      {
+        label: "Question 1",
+        text: "Combien de régions AWS existe-t-il approximativement dans le monde (début 2026) ?",
+        options: [
+          "10 régions",
+          "20 régions",
+          "Plus de 30 régions",
+          "Plus de 60 régions"
+        ],
+        answer: 2,
+        explanation: "AWS dispose de plus de 30 régions à travers le monde. Chaque région est un ensemble de datacenters géographiquement isolés."
+      },
+      {
+        label: "Question 2",
+        text: "Qu'est-ce qu'une Zone de disponibilité (Availability Zone) ?",
+        options: [
+          "Un continent où AWS est présent",
+          "Un ou plusieurs datacenters physiquement séparés au sein d'une même région",
+          "Un service de réplication de données entre régions",
+          "Un réseau privé virtuel"
+        ],
+        answer: 1,
+        explanation: "Une Zone de disponibilité (AZ) est un ou plusieurs datacenters discrets avec alimentation, réseau et connectivité redondants au sein d'une même région AWS."
+      },
+      {
+        label: "Question 3",
+        text: "Quel est le nombre minimum de Zones de disponibilité par région AWS ?",
+        options: [
+          "1",
+          "2",
+          "3",
+          "5"
+        ],
+        answer: 2,
+        explanation: "Chaque région AWS dispose d'au minimum 3 Zones de disponibilité (AZ), ce qui permet de concevoir des architectures hautement disponibles."
+      },
+      {
+        label: "Question 4",
+        text: "Quels sont les services AWS considérés comme globaux (non liés à une région) ?",
+        multi: true,
+        options: [
+          "IAM",
+          "EC2",
+          "Route 53",
+          "CloudFront",
+          "S3"
+        ],
+        answer: [0, 2, 3],
+        explanation: "<strong>IAM</strong>, <strong>Route 53</strong> et <strong>CloudFront</strong> sont des services globaux. EC2 et S3 sont des services régionaux (les buckets S3 sont créés dans une région spécifique)."
+      },
+      {
+        label: "Question 5",
+        text: "Que signifie le modèle de tarification « Pay-as-you-go » d'AWS ?",
+        options: [
+          "Vous payez un abonnement mensuel fixe",
+          "Vous payez uniquement pour les ressources consommées, à la demande",
+          "Vous payez un forfait annuel avec engagement",
+          "Le paiement est gratuit pour les 5 premières années"
+        ],
+        answer: 1,
+        explanation: "Le modèle « Pay-as-you-go » signifie que vous ne payez que ce que vous consommez, sans engagement à long terme (sauf si vous choisissez des Reserved Instances pour réduire les coûts)."
+      },
+      {
+        label: "Question 6",
+        text: "Quelle est la différence entre un Edge Location et une Région AWS ?",
+        options: [
+          "Il n'y a aucune différence",
+          "Un Edge Location est un point de présence pour le cache CDN (CloudFront), plus proche des utilisateurs finaux",
+          "Un Edge Location est une région avec moins de services disponibles",
+          "Un Edge Location sert uniquement au stockage S3"
+        ],
+        answer: 1,
+        explanation: "Les Edge Locations sont des points de présence utilisés par CloudFront (CDN) et Route 53 pour distribuer du contenu au plus proche des utilisateurs. Il y en a beaucoup plus que de régions (plus de 400)."
+      },
+      {
+        label: "Question 7",
+        text: "Quel outil AWS permet d'estimer le coût mensuel de son infrastructure avant de la déployer ?",
+        options: [
+          "AWS CloudTrail",
+          "AWS Pricing Calculator",
+          "AWS Config",
+          "Amazon Inspector"
+        ],
+        answer: 1,
+        explanation: "<strong>AWS Pricing Calculator</strong> permet de modéliser son architecture et d'estimer les coûts mensuels avant tout déploiement."
+      },
+      {
+        label: "Question 8",
+        text: "Que couvre le Free Tier AWS ?",
+        multi: true,
+        options: [
+          "750 heures par mois d'une instance EC2 t2.micro/t3.micro pendant 12 mois",
+          "5 Go de stockage S3 Standard pendant 12 mois",
+          "Utilisation illimitée de tous les services pendant 1 an",
+          "1 million de requêtes Lambda par mois (toujours gratuit)",
+          "25 Go de stockage DynamoDB (toujours gratuit)"
+        ],
+        answer: [0, 1, 3, 4],
+        explanation: "Le Free Tier comprend des offres sur 12 mois (EC2, S3, RDS...) et des offres « toujours gratuites » (Lambda, DynamoDB). L'utilisation illimitée n'existe pas."
+      },
+      {
+        label: "Question 9",
+        text: "Quel est le modèle de responsabilité partagée (Shared Responsibility Model) d'AWS ?",
+        options: [
+          "AWS est responsable de tout, y compris de la sécurité des applications",
+          "Le client est responsable de toute l'infrastructure physique",
+          "AWS gère la sécurité « du » cloud (infrastructure), le client gère la sécurité « dans » le cloud (données, accès, applications)",
+          "La sécurité est entièrement déléguée à un tiers"
+        ],
+        answer: 2,
+        explanation: "Dans le modèle de responsabilité partagée, AWS est responsable de la sécurité <strong>du</strong> cloud (hardware, réseau, datacenters) et le client est responsable de la sécurité <strong>dans</strong> le cloud (configuration, données, IAM, chiffrement)."
+      },
+      {
+        label: "Question 10",
+        text: "Quelle méthode d'accès permet d'interagir avec les services AWS ?",
+        multi: true,
+        options: [
+          "AWS Management Console (interface web)",
+          "AWS CLI (ligne de commande)",
+          "AWS SDK (bibliothèques de programmation)",
+          "Uniquement par courrier électronique au support AWS"
+        ],
+        answer: [0, 1, 2],
+        explanation: "AWS offre trois méthodes principales d'accès : la <strong>Console web</strong>, la <strong>CLI</strong> et les <strong>SDK</strong> (disponibles en Python, JavaScript, Java, Go, .NET, etc.)."
+      }
+    ];
+    let currentQuestion = 0, score = 0, answered = false;
+    function renderQuestion() {
+      const q = questions[currentQuestion];
+      const total = questions.length;
+      document.getElementById('progressBar').style.width = ((currentQuestion / total) * 100) + '%';
+      document.getElementById('progressText').textContent = `Question ${currentQuestion + 1} / ${total}`;
+      const inputType = q.multi ? 'checkbox' : 'radio';
+      let html = `<div class="card"><p class="question-label">${q.label}</p><p class="question-text">${q.text}</p>`;
+      if (q.multi) html += `<p class="hint">⚠ Plusieurs réponses possibles</p>`;
+      if (q.code) html += `<pre><code>${q.code}</code></pre>`;
+      html += `<ul class="options">`;
+      q.options.forEach((opt, i) => { html += `<li><label><input type="${inputType}" name="q" value="${i}"> ${opt}</label></li>`; });
+      html += `</ul><button class="btn btn-primary" id="validateBtn" onclick="validate()" disabled>Valider</button><div class="feedback" id="feedback"></div></div>`;
+      document.getElementById('quizContainer').innerHTML = html;
+      document.querySelectorAll('input[name="q"]').forEach(r => { r.addEventListener('change', () => { document.getElementById('validateBtn').disabled = false; }); });
+      answered = false;
+    }
+    function validate() {
+      if (answered) { currentQuestion++; if (currentQuestion < questions.length) renderQuestion(); else showScore(); return; }
+      answered = true;
+      const q = questions[currentQuestion];
+      const fb = document.getElementById('feedback');
+      const btn = document.getElementById('validateBtn');
+      document.querySelectorAll('input[name="q"]').forEach(r => r.disabled = true);
+      let correct = false;
+      if (q.multi) {
+        const selected = Array.from(document.querySelectorAll('input[name="q"]:checked')).map(el => parseInt(el.value)).sort();
+        const expected = [...q.answer].sort();
+        correct = selected.length === expected.length && selected.every((v, i) => v === expected[i]);
+      } else {
+        const selected = document.querySelector('input[name="q"]:checked');
+        if (!selected) return;
+        correct = parseInt(selected.value) === q.answer;
+      }
+      if (correct) { score++; fb.className = 'feedback correct'; fb.innerHTML = `<strong>Correct !</strong> ${q.explanation}`; }
+      else { fb.className = 'feedback wrong'; fb.innerHTML = `<strong>Incorrect.</strong> ${q.explanation}`; }
+      btn.textContent = currentQuestion < questions.length - 1 ? 'Suivant' : 'Voir le score';
+    }
+    function showScore() {
+      document.getElementById('quizContainer').classList.add('hidden');
+      document.getElementById('progressBar').style.width = '100%';
+      document.getElementById('progressText').textContent = 'Terminé !';
+      const sc = document.getElementById('scoreContainer');
+      sc.classList.remove('hidden');
+      const pct = Math.round((score / questions.length) * 100);
+      let msg = pct === 100 ? 'Parfait !' : pct >= 60 ? 'Bien joué !' : 'Continuez à réviser !';
+      sc.innerHTML = `<div class="score">${score} / ${questions.length}</div><div class="score-label">${msg} (${pct}%)</div><button class="btn-restart" onclick="restart()">Recommencer</button>`;
+    }
+    function restart() { currentQuestion = 0; score = 0; answered = false; document.getElementById('scoreContainer').classList.add('hidden'); document.getElementById('quizContainer').classList.remove('hidden'); renderQuestion(); }
+    renderQuestion();
+  </script>
+</body>
+</html>

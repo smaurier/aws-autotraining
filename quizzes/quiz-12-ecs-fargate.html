@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Quiz 11 — ECS & Fargate</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #1a1a2e; color: #e0e0e0; min-height: 100vh; padding: 2rem 1rem; }
+    .container { max-width: 800px; margin: 0 auto; }
+    h1 { text-align: center; margin-bottom: 0.5rem; font-size: 1.8rem; color: #ffffff; }
+    .subtitle { text-align: center; color: #8892b0; margin-bottom: 2rem; font-size: 1rem; }
+    .progress-bar-container { background: #0d1117; border-radius: 10px; height: 14px; margin-bottom: 2rem; overflow: hidden; }
+    .progress-bar { background: linear-gradient(90deg, #0d6efd, #4dabf7); height: 100%; width: 0%; border-radius: 10px; transition: width 0.4s ease; }
+    .progress-text { text-align: center; color: #8892b0; margin-bottom: 1rem; font-size: 0.9rem; }
+    .card { background: #16213e; border-radius: 12px; padding: 2rem; margin-bottom: 1.5rem; box-shadow: 0 4px 20px rgba(0,0,0,0.3); }
+    .question-label { font-size: 0.85rem; color: #4dabf7; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 0.5rem; }
+    .question-text { font-size: 1.15rem; margin-bottom: 1.2rem; line-height: 1.5; color: #ffffff; }
+    .hint { font-size: 0.85rem; color: #f0ad4e; margin-bottom: 1rem; }
+    pre { background: #0d1117; border: 1px solid #30363d; border-radius: 8px; padding: 1rem; margin-bottom: 1.2rem; overflow-x: auto; font-size: 0.95rem; }
+    code { font-family: 'Consolas', 'Fira Code', 'Courier New', monospace; color: #c9d1d9; }
+    .options { list-style: none; }
+    .options li { margin-bottom: 0.5rem; }
+    .options label { display: flex; align-items: center; gap: 0.75rem; padding: 0.8rem 1rem; background: #0d1117; border: 2px solid #30363d; border-radius: 8px; cursor: pointer; transition: border-color 0.2s, background 0.2s; font-size: 1rem; }
+    .options label:hover { border-color: #4dabf7; background: #1c2a4a; }
+    .options input[type="radio"], .options input[type="checkbox"] { accent-color: #0d6efd; width: 18px; height: 18px; flex-shrink: 0; }
+    .btn { display: inline-block; padding: 0.7rem 2rem; border: none; border-radius: 8px; font-size: 1rem; font-weight: 600; cursor: pointer; transition: background 0.2s, transform 0.1s; }
+    .btn-primary { background: #0d6efd; color: #fff; }
+    .btn-primary:hover { background: #3b82f6; }
+    .btn-primary:disabled { background: #374151; cursor: not-allowed; }
+    .btn-restart { background: #238636; color: #fff; margin-top: 1rem; padding: 0.7rem 2rem; border: none; border-radius: 8px; font-size: 1rem; font-weight: 600; cursor: pointer; }
+    .btn-restart:hover { background: #2ea043; }
+    .feedback { margin-top: 1rem; padding: 1rem 1.2rem; border-radius: 8px; font-size: 0.95rem; line-height: 1.5; display: none; }
+    .feedback.correct { background: #0f5132; border: 1px solid #198754; color: #d1fae5; display: block; }
+    .feedback.wrong { background: #842029; border: 1px solid #dc3545; color: #fdd; display: block; }
+    .score-card { text-align: center; padding: 3rem 2rem; }
+    .score-card .score { font-size: 3rem; font-weight: 700; color: #4dabf7; margin-bottom: 0.5rem; }
+    .score-card .score-label { font-size: 1.2rem; color: #8892b0; margin-bottom: 1.5rem; }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Quiz 11 — ECS & Fargate</h1>
+    <p class="subtitle">ECS, Fargate, task definitions, ECR, service discovery, ALB</p>
+    <div class="progress-bar-container"><div class="progress-bar" id="progressBar"></div></div>
+    <p class="progress-text" id="progressText">Question 1 / 11</p>
+    <div id="quizContainer"></div>
+    <div id="scoreContainer" class="card score-card hidden"></div>
+  </div>
+  <script>
+    const questions = [
+      {
+        label: "Question 1",
+        text: "Quelle est la différence entre ECS avec EC2 Launch Type et ECS avec Fargate ?",
+        options: [
+          "Il n'y a aucune différence",
+          "Avec EC2, vous gérez les instances serveur. Avec Fargate, AWS gère l'infrastructure — vous ne définissez que les conteneurs",
+          "Fargate ne supporte pas les conteneurs Docker",
+          "EC2 Launch Type est moins cher dans tous les cas"
+        ],
+        answer: 1,
+        explanation: "Avec le <strong>EC2 Launch Type</strong>, vous provisionnez et gérez les instances EC2 sous-jacentes. Avec <strong>Fargate</strong>, c'est serverless : vous définissez uniquement le CPU/mémoire par tâche, et AWS gère l'infrastructure."
+      },
+      {
+        label: "Question 2",
+        text: "Qu'est-ce qu'une Task Definition dans ECS ?",
+        options: [
+          "Un fichier Docker Compose",
+          "Un blueprint JSON décrivant un ou plusieurs conteneurs, leurs images, CPU/mémoire, ports, volumes et variables d'environnement",
+          "Un script de déploiement",
+          "Une politique IAM pour les conteneurs"
+        ],
+        answer: 1,
+        explanation: "Une <strong>Task Definition</strong> est un modèle JSON qui définit comment exécuter les conteneurs : image Docker, CPU/mémoire, port mappings, volumes, variables d'environnement, logging, health checks et rôle IAM de la tâche."
+      },
+      {
+        label: "Question 3",
+        text: "Qu'est-ce qu'Amazon ECR (Elastic Container Registry) ?",
+        options: [
+          "Un service d'orchestration de conteneurs",
+          "Un registre Docker privé entièrement géré par AWS pour stocker, gérer et déployer des images de conteneurs",
+          "Un outil de build de conteneurs",
+          "Un service de monitoring de conteneurs"
+        ],
+        answer: 1,
+        explanation: "<strong>ECR</strong> est un registre Docker privé géré par AWS. Il supporte le scanning de vulnérabilités des images, le chiffrement au repos, la réplication cross-region et les lifecycle policies pour nettoyer les anciennes images."
+      },
+      {
+        label: "Question 4",
+        text: "Quelle est la différence entre une ECS Task et un ECS Service ?",
+        options: [
+          "Il n'y a aucune différence",
+          "Une Task est une instance en cours d'exécution d'une Task Definition. Un Service maintient un nombre souhaité de Tasks en exécution avec load balancing et auto-healing",
+          "Un Service est une tâche planifiée (cron)",
+          "Une Task ne peut pas être utilisée avec Fargate"
+        ],
+        answer: 1,
+        explanation: "Une <strong>Task</strong> est l'instanciation d'une Task Definition (les conteneurs en cours d'exécution). Un <strong>Service</strong> garantit qu'un nombre souhaité de Tasks sont toujours en exécution, avec remplacement automatique et intégration ALB."
+      },
+      {
+        label: "Question 5",
+        text: "Quel type de load balancer est recommandé pour les services ECS ?",
+        options: [
+          "Classic Load Balancer (CLB)",
+          "Application Load Balancer (ALB)",
+          "Network Load Balancer (NLB) uniquement",
+          "Gateway Load Balancer (GWLB)"
+        ],
+        answer: 1,
+        explanation: "L'<strong>ALB</strong> (Application Load Balancer) est recommandé pour ECS car il supporte le routage dynamique par port (port mapping), le path-based routing et le host-based routing. Le NLB est utilisé pour les workloads nécessitant des performances réseau ultra-faible latence."
+      },
+      {
+        label: "Question 6",
+        text: "Qu'est-ce que le service discovery dans ECS ?",
+        options: [
+          "Un mécanisme pour découvrir les instances EC2 sous-jacentes",
+          "Un mécanisme basé sur AWS Cloud Map qui enregistre automatiquement les tâches ECS dans un namespace DNS, permettant aux services de se découvrir mutuellement",
+          "Un outil de scan de ports",
+          "Un service de monitoring réseau"
+        ],
+        answer: 1,
+        explanation: "Le <strong>service discovery</strong> ECS utilise AWS Cloud Map pour enregistrer automatiquement les tâches dans un namespace DNS. Les services peuvent se découvrir via des noms DNS (ex: <code>api.local</code>) sans load balancer intermédiaire."
+      },
+      {
+        label: "Question 7",
+        text: "Quels rôles IAM sont associés à une tâche ECS ?",
+        multi: true,
+        options: [
+          "Task Role (permissions pour le code de l'application dans le conteneur)",
+          "Task Execution Role (permissions pour ECS agent : pull d'image ECR, envoi de logs CloudWatch)",
+          "Instance Role (pour les instances EC2 en mode EC2 Launch Type)",
+          "Service Role (pour ECS agent uniquement)"
+        ],
+        answer: [0, 1, 2],
+        explanation: "Le <strong>Task Role</strong> donne des permissions au code applicatif. Le <strong>Task Execution Role</strong> permet à l'agent ECS de pull les images et envoyer les logs. L'<strong>Instance Role</strong> est nécessaire en mode EC2 Launch Type pour l'agent ECS."
+      },
+      {
+        label: "Question 8",
+        text: "Comment configurer l'auto-scaling d'un service ECS ?",
+        options: [
+          "En ajoutant des instances EC2 manuellement",
+          "En utilisant Application Auto Scaling avec des target tracking policies basées sur des métriques (CPU, mémoire, requêtes ALB)",
+          "L'auto-scaling n'est pas supporté avec ECS",
+          "En modifiant le nombre de tâches dans la Task Definition"
+        ],
+        answer: 1,
+        explanation: "<strong>Application Auto Scaling</strong> pour ECS permet de définir des politiques de scaling basées sur le CPU, la mémoire ou des métriques personnalisées. En mode EC2, il faut aussi configurer le Capacity Provider pour scaler les instances sous-jacentes."
+      },
+      {
+        label: "Question 9",
+        text: "Quelle est la taille maximale d'une image Docker dans ECR ?",
+        options: [
+          "2 Go",
+          "10 Go",
+          "Pas de limite explicite (mais les images multi-couches sont supportées)",
+          "500 Mo"
+        ],
+        answer: 2,
+        explanation: "ECR n'impose <strong>pas de limite explicite</strong> sur la taille des images. Les images Docker sont stockées en couches, et ECR gère efficacement le stockage et le transfert. Les bonnes pratiques recommandent des images les plus légères possible."
+      },
+      {
+        label: "Question 10",
+        text: "Quel logging driver est le plus couramment utilisé avec ECS pour envoyer les logs des conteneurs ?",
+        options: [
+          "syslog",
+          "awslogs (envoi vers CloudWatch Logs)",
+          "fluentd uniquement",
+          "journald"
+        ],
+        answer: 1,
+        explanation: "Le driver <strong>awslogs</strong> est le plus courant : il envoie directement les stdout/stderr des conteneurs vers <strong>CloudWatch Logs</strong>. ECS Fargate supporte aussi FireLens (basé sur Fluent Bit) pour un routage plus avancé des logs."
+      },
+      {
+        label: "Question 11",
+        text: "Qu'est-ce qu'un ECS Capacity Provider ?",
+        options: [
+          "Un fournisseur de stockage pour les conteneurs",
+          "Un mécanisme qui associe un cluster ECS à une source de capacité (ASG d'instances EC2 ou Fargate) avec des stratégies de scaling automatique",
+          "Un service de facturation",
+          "Un outil de provisionning réseau"
+        ],
+        answer: 1,
+        explanation: "Un <strong>Capacity Provider</strong> lie un cluster ECS à une source de capacité. Pour Fargate, c'est FARGATE ou FARGATE_SPOT. Pour EC2, il est lié à un Auto Scaling Group avec managed scaling pour ajuster automatiquement le nombre d'instances."
+      }
+    ];
+    let currentQuestion = 0, score = 0, answered = false;
+    function renderQuestion() {
+      const q = questions[currentQuestion];
+      const total = questions.length;
+      document.getElementById('progressBar').style.width = ((currentQuestion / total) * 100) + '%';
+      document.getElementById('progressText').textContent = `Question ${currentQuestion + 1} / ${total}`;
+      const inputType = q.multi ? 'checkbox' : 'radio';
+      let html = `<div class="card"><p class="question-label">${q.label}</p><p class="question-text">${q.text}</p>`;
+      if (q.multi) html += `<p class="hint">⚠ Plusieurs réponses possibles</p>`;
+      if (q.code) html += `<pre><code>${q.code}</code></pre>`;
+      html += `<ul class="options">`;
+      q.options.forEach((opt, i) => { html += `<li><label><input type="${inputType}" name="q" value="${i}"> ${opt}</label></li>`; });
+      html += `</ul><button class="btn btn-primary" id="validateBtn" onclick="validate()" disabled>Valider</button><div class="feedback" id="feedback"></div></div>`;
+      document.getElementById('quizContainer').innerHTML = html;
+      document.querySelectorAll('input[name="q"]').forEach(r => { r.addEventListener('change', () => { document.getElementById('validateBtn').disabled = false; }); });
+      answered = false;
+    }
+    function validate() {
+      if (answered) { currentQuestion++; if (currentQuestion < questions.length) renderQuestion(); else showScore(); return; }
+      answered = true;
+      const q = questions[currentQuestion];
+      const fb = document.getElementById('feedback');
+      const btn = document.getElementById('validateBtn');
+      document.querySelectorAll('input[name="q"]').forEach(r => r.disabled = true);
+      let correct = false;
+      if (q.multi) {
+        const selected = Array.from(document.querySelectorAll('input[name="q"]:checked')).map(el => parseInt(el.value)).sort();
+        const expected = [...q.answer].sort();
+        correct = selected.length === expected.length && selected.every((v, i) => v === expected[i]);
+      } else {
+        const selected = document.querySelector('input[name="q"]:checked');
+        if (!selected) return;
+        correct = parseInt(selected.value) === q.answer;
+      }
+      if (correct) { score++; fb.className = 'feedback correct'; fb.innerHTML = `<strong>Correct !</strong> ${q.explanation}`; }
+      else { fb.className = 'feedback wrong'; fb.innerHTML = `<strong>Incorrect.</strong> ${q.explanation}`; }
+      btn.textContent = currentQuestion < questions.length - 1 ? 'Suivant' : 'Voir le score';
+    }
+    function showScore() {
+      document.getElementById('quizContainer').classList.add('hidden');
+      document.getElementById('progressBar').style.width = '100%';
+      document.getElementById('progressText').textContent = 'Terminé !';
+      const sc = document.getElementById('scoreContainer');
+      sc.classList.remove('hidden');
+      const pct = Math.round((score / questions.length) * 100);
+      let msg = pct === 100 ? 'Parfait !' : pct >= 60 ? 'Bien joué !' : 'Continuez à réviser !';
+      sc.innerHTML = `<div class="score">${score} / ${questions.length}</div><div class="score-label">${msg} (${pct}%)</div><button class="btn-restart" onclick="restart()">Recommencer</button>`;
+    }
+    function restart() { currentQuestion = 0; score = 0; answered = false; document.getElementById('scoreContainer').classList.add('hidden'); document.getElementById('quizContainer').classList.remove('hidden'); renderQuestion(); }
+    renderQuestion();
+  </script>
+</body>
+</html>

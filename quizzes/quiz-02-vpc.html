@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Quiz 02 — VPC</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #1a1a2e; color: #e0e0e0; min-height: 100vh; padding: 2rem 1rem; }
+    .container { max-width: 800px; margin: 0 auto; }
+    h1 { text-align: center; margin-bottom: 0.5rem; font-size: 1.8rem; color: #ffffff; }
+    .subtitle { text-align: center; color: #8892b0; margin-bottom: 2rem; font-size: 1rem; }
+    .progress-bar-container { background: #0d1117; border-radius: 10px; height: 14px; margin-bottom: 2rem; overflow: hidden; }
+    .progress-bar { background: linear-gradient(90deg, #0d6efd, #4dabf7); height: 100%; width: 0%; border-radius: 10px; transition: width 0.4s ease; }
+    .progress-text { text-align: center; color: #8892b0; margin-bottom: 1rem; font-size: 0.9rem; }
+    .card { background: #16213e; border-radius: 12px; padding: 2rem; margin-bottom: 1.5rem; box-shadow: 0 4px 20px rgba(0,0,0,0.3); }
+    .question-label { font-size: 0.85rem; color: #4dabf7; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 0.5rem; }
+    .question-text { font-size: 1.15rem; margin-bottom: 1.2rem; line-height: 1.5; color: #ffffff; }
+    .hint { font-size: 0.85rem; color: #f0ad4e; margin-bottom: 1rem; }
+    pre { background: #0d1117; border: 1px solid #30363d; border-radius: 8px; padding: 1rem; margin-bottom: 1.2rem; overflow-x: auto; font-size: 0.95rem; }
+    code { font-family: 'Consolas', 'Fira Code', 'Courier New', monospace; color: #c9d1d9; }
+    .options { list-style: none; }
+    .options li { margin-bottom: 0.5rem; }
+    .options label { display: flex; align-items: center; gap: 0.75rem; padding: 0.8rem 1rem; background: #0d1117; border: 2px solid #30363d; border-radius: 8px; cursor: pointer; transition: border-color 0.2s, background 0.2s; font-size: 1rem; }
+    .options label:hover { border-color: #4dabf7; background: #1c2a4a; }
+    .options input[type="radio"], .options input[type="checkbox"] { accent-color: #0d6efd; width: 18px; height: 18px; flex-shrink: 0; }
+    .btn { display: inline-block; padding: 0.7rem 2rem; border: none; border-radius: 8px; font-size: 1rem; font-weight: 600; cursor: pointer; transition: background 0.2s, transform 0.1s; }
+    .btn-primary { background: #0d6efd; color: #fff; }
+    .btn-primary:hover { background: #3b82f6; }
+    .btn-primary:disabled { background: #374151; cursor: not-allowed; }
+    .btn-restart { background: #238636; color: #fff; margin-top: 1rem; padding: 0.7rem 2rem; border: none; border-radius: 8px; font-size: 1rem; font-weight: 600; cursor: pointer; }
+    .btn-restart:hover { background: #2ea043; }
+    .feedback { margin-top: 1rem; padding: 1rem 1.2rem; border-radius: 8px; font-size: 0.95rem; line-height: 1.5; display: none; }
+    .feedback.correct { background: #0f5132; border: 1px solid #198754; color: #d1fae5; display: block; }
+    .feedback.wrong { background: #842029; border: 1px solid #dc3545; color: #fdd; display: block; }
+    .score-card { text-align: center; padding: 3rem 2rem; }
+    .score-card .score { font-size: 3rem; font-weight: 700; color: #4dabf7; margin-bottom: 0.5rem; }
+    .score-card .score-label { font-size: 1.2rem; color: #8892b0; margin-bottom: 1.5rem; }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Quiz 02 — VPC</h1>
+    <p class="subtitle">VPC, CIDR, sous-réseaux, Security Groups, NACLs, NAT Gateway, IGW</p>
+    <div class="progress-bar-container"><div class="progress-bar" id="progressBar"></div></div>
+    <p class="progress-text" id="progressText">Question 1 / 11</p>
+    <div id="quizContainer"></div>
+    <div id="scoreContainer" class="card score-card hidden"></div>
+  </div>
+  <script>
+    const questions = [
+      {
+        label: "Question 1",
+        text: "Que signifie VPC dans le contexte AWS ?",
+        options: [
+          "Virtual Private Cloud",
+          "Virtual Public Connection",
+          "Virtual Processing Center",
+          "Virtual Protected Cluster"
+        ],
+        answer: 0,
+        explanation: "<strong>VPC</strong> signifie Virtual Private Cloud. C'est un réseau virtuel isolé dans lequel vous lancez vos ressources AWS."
+      },
+      {
+        label: "Question 2",
+        text: "Quel bloc CIDR est valide pour un VPC AWS ?",
+        options: [
+          "10.0.0.0/8",
+          "10.0.0.0/28",
+          "10.0.0.0/16",
+          "10.0.0.0/30"
+        ],
+        answer: 2,
+        explanation: "Un VPC AWS accepte des blocs CIDR entre /16 (65 536 adresses) et /28 (16 adresses). <code>10.0.0.0/16</code> est un choix classique. <code>/8</code> est trop grand et <code>/30</code> trop petit pour la plupart des usages (mais techniquement valide)."
+      },
+      {
+        label: "Question 3",
+        text: "Quelle est la différence entre un sous-réseau public et un sous-réseau privé ?",
+        options: [
+          "Un sous-réseau public a une taille CIDR plus grande",
+          "Un sous-réseau public possède une route vers un Internet Gateway (IGW), pas un sous-réseau privé",
+          "Un sous-réseau privé ne peut contenir aucune instance EC2",
+          "Il n'y a pas de différence, c'est juste une convention de nommage"
+        ],
+        answer: 1,
+        explanation: "Un <strong>sous-réseau public</strong> a une route dans sa table de routage vers un <strong>Internet Gateway (IGW)</strong>, ce qui permet aux instances avec une IP publique de communiquer avec Internet. Un sous-réseau privé n'a pas cette route."
+      },
+      {
+        label: "Question 4",
+        text: "Quel est le rôle d'un NAT Gateway ?",
+        options: [
+          "Permettre à des ressources Internet d'accéder aux instances privées",
+          "Permettre aux instances d'un sous-réseau privé d'accéder à Internet (trafic sortant uniquement)",
+          "Chiffrer le trafic entre deux VPC",
+          "Remplacer un Internet Gateway"
+        ],
+        answer: 1,
+        explanation: "Un <strong>NAT Gateway</strong> permet aux instances d'un sous-réseau privé d'initier des connexions vers Internet (pour les mises à jour, appels API...) tout en empêchant le trafic entrant non sollicité."
+      },
+      {
+        label: "Question 5",
+        text: "Quelles sont les caractéristiques d'un Security Group ?",
+        multi: true,
+        options: [
+          "Il est stateful (le trafic retour est automatiquement autorisé)",
+          "Il s'applique au niveau de l'instance (ENI)",
+          "Il peut contenir des règles Deny explicites",
+          "Par défaut, tout le trafic entrant est bloqué",
+          "Par défaut, tout le trafic sortant est autorisé"
+        ],
+        answer: [0, 1, 3, 4],
+        explanation: "Les Security Groups sont <strong>stateful</strong>, s'appliquent au niveau de l'instance, bloquent tout le trafic entrant par défaut et autorisent tout le trafic sortant par défaut. Ils ne supportent <strong>pas</strong> de règles Deny explicites — on ne peut qu'ajouter des règles Allow."
+      },
+      {
+        label: "Question 6",
+        text: "Quelle est la différence principale entre un Security Group et une NACL (Network ACL) ?",
+        options: [
+          "Les Security Groups sont stateless, les NACLs sont stateful",
+          "Les Security Groups s'appliquent au niveau de l'instance, les NACLs au niveau du sous-réseau",
+          "Les NACLs ne supportent que les règles Allow",
+          "Il n'y a aucune différence fonctionnelle"
+        ],
+        answer: 1,
+        explanation: "Les <strong>Security Groups</strong> opèrent au niveau de l'instance (ENI) et sont stateful. Les <strong>NACLs</strong> opèrent au niveau du sous-réseau, sont stateless et supportent les règles Allow ET Deny avec un ordre de priorité numérique."
+      },
+      {
+        label: "Question 7",
+        text: "Quel est le rôle d'un Internet Gateway (IGW) ?",
+        options: [
+          "Connecter un VPC à un autre VPC",
+          "Permettre la communication entre un VPC et Internet",
+          "Fournir un service DNS au VPC",
+          "Chiffrer le trafic réseau au sein du VPC"
+        ],
+        answer: 1,
+        explanation: "Un <strong>Internet Gateway (IGW)</strong> est un composant VPC qui permet la communication bidirectionnelle entre les instances d'un VPC (avec IP publique) et Internet. Il est hautement disponible et redondant."
+      },
+      {
+        label: "Question 8",
+        text: "Qu'est-ce que le VPC Peering ?",
+        options: [
+          "Un service de monitoring réseau",
+          "Une connexion réseau privée entre deux VPC permettant le routage du trafic via le réseau AWS",
+          "Un outil de déploiement d'infrastructure",
+          "Un service de load balancing entre VPC"
+        ],
+        answer: 1,
+        explanation: "Le <strong>VPC Peering</strong> établit une connexion réseau privée entre deux VPC (même compte ou comptes différents, même région ou régions différentes). Le trafic reste sur le réseau AWS. Attention : le peering n'est pas transitif."
+      },
+      {
+        label: "Question 9",
+        text: "Combien d'Internet Gateways peut-on attacher à un seul VPC ?",
+        options: [
+          "Autant que nécessaire",
+          "Un seul",
+          "Un par sous-réseau",
+          "Un par Zone de disponibilité"
+        ],
+        answer: 1,
+        explanation: "Un VPC ne peut avoir qu'<strong>un seul Internet Gateway</strong> attaché à la fois. L'IGW est hautement disponible par conception et ne constitue pas un point de défaillance unique."
+      },
+      {
+        label: "Question 10",
+        text: "Quels composants sont nécessaires pour qu'une instance EC2 dans un sous-réseau public soit accessible depuis Internet ?",
+        multi: true,
+        options: [
+          "Un Internet Gateway attaché au VPC",
+          "Une route 0.0.0.0/0 vers l'IGW dans la table de routage du sous-réseau",
+          "Une adresse IP publique ou Elastic IP sur l'instance",
+          "Un Security Group autorisant le trafic entrant sur le port souhaité",
+          "Un NAT Gateway dans le même sous-réseau"
+        ],
+        answer: [0, 1, 2, 3],
+        explanation: "Pour être accessible depuis Internet, une instance a besoin : d'un <strong>IGW</strong>, d'une <strong>route vers l'IGW</strong>, d'une <strong>IP publique/Elastic IP</strong> et d'un <strong>Security Group</strong> autorisant le trafic. Le NAT Gateway n'est pas nécessaire pour un sous-réseau public."
+      },
+      {
+        label: "Question 11",
+        text: "Quel service AWS permet de connecter un réseau on-premises à un VPC de manière sécurisée via Internet ?",
+        options: [
+          "VPC Peering",
+          "AWS Site-to-Site VPN",
+          "AWS CloudFront",
+          "Amazon Route 53"
+        ],
+        answer: 1,
+        explanation: "<strong>AWS Site-to-Site VPN</strong> crée un tunnel IPsec chiffré entre votre réseau on-premises et votre VPC via Internet. Pour une connexion dédiée (sans passer par Internet), on utilise <strong>AWS Direct Connect</strong>."
+      }
+    ];
+    let currentQuestion = 0, score = 0, answered = false;
+    function renderQuestion() {
+      const q = questions[currentQuestion];
+      const total = questions.length;
+      document.getElementById('progressBar').style.width = ((currentQuestion / total) * 100) + '%';
+      document.getElementById('progressText').textContent = `Question ${currentQuestion + 1} / ${total}`;
+      const inputType = q.multi ? 'checkbox' : 'radio';
+      let html = `<div class="card"><p class="question-label">${q.label}</p><p class="question-text">${q.text}</p>`;
+      if (q.multi) html += `<p class="hint">⚠ Plusieurs réponses possibles</p>`;
+      if (q.code) html += `<pre><code>${q.code}</code></pre>`;
+      html += `<ul class="options">`;
+      q.options.forEach((opt, i) => { html += `<li><label><input type="${inputType}" name="q" value="${i}"> ${opt}</label></li>`; });
+      html += `</ul><button class="btn btn-primary" id="validateBtn" onclick="validate()" disabled>Valider</button><div class="feedback" id="feedback"></div></div>`;
+      document.getElementById('quizContainer').innerHTML = html;
+      document.querySelectorAll('input[name="q"]').forEach(r => { r.addEventListener('change', () => { document.getElementById('validateBtn').disabled = false; }); });
+      answered = false;
+    }
+    function validate() {
+      if (answered) { currentQuestion++; if (currentQuestion < questions.length) renderQuestion(); else showScore(); return; }
+      answered = true;
+      const q = questions[currentQuestion];
+      const fb = document.getElementById('feedback');
+      const btn = document.getElementById('validateBtn');
+      document.querySelectorAll('input[name="q"]').forEach(r => r.disabled = true);
+      let correct = false;
+      if (q.multi) {
+        const selected = Array.from(document.querySelectorAll('input[name="q"]:checked')).map(el => parseInt(el.value)).sort();
+        const expected = [...q.answer].sort();
+        correct = selected.length === expected.length && selected.every((v, i) => v === expected[i]);
+      } else {
+        const selected = document.querySelector('input[name="q"]:checked');
+        if (!selected) return;
+        correct = parseInt(selected.value) === q.answer;
+      }
+      if (correct) { score++; fb.className = 'feedback correct'; fb.innerHTML = `<strong>Correct !</strong> ${q.explanation}`; }
+      else { fb.className = 'feedback wrong'; fb.innerHTML = `<strong>Incorrect.</strong> ${q.explanation}`; }
+      btn.textContent = currentQuestion < questions.length - 1 ? 'Suivant' : 'Voir le score';
+    }
+    function showScore() {
+      document.getElementById('quizContainer').classList.add('hidden');
+      document.getElementById('progressBar').style.width = '100%';
+      document.getElementById('progressText').textContent = 'Terminé !';
+      const sc = document.getElementById('scoreContainer');
+      sc.classList.remove('hidden');
+      const pct = Math.round((score / questions.length) * 100);
+      let msg = pct === 100 ? 'Parfait !' : pct >= 60 ? 'Bien joué !' : 'Continuez à réviser !';
+      sc.innerHTML = `<div class="score">${score} / ${questions.length}</div><div class="score-label">${msg} (${pct}%)</div><button class="btn-restart" onclick="restart()">Recommencer</button>`;
+    }
+    function restart() { currentQuestion = 0; score = 0; answered = false; document.getElementById('scoreContainer').classList.add('hidden'); document.getElementById('quizContainer').classList.remove('hidden'); renderQuestion(); }
+    renderQuestion();
+  </script>
+</body>
+</html>
