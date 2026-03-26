@@ -5,9 +5,10 @@
   "type": "module",
   "private": true,
   "scripts": {
+    "docs:dev": "vitepress dev",
+    "docs:build": "vitepress build",
+    "docs:preview": "vitepress preview",
     "dev": "vitepress dev",
-    "build": "vitepress build",
-    "preview": "vitepress preview",
     "lab:00": "npx tsx labs/lab-00/exercise.ts",
     "lab:01": "npx tsx labs/lab-01/exercise.ts",
     "lab:02": "npx tsx labs/lab-02/exercise.ts",
