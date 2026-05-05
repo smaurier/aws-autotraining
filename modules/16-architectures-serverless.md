@@ -184,6 +184,20 @@ Le resultat est un tableau avec les sorties de chaque branche.
 | **Historique** | Complet (console) | CloudWatch Logs |
 | **Cas d'usage** | Workflows longs (commandes, approbations) | Traitement haute frequence (IoT, streaming) |
 
+### Parametres de depart recommandes
+
+Pour eviter les configurations arbitraires, voici une base simple a appliquer puis ajuster avec la production :
+
+| Sujet | Point de depart |
+|---|---|
+| Retry Task Step Functions | `MaxAttempts: 3`, `IntervalSeconds: 2`, `BackoffRate: 2.0` |
+| Timeout d'une Lambda metier | 10-30 s (eviter 120+ s par defaut) |
+| DLQ / destination d'echec async | Activee systematiquement |
+| Correlation ID | Propage de l'entree API jusqu'aux events |
+| Alarme erreurs | seuil initial a 1% sur 5 min |
+
+L'idee n'est pas d'etre parfait du premier coup, mais d'avoir une baseline mesurable et defendable.
+
 ---
 
 ## Step Functions + Lambda + DynamoDB
