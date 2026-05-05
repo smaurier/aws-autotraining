@@ -24,6 +24,8 @@ hero:
 - Module 08 : SQS, SNS & EventBridge
 - Module 09 : Cognito — Authentification
 
+Ces modules permettent de construire des APIs et des workflows asynchrones robustes, en traitant explicitement les retries, les erreurs temporaires et la traçabilité des événements.
+
 ### Palier 3 — Infrastructure & Containers
 - Module 10 : CDK — Infrastructure as Code
 - Module 11 : ECS & Fargate
@@ -36,3 +38,5 @@ hero:
 - Module 16 : Architectures Serverless Avancées
 - Module 17 : CI/CD & DevOps AWS
 - Module 18 : Projet Final — Architecture Cloud Complète
+
+L'accent est mis sur la réalité d'exploitation : observabilité, fiabilité des flux, coût, sécurité IAM et qualité de déploiement en continu.
