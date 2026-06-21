@@ -250,8 +250,8 @@ Resources
 [+] AWS::S3::Bucket MyBucket MyBucket560B80BC
 [~] AWS::Lambda::Function MyFunction
  └── [~] Runtime
-     ├── [-] nodejs18.x
-     └── [+] nodejs20.x
+     ├── [-] nodejs18.x   ← Node.js 18 EOL depuis avril 2024
+     └── [+] nodejs20.x   ← migrer vers nodejs20.x ou nodejs22.x
 ```
 
 - `[+]` = nouvelle ressource
