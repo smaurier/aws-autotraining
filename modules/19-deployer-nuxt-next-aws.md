@@ -141,7 +141,7 @@ new sst.aws.Nuxt('Web', {
 })
 ```
 
-<!-- FLAG-DOC: SST doc (component/aws/nuxt) indique le préfixe VUE_APP_ pour exposer une var au navigateur via le composant Nuxt. Le préfixe Nuxt natif habituel est NUXT_PUBLIC_ (runtimeConfig). Revérifier sur sst.dev le préfixe exact attendu par sst.aws.Nuxt avant un déploiement prod. -->
+> **Préfixe côté navigateur avec `sst.aws.Nuxt` :** le composant Nuxt de SST expose au navigateur les variables préfixées **`VUE_APP_`** (et non le `NUXT_PUBLIC_` natif de `runtimeConfig`). C'est bien `VUE_APP_API_URL` qu'il faut déclarer dans `environment` pour un accès client.
 
 Le composant crée automatiquement : la (les) Lambda de SSR, le bucket S3 des assets, la distribution CloudFront, et le certificat ACM + les enregistrements Route 53 pour le domaine.
 

@@ -359,7 +359,7 @@ La sécurité avancée s'applique à toute l'infra TribuZen vue dans le fil-roug
 | Clé d'API du mailer, credentials RDS | **Secrets Manager**, chiffrés par `alias/tribuzen-data`, rotation planifiée |
 | Configuration non secrète (URLs, feature flags) | **Parameter Store** (String / SecureString) |
 | Avatars S3, feed DynamoDB, volumes | **chiffrement at rest SSE-KMS** avec la customer managed key TribuZen |
-| API Gateway devant les Lambda | **WAF** : AWS Managed Rules + règle **rate-based** sur l'endpoint d'invitation |
+| CloudFront devant l'API (HTTP API + Lambda) | **WAF** : AWS Managed Rules + règle **rate-based** sur l'endpoint d'invitation. WAF ne s'attache **pas** à une HTTP API (v2) — on le pose sur **CloudFront devant l'API** (REST API / ALB / CloudFront seulement). |
 | Compte AWS TribuZen | **GuardDuty** activé (sources fondamentales) + **Security Hub** pour la vue consolidée |
 | Comptes de l'organisation | **SCP** « régions Europe uniquement » + « interdiction de désactiver CloudTrail » sur l'OU prod |
 | Accès délégué (admin junior) | **permissions boundary** plafonnant ce qu'il peut créer |

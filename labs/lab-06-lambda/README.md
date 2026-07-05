@@ -88,7 +88,7 @@ export const handler = async (event, context) => {
    zip function.zip index.mjs
    aws lambda create-function \
      --function-name tribuzen-lab-echo \
-     --runtime nodejs20.x \
+     --runtime nodejs22.x \
      --handler index.handler \
      --role arn:aws:iam::<ACCOUNT_ID>:role/<ton-role-lambda> \
      --zip-file fileb://function.zip \
@@ -147,7 +147,7 @@ export class Lab06Stack extends Stack {
       functionName: 'tribuzen-lab-echo',
       entry: 'lambda/index.mjs',   // CDK bundle automatiquement avec esbuild
       handler: 'handler',          // -> propriété Handler = index.handler
-      runtime: Runtime.NODEJS_20_X,
+      runtime: Runtime.NODEJS_22_X,
       memorySize: 256,             // CPU proportionnel ; passe à 512 à l'étape 7
       timeout: Duration.seconds(10),
       environment: { STAGE: 'lab' },

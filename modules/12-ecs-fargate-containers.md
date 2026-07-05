@@ -109,7 +109,7 @@ En Fargate, on ne choisit pas n'importe quel couple : le `cpu` détermine une **
 | CPU (task) | Valeurs mémoire autorisées |
 |------------|-----------------------------|
 | **256** (.25 vCPU) | 512 MiB, 1 Go, 2 Go |
-| **512** (.5 vCPU) | 1 à 4 Go (pas de 1 Go) — 1, 2, 3, 4 Go |
+| **512** (.5 vCPU) | 1 à 4 Go (pas de 512 Mo) — 1, 2, 3, 4 Go |
 | **1024** (1 vCPU) | 2 à 8 Go (par 1 Go) |
 | **2048** (2 vCPU) | 4 à 16 Go (par 1 Go) |
 | **4096** (4 vCPU) | 8 à 30 Go (par 1 Go) |

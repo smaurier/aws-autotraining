@@ -69,7 +69,7 @@ Le fil conducteur de TribuZen : **charge variable, petite équipe, budget qui su
 | **Traitement image** | miniature à l'upload | **Lambda déclenchée par S3** (06) | Asynchrone, découplé de l'API. Bucket source ≠ destination (anti-boucle). |
 | **Notifications** | prévenir les membres à chaque post | **DynamoDB Streams → Lambda → SNS/EventBridge** (10) | Event-driven : le feed est la source de vérité, la notif est un effet de bord découplé. Pas de polling. |
 | **Distribution front** | SPA HTTPS rapide | **S3 (privé) + CloudFront + OAC** (13) | CDN au edge, HTTPS via ACM, bucket **jamais** public. |
-| **Sécurité périmètre** | anti-abus, WAF | **WAF sur CloudFront/API** (15) | Managed rule sets + rate-limit. Optionnel au démarrage (coût fixe), à activer avant l'ouverture publique. |
+| **Sécurité périmètre** | anti-abus, WAF | **WAF sur CloudFront** (15) | Managed rule sets + rate-limit. **WAF ne s'attache pas à une HTTP API (v2)** — on le pose sur **CloudFront devant l'API**. Optionnel au démarrage (coût fixe), à activer avant l'ouverture publique. |
 | **Secrets** | clés tierces (mailer, etc.) | **Secrets Manager / SSM** (15) | Jamais de secret en variable d'env en clair ni dans le code. |
 | **Observabilité** | logs, métriques, traces, alarmes | **CloudWatch + X-Ray** (14) | Logs structurés, alarmes → SNS email, traces distribuées end-to-end. |
 | **IaC** | tout reproductible | **CDK** (05) | Stacks TypeScript, `cdk deploy/diff/destroy`, revues en PR. Zéro ressource cliquée à la main. |

@@ -62,10 +62,39 @@ VPC TribuZen  10.0.0.0/16   (eu-west-3, 2 AZ)
 
 ### Encadré — tester la connectivité (le cœur du lab)
 
+Pour joindre l'instance privée **sans SSH ni IP publique**, on passe par **SSM Session Manager**. Ça exige que l'instance porte un **rôle IAM** (via un *instance profile*) avec la policy managée **`AmazonSSMManagedInstanceCore`** — sinon l'agent SSM ne peut pas s'enregistrer et `start-session` échoue avec `TargetNotConnected`.
+
+> **Note :** SSM (rôle, instance profile, Session Manager) est détaillé au **module 03**. Ici on l'utilise juste comme moyen d'accès à une instance sans IP publique.
+
 ```bash
-# Lance une instance de test dans le subnet PRIVÉ (SG-private), sans IP publique
-#   Utilise l'AMI Amazon Linux 2023 de ta région ; connecte-toi via SSM Session Manager
-#   (pas de SSH direct : l'instance n'a pas d'IP publique — c'est le but)
+# ─── Rôle IAM + instance profile pour SSM (à créer AVANT run-instances) ──────
+cat > ssm-trust.json <<'EOF'
+{ "Version": "2012-10-17",
+  "Statement": [{ "Effect": "Allow",
+    "Principal": { "Service": "ec2.amazonaws.com" },
+    "Action": "sts:AssumeRole" }] }
+EOF
+aws iam create-role --role-name tribuzen-ssm-role \
+  --assume-role-policy-document file://ssm-trust.json
+aws iam attach-role-policy --role-name tribuzen-ssm-role \
+  --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+aws iam create-instance-profile --instance-profile-name tribuzen-ssm-profile
+aws iam add-role-to-instance-profile \
+  --instance-profile-name tribuzen-ssm-profile --role-name tribuzen-ssm-role
+
+# ─── Instance de test dans le subnet PRIVÉ (SG-private), SANS IP publique ─────
+#   AMI Amazon Linux 2023 (agent SSM préinstallé) ; --iam-instance-profile = accès SSM
+#   --no-associate-public-ip-address : l'instance reste privée (c'est le but)
+aws ec2 run-instances \
+  --image-id ami-0abcdef1234567890 \
+  --instance-type t3.micro \
+  --subnet-id subnet-priv \
+  --security-group-ids sg-priv \
+  --iam-instance-profile Name=tribuzen-ssm-profile \
+  --no-associate-public-ip-address \
+  --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=tribuzen-test-priv}]'
+# → i-xxxx ; attends l'état "running", puis connecte-toi :
+aws ssm start-session --target i-xxxx
 
 # Depuis la session SSM sur l'instance privée :
 curl -s -o /dev/null -w "%{http_code}\n" https://aws.amazon.com   # attendu : 200  → sortie NAT OK
@@ -179,6 +208,14 @@ aws ec2 delete-security-group --group-id sg-pub
 
 # 5. VPC
 aws ec2 delete-vpc --vpc-id vpc-0aaa
+
+# 6. Rôle IAM + instance profile SSM (retirer le rôle du profile AVANT de supprimer)
+aws iam remove-role-from-instance-profile \
+  --instance-profile-name tribuzen-ssm-profile --role-name tribuzen-ssm-role
+aws iam delete-instance-profile --instance-profile-name tribuzen-ssm-profile
+aws iam detach-role-policy --role-name tribuzen-ssm-role \
+  --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+aws iam delete-role --role-name tribuzen-ssm-role
 ```
 
 ✅ **Vérification finale :** `aws ec2 describe-nat-gateways --filter "Name=state,Values=available"` doit renvoyer **une liste vide**. Va aussi voir **Billing → Cost Explorer** le lendemain.

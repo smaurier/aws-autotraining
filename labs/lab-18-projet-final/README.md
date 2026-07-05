@@ -59,14 +59,17 @@ lab18/
   cdk.json, package.json    ← générés par `cdk init app --language typescript`
 ```
 
-Démarre par : `mkdir lab18 && cd lab18 && cdk init app --language typescript`, puis installe les modules d'intégration HTTP API :
+Démarre par : `mkdir lab18 && cd lab18 && cdk init app --language typescript`.
 
-```bash
-npm install @aws-cdk/aws-apigatewayv2-alpha @aws-cdk/aws-apigatewayv2-authorizers-alpha \
-            @aws-cdk/aws-apigatewayv2-integrations-alpha
-# NB : selon ta version d'aws-cdk-lib, HTTP API peut être STABLE (aws-cdk-lib/aws-apigatewayv2*)
-#      ou en module -alpha séparé. Vérifie avec `cdk --version` et adapte les imports.
+Les constructs L2 **HTTP API** (`HttpApi`, `HttpUserPoolAuthorizer`, `HttpLambdaIntegration`) ont **gradué STABLE** : ils sont **inclus dans `aws-cdk-lib`**, aucun paquet à installer. On importe directement :
+
+```typescript
+import { HttpApi, HttpMethod } from 'aws-cdk-lib/aws-apigatewayv2';
+import { HttpUserPoolAuthorizer } from 'aws-cdk-lib/aws-apigatewayv2-authorizers';
+import { HttpLambdaIntegration } from 'aws-cdk-lib/aws-apigatewayv2-integrations';
 ```
+
+> **Note de repli (anciennes versions d'aws-cdk-lib < 2.87)** : ces constructs étaient alors en paquets `-alpha` séparés (`npm install @aws-cdk/aws-apigatewayv2-alpha …`), désormais **dépréciés**. Si tu es sur une vieille version, mets à jour `aws-cdk-lib` plutôt que d'installer l'alpha.
 
 <!-- FLAG-DOC: statut (stable vs -alpha) des constructs L2 apigatewayv2 (HttpApi, HttpUserPoolAuthorizer, HttpLambdaIntegration) dépend de la version d'aws-cdk-lib installée — vérifier sur docs.aws.amazon.com/cdk et adapter le chemin d'import. Le corrigé montre la forme stable aws-cdk-lib/aws-apigatewayv2*. -->
 

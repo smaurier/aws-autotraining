@@ -239,7 +239,7 @@ Dans le vrai produit, ce pool n'est pas créé à la main mais **par le CDK** (m
 tribuzen-infra/
   lib/
     auth-stack.ts        # UserPool + UserPoolClient (aws-cdk-lib/aws-cognito)
-    api-stack.ts         # HttpApi + CognitoUserPoolsAuthorizer devant les Lambda du feed
+    api-stack.ts         # HttpApi + HttpUserPoolAuthorizer devant les Lambda du feed
   lambda/
     post-confirmation.ts # trigger : crée le profil famille dans DynamoDB
     pre-token-gen.ts     # trigger : ajoute family_id aux claims du JWT

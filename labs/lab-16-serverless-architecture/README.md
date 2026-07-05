@@ -129,7 +129,7 @@ Tu produis chaque commande / bloc ASL toi-même. Les commandes de création sont
 5. **Écris l'ASL complète** dans `avatar-workflow.asl.json` (c'est le vrai travail — voir corrigé). Points de friction :
    - la règle `Choice` : `NumericGreaterThan` sur `$.sizeBytes` avec seuil `5242880` → `RejectUpload`.
    - `WriteFeed` : `Resource: arn:aws:states:::dynamodb:putItem`, `Parameters` avec `ConditionExpression: attribute_not_exists(sk)`, et **l'ordre Retry puis deux Catch**.
-   - le premier `Catch` cible **précisément** `DynamoDb.ConditionalCheckFailedException` → `AlreadyProcessed` (idempotence), le second cible `States.ALL` → `CompensateAndFail` (saga).
+   - le premier `Catch` cible **précisément** `DynamoDB.ConditionalCheckFailedException` → `AlreadyProcessed` (idempotence), le second cible `States.ALL` → `CompensateAndFail` (saga).
 
 6. **Crée la state machine** (type **Standard**, immuable — module 16 §2.8) :
    ```bash
@@ -170,7 +170,7 @@ Tu produis chaque commande / bloc ASL toi-même. Les commandes de création sont
      --input '{"familyId":"fam-42","uploadId":"up-001","sizeBytes":1048576}' \
      --region eu-west-1
    ```
-   Dans la console, ouvre cette exécution : `WriteFeed` lève `DynamoDb.ConditionalCheckFailedException`, le `Catch` la route vers `AlreadyProcessed`, l'exécution finit **`SUCCEEDED`** — **et il n'y a toujours qu'un seul item** dans DynamoDB. Tu viens de voir l'idempotence empêcher un doublon, en vrai.
+   Dans la console, ouvre cette exécution : `WriteFeed` lève `DynamoDB.ConditionalCheckFailedException`, le `Catch` la route vers `AlreadyProcessed`, l'exécution finit **`SUCCEEDED`** — **et il n'y a toujours qu'un seul item** dans DynamoDB. Tu viens de voir l'idempotence empêcher un doublon, en vrai.
 
 10. **Vérifie le rejet.** Relance avec un fichier trop lourd → le `Choice` route vers `RejectUpload`, exécution **`FAILED`** avec `Error: ValidationError` :
     ```bash
@@ -238,7 +238,7 @@ Tu produis chaque commande / bloc ASL toi-même. Les commandes de création sont
       },
       "Retry": [
         {
-          "ErrorEquals": ["DynamoDb.InternalServerError", "States.Timeout"],
+          "ErrorEquals": ["DynamoDB.InternalServerError", "States.Timeout"],
           "IntervalSeconds": 2,
           "MaxAttempts": 3,
           "BackoffRate": 2.0
@@ -246,7 +246,7 @@ Tu produis chaque commande / bloc ASL toi-même. Les commandes de création sont
       ],
       "Catch": [
         {
-          "ErrorEquals": ["DynamoDb.ConditionalCheckFailedException"],
+          "ErrorEquals": ["DynamoDB.ConditionalCheckFailedException"],
           "Next": "AlreadyProcessed"
         },
         {
@@ -305,7 +305,7 @@ Tu produis chaque commande / bloc ASL toi-même. Les commandes de création sont
 
 - **`Choice` avant tout travail** — on rejette un fichier trop lourd sans avoir rien écrit. `NumericGreaterThan` compare `$.sizeBytes` (entrée du workflow) au seuil 5 Mo (`5242880`).
 - **`GenerateThumbnail` est un `Pass`** — il représente l'étape sans en faire le travail réel. `ResultPath: "$.thumbnail"` **enrichit** l'entrée au lieu de l'écraser : `$.familyId` et `$.uploadId` restent disponibles pour la suite. C'est le piège classique — un `Pass` sans `ResultPath` remplace tout le contexte.
-- **`WriteFeed` est le cœur.** `ConditionExpression: attribute_not_exists(sk)` rend l'écriture idempotente : un `uploadId` déjà présent lève `DynamoDb.ConditionalCheckFailedException`.
+- **`WriteFeed` est le cœur.** `ConditionExpression: attribute_not_exists(sk)` rend l'écriture idempotente : un `uploadId` déjà présent lève `DynamoDB.ConditionalCheckFailedException`.
 - **L'ordre `Retry` puis `Catch` compte.** Step Functions évalue `Retry` d'abord. On ne retente **que** les erreurs transitoires (`InternalServerError`, `Timeout`) — surtout pas la conditionnelle, qui ne réussira jamais au retry.
 - **Deux `Catch`, du plus précis au plus large.** Le premier attrape `ConditionalCheckFailedException` → `AlreadyProcessed` : le rejeu est un **succès** (la donnée existe déjà), pas une erreur. Le second, `States.ALL`, est le filet de sécurité → `CompensateAndFail` (la saga du module 16 §2.10). Inverser l'ordre casserait tout : `States.ALL` matcherait en premier et l'idempotence ne serait jamais atteinte.
 - **`$$.State.EnteredTime`** (double `$$`) lit le **contexte d'exécution**, pas l'entrée. Un seul `$` chercherait un champ `createdAt` dans l'input, qui n'existe pas.

@@ -45,7 +45,7 @@ Ce que ce code n'a pas et n'aura jamais sans des semaines de travail :
 
 **Cognito** fournit tout ça en service managé : un **User Pool** est un annuaire d'utilisateurs qui *authentifie* et émet des **JWT** standards (OIDC). Un **Identity Pool** échange ensuite ces tokens contre des **credentials AWS temporaires** (via STS) si le front doit taper directement S3/DynamoDB. À la fin de ce module, tu sais lequel des deux tu veux, comment obtenir les tokens, et comment le backend les vérifie sans jamais voir le mot de passe.
 
-<!-- FLAG-DOC: le free tier Cognito (nombre de MAU offerts) a changé de modèle en 2024-2025 ; vérifier le chiffre exact sur aws.amazon.com/cognito/pricing avant de citer un nombre en session. -->
+> **Free tier Cognito :** depuis nov. 2024, les User Pools offrent **10 000 MAU gratuits/mois** (tier Lite ou Essentials), un tier permanent qui n'expire pas. Les pools créés avant cette date conservent en grandfathering l'ancien palier de 50 000 MAU. La fédération SAML/OIDC n'a droit qu'à **50 MAU** gratuits.
 
 ---
 
