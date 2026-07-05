@@ -1,706 +1,407 @@
-# Module 11 — Cognito — Authentification et gestion des identités
+---
+titre: Cognito — Authentification et identités managées
+cours: 12-aws-cloud
+notions: [User Pool, Identity Pool, "sign-up / confirm-sign-up", initiate-auth, "SRP (secure remote password)", USER_SRP_AUTH, USER_PASSWORD_AUTH, REFRESH_TOKEN_AUTH, ID token, access token, refresh token, "token_use = id | access", "claim cognito:groups", JWKS, "iss / aud / client_id", RS256, app client, "hosted UI / managed login", domaine Cognito, triggers Lambda, pre token generation, "fédération OIDC / SAML", "COGNITO_USER_POOLS authorizer", MFA TOTP, "credentials temporaires STS"]
+outcomes:
+  - sait distinguer un User Pool (authentification, JWT) d'un Identity Pool (credentials AWS temporaires via STS) et choisir le bon
+  - sait dérouler un flux sign-up / confirm / sign-in avec l'AWS CLI et récupérer les trois tokens
+  - sait décoder et vérifier un JWT Cognito (signature JWKS, iss, aud/client_id, token_use, exp)
+  - sait brancher un User Pool comme authorizer d'API Gateway et lire les claims côté backend
+prerequis: [Modules 00-10 du cours 12-aws-cloud, dont 01-iam (roles, STS, moindre privilège) et 07-api-gateway (REST vs HTTP API, autorisers)]
+next: 12-ecs-fargate-containers
+libs: []
+tribuzen: infra cloud TribuZen — authentification des familles via un User Pool Cognito, JWT vérifié par l'API Gateway devant les Lambda du feed
+last-reviewed: 2026-07
+---
 
-> **Objectif** : Comprendre les User Pools et Identity Pools de Cognito, implémenter un flux d'authentification complet (inscription, connexion, MFA, fédération), gérer les tokens JWT, et intégrer Cognito avec API Gateway et Lambda.
+# Cognito — Authentification et identités managées
+
+> **Outcomes — tu sauras FAIRE :** distinguer User Pool et Identity Pool, dérouler un flux sign-up/sign-in en CLI et récupérer les tokens, décoder et vérifier un JWT Cognito, brancher un User Pool comme authorizer d'API Gateway.
+> **Difficulté :** :star::star::star:
 >
-> **Difficulté** : ⭐⭐⭐ (avancé)
->
-> **Prérequis** : Module 01 (IAM), Module 06 (API Gateway)
->
-> **Durée estimée** : 3h30
+> **Portée :** ce module couvre **Cognito seul** — User Pools, Identity Pools, flux d'authentification, JWT, triggers, fédération (survol), intégration API Gateway. Il **réutilise** IAM/STS (module 01) et API Gateway (module 07) sans les réexpliquer. Le chiffrement (**KMS**), les secrets (**Secrets Manager**) et le WAF devant l'auth relèvent du **module 15 (sécurité AWS avancée)**. Ici, une seule question : *comment prouver qui est l'utilisateur, et quoi faire de cette preuve ?*
+
+## 1. Cas concret d'abord
+
+TribuZen a besoin de connecter les membres d'une famille : chaque parent se crée un compte, confirme son email, se connecte, et l'app appelle ensuite l'API du feed familial. Un collègue propose de « faire l'auth nous-mêmes » dans une Lambda :
+
+```ts
+// ❌ auth "maison" dans une Lambda — le piège classique
+export async function login(email: string, password: string) {
+  const user = await db.getUser(email)
+  if (user.passwordHash === md5(password)) {        // hash cassé, pas de sel
+    return { token: sign({ email }, 'super-secret') } // secret en dur, jamais tourné
+  }
+  throw new Error('invalid')
+}
+```
+
+Ce que ce code n'a pas et n'aura jamais sans des semaines de travail :
+
+1. Un **hash de mot de passe** correct (bcrypt/Argon2 + sel), pas `md5`.
+2. La **vérification d'email**, le **reset de mot de passe**, le **MFA**, le blocage anti brute-force.
+3. Une **rotation des clés de signature** des tokens, et une signature **asymétrique** (le backend ne devrait pas connaître le secret pour *vérifier* un token).
+4. La **fédération** (« se connecter avec Google ») et le **SSO** entreprise (SAML) quand un client B2B le demandera.
+
+**Cognito** fournit tout ça en service managé : un **User Pool** est un annuaire d'utilisateurs qui *authentifie* et émet des **JWT** standards (OIDC). Un **Identity Pool** échange ensuite ces tokens contre des **credentials AWS temporaires** (via STS) si le front doit taper directement S3/DynamoDB. À la fin de ce module, tu sais lequel des deux tu veux, comment obtenir les tokens, et comment le backend les vérifie sans jamais voir le mot de passe.
+
+<!-- FLAG-DOC: le free tier Cognito (nombre de MAU offerts) a changé de modèle en 2024-2025 ; vérifier le chiffre exact sur aws.amazon.com/cognito/pricing avant de citer un nombre en session. -->
 
 ---
 
-## Table des matières
+## 2. Théorie complète, concise
 
-1. [Pourquoi Cognito](#1-pourquoi-cognito)
-2. [User Pools](#2-user-pools)
-3. [Flux d'authentification](#3-flux-dauthentification)
-4. [Tokens JWT](#4-tokens-jwt)
-5. [MFA — Authentification multi-facteurs](#5-mfa--authentification-multi-facteurs)
-6. [Hosted UI et Custom UI](#6-hosted-ui-et-custom-ui)
-7. [Fédération d'identité](#7-fédération-didentité)
-8. [Identity Pools](#8-identity-pools)
-9. [Lambda Triggers](#9-lambda-triggers)
-10. [Intégration avec API Gateway](#10-intégration-avec-api-gateway)
-11. [TypeScript SDK v3](#11-typescript-sdk-v3)
-12. [Bonnes pratiques](#12-bonnes-pratiques)
-13. [Récapitulatif](#13-récapitulatif)
+### 2.1 Les deux composants : User Pool vs Identity Pool
 
----
+C'est **LA** distinction du module. Les deux sont indépendants et se combinent souvent, mais ne répondent pas à la même question (formulation doc AWS : « The two components... operate independently or in tandem »).
 
-## 1. Pourquoi Cognito
-
-### 1.1 Le problème qu'il résout
-
-Implémenter un système d'authentification robuste est complexe et risqué. Vous devez gérer :
-
-- Le stockage sécurisé des mots de passe (hashing, salting)
-- Les flux d'inscription et de vérification d'email
-- La réinitialisation de mot de passe
-- L'authentification multi-facteurs (MFA)
-- La fédération avec des fournisseurs externes (Google, Facebook)
-- La gestion et la rotation des tokens
-- La protection contre les attaques (brute force, credential stuffing)
-
-Cognito fournit tout cela **en tant que service managé**, avec un free tier de **50 000 utilisateurs actifs mensuels**.
-
-> **Analogie** : Cognito est comme le service de sécurité à l'entrée d'un immeuble de bureaux. Il vérifie l'identité de chaque visiteur (authentification), lui donne un badge d'accès (token JWT) indiquant les étages auxquels il a droit (autorisations), et gère la liste des employés autorisés (User Pool).
-
-### 1.2 Les deux composants principaux
-
-| Composant | Rôle | Analogie |
+| | **User Pool** | **Identity Pool** (Federated Identities) |
 |---|---|---|
-| **User Pool** | Annuaire d'utilisateurs + authentification | La liste des employés et la vérification du badge |
-| **Identity Pool** | Échange de tokens contre des credentials AWS temporaires | Le badge donne accès à certaines salles (services AWS) |
+| Question | *Qui es-tu ?* (**authentification**) | *À quelles ressources AWS as-tu droit ?* (**autorisation AWS**) |
+| Ce qu'il est | un **annuaire** d'utilisateurs + serveur d'auth OIDC | un **courtier de credentials** |
+| Ce qu'il produit | des **JWT** (ID, access, refresh) | des **credentials AWS temporaires** (AccessKeyId, SecretAccessKey, SessionToken) via **STS** |
+| Pour quoi | connexion à ton app/API, autoriser des appels API | accès **direct** du client à S3, DynamoDB… |
+| Peut fonctionner seul | oui (« issue authenticated JWTs directly to an app, a web server, or an API ») | oui (accepte aussi des claims d'IdP tiers) |
+
+Combinés (scénario doc AWS) :
 
 ```
-Utilisateur → User Pool (login) → Token JWT
-                                       ↓
-                              Identity Pool → Credentials AWS temporaires
-                                       ↓
-                              Accès direct à S3, DynamoDB, etc.
+1. L'utilisateur se connecte via le User Pool        → reçoit des tokens OAuth 2.0 (JWT)
+2. L'app échange le token du User Pool auprès de     → l'Identity Pool
+3. L'Identity Pool appelle STS                       → credentials AWS temporaires
+4. Le client accède directement à S3, DynamoDB, ...  avec ces credentials
 ```
+
+> **Règle de choix.** Besoin de *connecter des utilisateurs à ton API* → **User Pool** suffit. Besoin que le *front frappe directement un service AWS* au nom de l'utilisateur → ajouter un **Identity Pool**. Pour TribuZen, le front parle à l'API Gateway (pas à S3 en direct) : on utilise surtout le **User Pool**.
+
+### 2.2 User Pool : annuaire + serveur d'authentification
+
+Un User Pool stocke des profils utilisateur (attributs standard OIDC — `email`, `name`, `phone_number`… — et attributs `custom:`), gère le sign-up, la confirmation, le reset, le MFA, la protection anti-attaques. Il joue à la fois :
+
+- **OIDC IdP** pour ton app (il émet des ID tokens),
+- **serveur d'autorisation OAuth 2.0** (il émet des access tokens avec des scopes),
+- et **service provider** vers des IdP tiers (Google, Facebook, Apple, ou SAML/OIDC entreprise) — il mappe leurs claims vers un **format de token unique**.
+
+### 2.3 App client : par où l'application parle au pool
+
+Une application n'interagit jamais « avec le pool » directement : elle passe par un **app client** (un identifiant `ClientId`, avec ou sans `ClientSecret`). L'app client déclare notamment les **flux d'authentification autorisés** via `ExplicitAuthFlows`. Valeurs (vérifiées doc) :
+
+| `ExplicitAuthFlows` | Flux `AuthFlow` (InitiateAuth) | À quoi |
+|---|---|---|
+| `ALLOW_USER_SRP_AUTH` | `USER_SRP_AUTH` | mot de passe via **SRP** — le mot de passe **ne transite pas** en clair |
+| `ALLOW_USER_PASSWORD_AUTH` | `USER_PASSWORD_AUTH` | mot de passe envoyé au service (à réserver au dev/migration) |
+| `ALLOW_USER_AUTH` | `USER_AUTH` | **choice-based** : le user choisit (mot de passe, OTP email, passkey…) |
+| `ALLOW_REFRESH_TOKEN_AUTH` | `REFRESH_TOKEN_AUTH` | renouveler les tokens avec le refresh token |
+| `ALLOW_ADMIN_USER_PASSWORD_AUTH` | `ADMIN_USER_PASSWORD_AUTH` | auth **côté serveur** (backend de confiance) |
+| `ALLOW_CUSTOM_AUTH` | `CUSTOM_AUTH` | challenges custom via triggers Lambda |
+
+> **SRP** = Secure Remote Password : un protocole où le client prouve qu'il connaît le mot de passe **sans jamais l'envoyer** (« sign-in with secure remote password (SRP) »). `USER_PASSWORD_AUTH` transmet le mot de passe au service — pratique en CLI pour apprendre, mais `USER_SRP_AUTH` est le défaut sain en production.
+
+### 2.4 Flux sign-up → confirm → sign-in
+
+Cycle de vie d'un utilisateur local (créé dans le pool, pas fédéré) :
+
+```
+SignUp (email + password)          → compte créé, statut UNCONFIRMED
+        ↓  Cognito envoie un code par email/SMS
+ConfirmSignUp (code)               → statut CONFIRMED
+        ↓
+InitiateAuth (USER_PASSWORD_AUTH)  → [challenge MFA éventuel] → 3 tokens JWT
+```
+
+Si le MFA est actif, `InitiateAuth` ne renvoie **pas** les tokens tout de suite : il renvoie un **challenge** (ex. `SOFTWARE_TOKEN_MFA`), auquel on répond via `RespondToAuthChallenge` (le code TOTP), et *alors* Cognito émet les tokens. Un flux peut enchaîner plusieurs challenges ; chaque réponse renvoie une `Session` à rejouer (par défaut **3 minutes** pour répondre à chaque challenge).
+
+> **Anti brute-force (doc).** Après **5** échecs de mot de passe, Cognito verrouille l'utilisateur 1 s, puis double à chaque échec, jusqu'à ~15 min max. C'est un garde-fou que tu n'as pas à coder.
+
+### 2.5 Les trois tokens JWT
+
+Après une auth réussie, le User Pool renvoie **trois** tokens :
+
+| Token | Contenu (claims) | Sert à | Décodable ? |
+|---|---|---|---|
+| **ID token** | *identité* : `email`, `name`, attributs, `aud` (= client), `iss`, `cognito:groups` | savoir *qui* est l'utilisateur, peupler l'UI/le profil | oui (base64url → JSON) |
+| **Access token** | *autorisation* : `scope`, `cognito:groups`, `client_id`, `iss` | autoriser des appels API, le userInfo endpoint, les self-service | oui (base64url → JSON) |
+| **Refresh token** | opaque | obtenir de **nouveaux** ID/access tokens | **non** — chiffré, illisible hors du pool |
+
+Points vérifiés à retenir :
+
+- ID token **et** access token portent le claim `cognito:groups` (les groupes du pool).
+- Le refresh token est **chiffré et opaque** : inutile d'essayer de le décoder, seul le pool sait le lire.
+- **Durées.** ID et access tokens : configurable de **5 min à 1 jour** (défaut 1 h). Refresh token : **défaut 30 jours**, configurable de **60 minutes à 10 ans** (vérifié doc). Bonne pratique doc : renouveler à ~75 % de la durée de vie, stocker en **mémoire** (client) ou cache chiffré (serveur).
+
+### 2.6 Vérifier un JWT — l'étape que personne ne doit sauter
+
+Un JWT se **décode** trivialement (base64url) : ne *jamais* faire confiance à son contenu sans **vérifier la signature**. Un access token modifié = escalade de privilège ; un ID token modifié = usurpation. Cognito signe en **RS256** (RSA + SHA-256, signature **asymétrique**) : le backend n'a besoin que de la **clé publique** pour vérifier.
+
+Structure d'un JWT : `header.payload.signature` (trois segments séparés par `.`). Le header contient `kid` (quelle clé) et `alg` (`RS256`).
+
+Les clés publiques sont exposées au **JWKS URI** du pool :
+
+```
+https://cognito-idp.<region>.amazonaws.com/<userPoolId>/.well-known/jwks.json
+```
+
+Étapes de vérification (doc AWS, à faire à **chaque** sign-in) :
+
+1. **Signature** : récupérer la clé du JWKS dont le `kid` correspond au `kid` du header, vérifier la signature RS256. (Cacher le JWKS par `kid`, le pool peut faire tourner ses clés.)
+2. **`iss`** doit valoir `https://cognito-idp.<region>.amazonaws.com/<userPoolId>`.
+3. **`aud`** (ID token) ou **`client_id`** (access token) doit valoir l'**app client** attendu.
+4. **`token_use`** : `id` si tu attends un ID token, `access` si tu attends un access token.
+5. **`exp`** : le token ne doit pas être expiré.
+
+En Node, AWS recommande la lib **`aws-jwt-verify`** (`CognitoJwtVerifier`) qui fait tout ça. On **ne** réimplémente **pas** la crypto à la main.
+
+### 2.7 Hosted UI / managed login
+
+Cognito fournit des **pages d'authentification hébergées** : login, sign-up, reset, MFA, et les boutons de fédération, sans écrire de front. On active un **domaine** sur le pool, ce qui expose des endpoints OAuth 2.0 :
+
+```
+https://<domaine>.auth.<region>.amazoncognito.com/login       (managed login / hosted UI)
+https://<domaine>.auth.<region>.amazoncognito.com/oauth2/token
+https://<domaine>.auth.<region>.amazoncognito.com/logout
+```
+
+> AWS propose désormais **managed login** (la version moderne, personnalisable, avec passkeys/passwordless) à côté du **classic hosted UI**. Les flux **passwordless** et **passkey** ne sont disponibles **qu'en managed login**, pas via l'API SDK directe. Les flux de **fédération** (Google/SAML) passent aussi **obligatoirement** par ces pages hébergées, jamais par l'API SDK pure.
+
+### 2.8 Triggers Lambda
+
+Cognito peut invoquer une **Lambda** à des moments clés du cycle de vie, pour injecter ta logique métier :
+
+| Trigger | Moment | Usage TribuZen typique |
+|---|---|---|
+| **Pre Sign-up** | avant création | auto-confirmer un domaine de confiance, valider l'email |
+| **Post Confirmation** | après confirmation | créer le profil famille dans DynamoDB |
+| **Pre Token Generation** | avant l'émission des tokens | **ajouter des claims** (ex. `family_id`) au JWT |
+| **Custom Message** | à l'envoi d'un email/SMS | personnaliser le mail de vérification |
+| **User Migration** | user inconnu qui se connecte | migrer depuis un ancien système |
+| **Define / Create / Verify Auth Challenge** | flux `CUSTOM_AUTH` | CAPTCHA, challenge maison |
+
+**Pre Token Generation** est le plus utile côté produit : plutôt que de requêter la base à chaque appel API pour savoir à quelle famille appartient l'utilisateur, on **grave** l'info dans le token une fois pour toutes.
+
+### 2.9 Fédération OIDC / SAML (survol)
+
+La fédération laisse l'utilisateur se connecter via un **IdP externe** sans créer de mot de passe dans le pool :
+
+- **Social / OIDC** : Google, Facebook, Apple, Amazon, ou tout IdP OIDC générique (issuer + client id/secret).
+- **SAML 2.0** : IdP entreprise (Okta, ADFS, Entra ID) via les **metadata** de l'IdP — le cas SSO B2B.
+
+Le User Pool agit alors comme **service provider** vers l'IdP et **IdP** vers ton app : quel que soit le fournisseur, ton app reçoit **le même format de JWT**. C'est tout l'intérêt — standardiser en aval.
+
+### 2.10 Intégration API Gateway (authorizer)
+
+Le cas TribuZen : l'app envoie un token, l'**API Gateway** le vérifie avant d'atteindre la Lambda. Deux options selon le type d'API (module 07) :
+
+- **REST API** → authorizer de type **`COGNITO_USER_POOLS`**. Le client passe un **ID token ou access token** dans le header **`Authorization`** ; API Gateway valide et rejette sinon (doc : « call the API method with one of the tokens, which are typically set to the request's `Authorization` header »). L'**ID token** autorise sur les **claims d'identité** ; l'**access token** autorise sur les **scopes** OAuth. Les claims sont exposés au backend via `$context.authorizer.claims` → dans la Lambda : `event.requestContext.authorizer.claims`.
+- **HTTP API** → **JWT authorizer** natif : on configure l'**issuer** (l'URL du pool) et l'**audience** (l'app client). Claims côté Lambda : `event.requestContext.authorizer.jwt.claims`.
+
+Dans les deux cas, la validation cryptographique est **déléguée** à API Gateway : la Lambda reçoit des claims déjà vérifiés.
 
 ---
 
-## 2. User Pools
+## 3. Worked examples
 
-### 2.1 Concept
+### Exemple 1 — Créer un User Pool et dérouler sign-up → sign-in en CLI
 
-Un **User Pool** est un annuaire d'utilisateurs. Il gère :
-
-- L'inscription (sign-up)
-- La connexion (sign-in)
-- La vérification d'email/téléphone
-- La réinitialisation de mot de passe
-- Les attributs utilisateur (email, nom, attributs personnalisés)
-
-### 2.2 Création via CLI
+Objectif : un pool TribuZen, un app client capable de `USER_PASSWORD_AUTH`, un utilisateur qui s'inscrit, se confirme, se connecte, et récupère ses tokens.
 
 ```bash
-# Créer un User Pool
+# 1. Créer le User Pool (email = identifiant, email auto-vérifié)
 aws cognito-idp create-user-pool \
-  --pool-name my-app-users \
-  --auto-verified-attributes email \
+  --pool-name tribuzen-users \
   --username-attributes email \
-  --policies '{
-    "PasswordPolicy": {
-      "MinimumLength": 12,
-      "RequireUppercase": true,
-      "RequireLowercase": true,
-      "RequireNumbers": true,
-      "RequireSymbols": true
-    }
-  }' \
-  --schema '[
-    {"Name": "email", "Required": true, "Mutable": true},
-    {"Name": "name", "Required": true, "Mutable": true}
-  ]'
-```
+  --auto-verified-attributes email \
+  --policies '{"PasswordPolicy":{"MinimumLength":12,"RequireUppercase":true,"RequireLowercase":true,"RequireNumbers":true,"RequireSymbols":true}}'
+# → note l'Id retourné, ex. eu-west-3_ABC123
 
-### 2.3 App Client
-
-Pour qu'une application puisse interagir avec le User Pool, vous devez créer un **App Client** :
-
-```bash
+# 2. Créer un app client SANS secret (client public, ex. SPA) et autoriser USER_PASSWORD_AUTH
 aws cognito-idp create-user-pool-client \
-  --user-pool-id eu-west-1_XXXXXXX \
-  --client-name my-web-app \
-  --explicit-auth-flows ALLOW_USER_SRP_AUTH ALLOW_REFRESH_TOKEN_AUTH \
-  --prevent-user-existence-errors ENABLED \
-  --access-token-validity 60 \
-  --id-token-validity 60 \
-  --refresh-token-validity 30 \
-  --token-validity-units '{
-    "AccessToken": "minutes",
-    "IdToken": "minutes",
-    "RefreshToken": "days"
-  }'
-```
+  --user-pool-id eu-west-3_ABC123 \
+  --client-name tribuzen-web \
+  --no-generate-secret \
+  --explicit-auth-flows ALLOW_USER_PASSWORD_AUTH ALLOW_REFRESH_TOKEN_AUTH
+# → note le ClientId, ex. 5abc123def456
 
-> `ALLOW_USER_SRP_AUTH` utilise le protocole **Secure Remote Password** — le mot de passe n'est jamais transmis en clair sur le réseau.
-
-### 2.4 Attributs utilisateur
-
-Cognito distingue les **attributs standard** (définis par OpenID Connect) et les **attributs personnalisés** :
-
-| Attributs standard | Attributs personnalisés |
-|---|---|
-| `email`, `phone_number` | `custom:company` |
-| `name`, `family_name` | `custom:role` |
-| `address`, `birthdate` | `custom:tenant_id` |
-| `locale`, `zoneinfo` | `custom:subscription_tier` |
-
-Les attributs personnalisés sont préfixés par `custom:` et doivent être définis à la création du pool.
-
----
-
-## 3. Flux d'authentification
-
-### 3.1 Inscription (Sign-up)
-
-```
-1. L'utilisateur fournit email + mot de passe
-2. Cognito crée le compte (status: UNCONFIRMED)
-3. Cognito envoie un code de vérification par email
-4. L'utilisateur saisit le code
-5. Cognito confirme le compte (status: CONFIRMED)
-```
-
-```bash
-# Inscription
+# 3. Sign-up : l'utilisateur crée son compte (statut UNCONFIRMED)
 aws cognito-idp sign-up \
-  --client-id 1234567890abcdef \
-  --username alice@example.com \
-  --password 'MonMotDePasse123!' \
-  --user-attributes Name=name,Value="Alice Dupont"
+  --client-id 5abc123def456 \
+  --username alice@tribuzen.app \
+  --password 'MotDePasseTresSolide1!' \
+  --user-attributes Name=name,Value="Alice Martin"
 
-# Confirmation avec le code reçu par email
+# 4. Confirmer avec le code reçu par email (statut → CONFIRMED)
 aws cognito-idp confirm-sign-up \
-  --client-id 1234567890abcdef \
-  --username alice@example.com \
+  --client-id 5abc123def456 \
+  --username alice@tribuzen.app \
   --confirmation-code 123456
-```
 
-### 3.2 Connexion (Sign-in)
-
-```bash
+# 5. Sign-in : récupérer les trois tokens
 aws cognito-idp initiate-auth \
-  --client-id 1234567890abcdef \
+  --client-id 5abc123def456 \
   --auth-flow USER_PASSWORD_AUTH \
-  --auth-parameters USERNAME=alice@example.com,PASSWORD='MonMotDePasse123!'
+  --auth-parameters USERNAME=alice@tribuzen.app,PASSWORD='MotDePasseTresSolide1!'
 ```
 
-Réponse :
+Réponse de `initiate-auth` (pas de MFA activé ici) :
+
 ```json
 {
   "AuthenticationResult": {
-    "AccessToken": "eyJra...",
-    "IdToken": "eyJra...",
-    "RefreshToken": "eyJjd...",
+    "AccessToken":  "eyJraWQ...",
+    "IdToken":      "eyJraWQ...",
+    "RefreshToken": "eyJjdH...",
     "ExpiresIn": 3600,
     "TokenType": "Bearer"
   }
 }
 ```
 
-### 3.3 Réinitialisation de mot de passe
+Analyse :
+- `--no-generate-secret` : un client **public** (SPA, mobile) ne peut pas garder un secret ; un backend de confiance en générerait un.
+- `ALLOW_USER_PASSWORD_AUTH` est activé **volontairement** pour apprendre en CLI ; en prod on préfère `ALLOW_USER_SRP_AUTH` (mot de passe jamais transmis).
+- `ExpiresIn: 3600` = 1 h : la durée par défaut des ID/access tokens. Le refresh token, lui, vit 30 jours par défaut.
+
+### Exemple 2 — Décoder puis vérifier l'ID token
+
+**Décoder** (sans vérifier) le payload de l'ID token — juste pour *lire* :
 
 ```bash
-# Étape 1 : Demander un code de réinitialisation
-aws cognito-idp forgot-password \
-  --client-id 1234567890abcdef \
-  --username alice@example.com
-
-# Étape 2 : Confirmer le nouveau mot de passe
-aws cognito-idp confirm-forgot-password \
-  --client-id 1234567890abcdef \
-  --username alice@example.com \
-  --confirmation-code 654321 \
-  --password 'NouveauMotDePasse456!'
+# le payload est le 2e segment séparé par des points
+echo "<IdToken>" | cut -d. -f2 | base64 -d 2>/dev/null
 ```
 
----
-
-## 4. Tokens JWT
-
-### 4.1 Les trois tokens
-
-Cognito délivre trois tokens JWT après une authentification réussie :
-
-| Token | Contenu | Durée | Usage |
-|---|---|---|---|
-| **ID Token** | Identité de l'utilisateur (email, nom, attributs) | 5 min à 1 jour | Personnaliser l'UI, afficher le profil |
-| **Access Token** | Autorisations (scopes, groupes) | 5 min à 1 jour | Autoriser les appels API |
-| **Refresh Token** | Permet d'obtenir de nouveaux tokens | 1 heure à 10 ans | Renouveler la session sans re-login |
-
-### 4.2 Structure d'un ID Token (décodé)
+Payload typique (décodé) :
 
 ```json
 {
-  "sub": "12345678-abcd-1234-efgh-123456789012",
-  "email_verified": true,
-  "iss": "https://cognito-idp.eu-west-1.amazonaws.com/eu-west-1_XXXXXXX",
-  "cognito:username": "alice@example.com",
-  "aud": "1234567890abcdef",
-  "event_id": "abcd-1234",
+  "sub": "8f3b...-uuid",
+  "iss": "https://cognito-idp.eu-west-3.amazonaws.com/eu-west-3_ABC123",
+  "aud": "5abc123def456",
   "token_use": "id",
-  "auth_time": 1710412800,
-  "name": "Alice Dupont",
-  "exp": 1710416400,
-  "iat": 1710412800,
-  "email": "alice@example.com",
-  "custom:tenant_id": "tenant-42"
+  "cognito:username": "alice@tribuzen.app",
+  "email": "alice@tribuzen.app",
+  "email_verified": true,
+  "name": "Alice Martin",
+  "exp": 1893456000,
+  "iat": 1893452400
 }
 ```
 
-### 4.3 Vérification des tokens
+**Vérifier** (Node, lib recommandée par AWS) — c'est ce que fait un backend qui reçoit le token :
 
-Pour valider un token JWT côté serveur :
+```js
+// npm i aws-jwt-verify
+import { CognitoJwtVerifier } from 'aws-jwt-verify'
 
-1. Vérifier la **signature** avec la clé publique JWKS du User Pool
-2. Vérifier que `iss` correspond à votre User Pool
-3. Vérifier que `token_use` est `id` ou `access` selon le besoin
-4. Vérifier que le token n'est pas expiré (`exp`)
-
-L'URL JWKS : `https://cognito-idp.{region}.amazonaws.com/{userPoolId}/.well-known/jwks.json`
-
----
-
-## 5. MFA — Authentification multi-facteurs
-
-### 5.1 Types de MFA supportés
-
-| Type | Description | Niveau de sécurité |
-|---|---|---|
-| **SMS** | Code envoyé par SMS | Moyen (vulnérable au SIM swapping) |
-| **TOTP** | Application d'authentification (Google Auth, Authy) | Élevé |
-| **Email** | Code envoyé par email | Moyen |
-
-### 5.2 Configuration
-
-```bash
-# Activer le MFA optionnel (l'utilisateur choisit)
-aws cognito-idp set-user-pool-mfa-config \
-  --user-pool-id eu-west-1_XXXXXXX \
-  --mfa-configuration OPTIONAL \
-  --software-token-mfa-configuration Enabled=true \
-  --sms-mfa-configuration SmsAuthenticationMessage="Votre code : {####}",SmsConfiguration='{
-    "SnsCallerArn": "arn:aws:iam::123456789:role/cognito-sms-role",
-    "ExternalId": "my-app"
-  }'
-```
-
-Valeurs possibles pour `--mfa-configuration` :
-- `OFF` : MFA désactivé
-- `OPTIONAL` : l'utilisateur choisit d'activer le MFA
-- `ON` : MFA obligatoire pour tous les utilisateurs
-
-### 5.3 Flux avec MFA activé
-
-```
-1. L'utilisateur se connecte (email + password)
-2. Cognito retourne un challenge MFA (pas encore de tokens)
-3. L'utilisateur fournit le code TOTP/SMS
-4. Cognito valide le code et retourne les tokens JWT
-```
-
----
-
-## 6. Hosted UI et Custom UI
-
-### 6.1 Hosted UI
-
-Cognito fournit une **interface d'authentification prête à l'emploi**. Elle gère l'inscription, la connexion, la réinitialisation de mot de passe et la fédération.
-
-```bash
-# Configurer le domaine de la Hosted UI
-aws cognito-idp create-user-pool-domain \
-  --user-pool-id eu-west-1_XXXXXXX \
-  --domain my-app-auth
-
-# URL résultante :
-# https://my-app-auth.auth.eu-west-1.amazoncognito.com/login?
-#   client_id=1234567890abcdef&
-#   response_type=code&
-#   scope=openid+email+profile&
-#   redirect_uri=https://myapp.com/callback
-```
-
-**Avantages** : Rapide à mettre en place, gère tous les flux, personnalisable (CSS).
-**Inconvénients** : Personnalisation limitée, expérience utilisateur générique.
-
-### 6.2 Custom UI
-
-Pour une expérience totalement personnalisée, vous construisez votre propre interface et utilisez le SDK Cognito côté client :
-
-```typescript
-// Avec la bibliothèque amazon-cognito-identity-js ou AWS Amplify
-import { Amplify } from 'aws-amplify'
-import { signIn, signUp, confirmSignUp } from 'aws-amplify/auth'
-
-Amplify.configure({
-  Auth: {
-    Cognito: {
-      userPoolId: 'eu-west-1_XXXXXXX',
-      userPoolClientId: '1234567890abcdef',
-    },
-  },
+const verifier = CognitoJwtVerifier.create({
+  userPoolId: 'eu-west-3_ABC123',
+  tokenUse: 'id',              // on attend un ID token → token_use doit valoir "id"
+  clientId: '5abc123def456',   // vérifie l'audience (aud)
 })
 
-// Inscription
-await signUp({
-  username: 'alice@example.com',
-  password: 'MonMotDePasse123!',
-  options: {
-    userAttributes: { name: 'Alice Dupont' },
-  },
-})
-
-// Connexion
-const { isSignedIn, nextStep } = await signIn({
-  username: 'alice@example.com',
-  password: 'MonMotDePasse123!',
-})
+// verify() télécharge le JWKS, matche le kid, contrôle signature RS256, iss, aud, token_use, exp
+const payload = await verifier.verify(idToken)
+console.log(payload.email) // digne de confiance SEULEMENT après verify()
 ```
+
+Ce que `verify()` contrôle (et qu'un `base64 -d` **ne** contrôle **pas**) :
+1. la **signature** via le `kid` du JWKS (`.../.well-known/jwks.json`),
+2. `iss` = ton pool, 3. `aud` = ton app client, 4. `token_use` = `id`, 5. `exp` non dépassé.
+
+Sans ces 5 contrôles, n'importe qui peut forger un JSON et se faire passer pour Alice.
 
 ---
 
-## 7. Fédération d'identité
+## 4. Pièges & misconceptions
 
-### 7.1 Concept
+### PIÈGE #1 — Confondre User Pool et Identity Pool
 
-La fédération permet à vos utilisateurs de se connecter avec un **fournisseur d'identité externe** (Google, Facebook, Apple, SAML, OIDC) sans créer un compte spécifique.
+- **User Pool** = *authentification* → produit des **JWT**. C'est ce dont TribuZen a besoin pour son API.
+- **Identity Pool** = *autorisation AWS* → produit des **credentials AWS temporaires** (STS) pour taper S3/DynamoDB **en direct** depuis le client.
 
-```
-Utilisateur → "Se connecter avec Google"
-    → Google OAuth → Code d'autorisation
-    → Cognito échange le code → Tokens Cognito
-    → Utilisateur créé/lié dans le User Pool
-```
+Beaucoup ajoutent un Identity Pool « parce que le tuto le fait » alors que le front passe par une API Gateway : dans ce cas l'Identity Pool est **inutile**. On l'ajoute seulement si le client doit accéder à un service AWS sans backend.
 
-### 7.2 Fournisseurs supportés
+### PIÈGE #2 — Faire confiance à un JWT décodé sans le vérifier
 
-| Fournisseur | Protocole | Configuration requise |
-|---|---|---|
-| **Google** | OIDC | Client ID + Client Secret (Google Console) |
-| **Facebook** | OAuth 2.0 | App ID + App Secret (Meta Developers) |
-| **Apple** | OIDC | Service ID + Team ID + Key ID |
-| **Amazon** | OAuth 2.0 | Client ID + Client Secret |
-| **SAML** | SAML 2.0 | Metadata XML de l'IdP |
-| **OIDC générique** | OIDC | Issuer URL + Client ID + Secret |
+Décoder un JWT (`base64 -d`) ne prouve **rien** : les segments header/payload sont en clair, n'importe qui les fabrique. Seule la **vérification de signature** (JWKS + `kid`, RS256) + `iss`/`aud`/`token_use`/`exp` rend le contenu digne de confiance. Lire `payload.email` sans `verify()` = trou de sécurité.
 
-### 7.3 Configuration d'un fournisseur Google
+### PIÈGE #3 — Vérifier le mauvais token, ou ignorer `token_use`
 
-```bash
-# Ajouter Google comme Identity Provider
-aws cognito-idp create-identity-provider \
-  --user-pool-id eu-west-1_XXXXXXX \
-  --provider-name Google \
-  --provider-type Google \
-  --provider-details '{
-    "client_id": "123456789.apps.googleusercontent.com",
-    "client_secret": "GOCSPX-xxxxxxxxxxxx",
-    "authorize_scopes": "openid email profile"
-  }' \
-  --attribute-mapping '{
-    "email": "email",
-    "name": "name",
-    "username": "sub"
-  }'
-```
+L'access token et l'ID token ont des rôles différents : autoriser une **API par scopes** → **access token** (`token_use: access`) ; connaître **l'identité** → **ID token** (`token_use: id`). Oublier de contrôler `token_use` laisse accepter un ID token là où un access token est attendu (et inversement) : une confusion que les attaquants exploitent.
 
-### 7.4 Fédération SAML (entreprise)
+### PIÈGE #4 — Essayer de décoder le refresh token
 
-Pour les clients entreprise utilisant Active Directory, Okta, ou un autre IdP SAML :
+L'ID et l'access tokens sont des JWT lisibles (base64url). Le **refresh token est chiffré et opaque** : il n'a pas de claims exploitables côté client, seul le pool le lit. Le passer à un décodeur JWT ne donne rien d'utile — son seul usage est `REFRESH_TOKEN_AUTH`.
 
-```bash
-aws cognito-idp create-identity-provider \
-  --user-pool-id eu-west-1_XXXXXXX \
-  --provider-name CorporateSSO \
-  --provider-type SAML \
-  --provider-details '{
-    "MetadataURL": "https://idp.corporate.com/saml/metadata"
-  }' \
-  --attribute-mapping '{
-    "email": "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress",
-    "name": "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name"
-  }'
-```
+### PIÈGE #5 — `USER_PASSWORD_AUTH` en production
+
+`USER_PASSWORD_AUTH` **transmet le mot de passe** au service : acceptable pour apprendre en CLI, à éviter en prod. `USER_SRP_AUTH` (Secure Remote Password) prouve la connaissance du mot de passe **sans l'envoyer**. Activer `ALLOW_USER_PASSWORD_AUTH` sur l'app client de production, c'est ouvrir une porte qu'on n'a pas besoin d'ouvrir.
+
+### PIÈGE #6 — Croire que la fédération se fait via l'API SDK
+
+Les connexions **Google/Facebook/SAML** passent **obligatoirement** par les pages hébergées (hosted UI / managed login), pas par `InitiateAuth` en SDK pur. De même, **passkey** et **passwordless** ne sont dispo qu'en **managed login**. Vouloir tout piloter en API SDK bloque ces cas d'usage.
 
 ---
 
-## 8. Identity Pools
+## 5. Ancrage TribuZen
 
-### 8.1 Concept
+TribuZen authentifie les familles avec **un User Pool** ; le front (Nuxt/Vue) parle à l'**API Gateway** (module 07) qui met un **authorizer Cognito** devant les Lambda du feed (module 06). Pas d'Identity Pool au départ : le client ne tape jamais S3/DynamoDB en direct.
 
-Un **Identity Pool** (anciennement Federated Identities) échange un token d'authentification contre des **credentials AWS temporaires** (via STS). Cela permet à un utilisateur authentifié d'accéder directement aux services AWS (S3, DynamoDB) depuis le front-end.
+Chaîne complète :
 
 ```
-Token Cognito User Pool ──┐
-Token Google             ──┤→ Identity Pool → STS → Credentials AWS
-Token Facebook           ──┘                         (AccessKeyId, SecretAccessKey, SessionToken)
+App TribuZen ──(1) sign-in──▶ User Pool  ──▶ ID + access + refresh (JWT)
+App ──(2) GET /feed  Authorization: Bearer <access token>──▶ API Gateway
+                                   │ authorizer COGNITO_USER_POOLS (vérifie le JWT)
+                                   ▼
+                          Lambda getFeed  (event.requestContext.authorizer.claims)
+                                   │  lit family_id depuis les claims
+                                   ▼
+                          DynamoDB TribuZenFeed  (items de CETTE famille)
 ```
 
-### 8.2 Rôles IAM
+Choix concrets :
 
-L'Identity Pool attribue des **rôles IAM différents** selon que l'utilisateur est authentifié ou non :
-
-| Rôle | Accès |
+| Besoin TribuZen | Réponse Cognito |
 |---|---|
-| **Authenticated role** | Accès à ses propres données (S3, DynamoDB) |
-| **Unauthenticated role** | Accès limité (lecture publique seulement) |
+| Login email + mot de passe | User Pool, app client `USER_SRP_AUTH` |
+| « Se connecter avec Google » | fédération OIDC via managed login |
+| Chaque JWT sait à quelle famille il appartient | trigger **Pre Token Generation** ajoute `family_id` |
+| Créer le profil famille à l'inscription | trigger **Post Confirmation** écrit dans DynamoDB |
+| Protéger l'API du feed | authorizer **`COGNITO_USER_POOLS`** sur l'API Gateway |
+| MFA pour les comptes admin de famille | MFA **TOTP** activé sur le pool |
 
-Exemple de politique IAM pour accès à DynamoDB par utilisateur :
-
-```json
-{
-  "Effect": "Allow",
-  "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:Query"],
-  "Resource": "arn:aws:dynamodb:eu-west-1:123456789:table/UserData",
-  "Condition": {
-    "ForAllValues:StringEquals": {
-      "dynamodb:LeadingKeys": ["${cognito-identity.amazonaws.com:sub}"]
-    }
-  }
-}
-```
-
-> Chaque utilisateur ne peut accéder qu'aux items dont la PK correspond à son identifiant Cognito.
-
-### 8.3 User Pool vs Identity Pool
-
-| Aspect | User Pool | Identity Pool |
-|---|---|---|
-| **Fonction** | Authentification (qui êtes-vous ?) | Autorisation (quelles ressources AWS ?) |
-| **Résultat** | Tokens JWT | Credentials AWS temporaires |
-| **Usage** | API Gateway, backend | Accès direct S3, DynamoDB depuis le client |
-| **Peut fonctionner seul** | Oui | Oui (mais souvent couplé à un User Pool) |
+> Le **client secret** de la fédération Google et les paramètres sensibles ne vont **pas** en dur : ils relèvent de **Secrets Manager** (module 15). Ici, Cognito ne fait qu'*authentifier* et *émettre des tokens* ; le stockage sécurisé des secrets est un autre module.
 
 ---
 
-## 9. Lambda Triggers
+## 6. Points clés
 
-### 9.1 Concept
+1. **User Pool** = authentification → émet des **JWT** (ID/access/refresh). **Identity Pool** = échange un token contre des **credentials AWS temporaires** (STS). Deux composants indépendants, questions différentes.
+2. Une app parle au pool via un **app client** (`ClientId`) qui déclare les **flux autorisés** (`ExplicitAuthFlows` : `ALLOW_USER_SRP_AUTH`, `ALLOW_USER_PASSWORD_AUTH`, `ALLOW_REFRESH_TOKEN_AUTH`, …).
+3. Cycle : **SignUp** (UNCONFIRMED) → **ConfirmSignUp** (CONFIRMED) → **InitiateAuth** → tokens (avec challenge **MFA** intercalé si activé).
+4. Trois tokens : **ID** (identité), **access** (scopes/`cognito:groups`), **refresh** (opaque, chiffré). ID/access défaut **1 h** (5 min–1 j) ; refresh défaut **30 j** (60 min–10 ans).
+5. **Vérifier** un JWT = signature via **JWKS**/`kid` (**RS256**) + `iss` + `aud`/`client_id` + `token_use` + `exp`. Décoder ≠ vérifier. Utiliser **`aws-jwt-verify`**.
+6. **SRP** (`USER_SRP_AUTH`) ne transmet jamais le mot de passe ; `USER_PASSWORD_AUTH` si — à réserver au dev/CLI.
+7. **Triggers Lambda** (surtout **Pre Token Generation** pour ajouter des claims, **Post Confirmation** pour provisionner) ; **fédération** OIDC/SAML via les pages **managed login**.
+8. Devant l'API : **REST → `COGNITO_USER_POOLS`** (token dans `Authorization`, claims via `event.requestContext.authorizer.claims`) ; **HTTP API → JWT authorizer** (issuer + audience).
 
-Cognito peut invoquer des **fonctions Lambda** à différentes étapes du cycle de vie utilisateur. Ces triggers permettent de personnaliser le comportement par défaut.
+---
 
-### 9.2 Triggers disponibles
+## 7. Seeds Anki
 
-| Trigger | Moment | Cas d'usage |
-|---|---|---|
-| **Pre Sign-up** | Avant la création du compte | Valider l'email (domaine autorisé), auto-confirmer |
-| **Pre Authentication** | Avant la vérification du mot de passe | Bloquer certains utilisateurs, logging |
-| **Post Authentication** | Après une connexion réussie | Enregistrer l'IP, mettre à jour last_login |
-| **Post Confirmation** | Après la confirmation du compte | Créer un profil dans DynamoDB, envoyer un email de bienvenue |
-| **Pre Token Generation** | Avant la génération des tokens | Ajouter des claims personnalisés au JWT |
-| **Custom Message** | Quand Cognito envoie un message | Personnaliser l'email de vérification |
-| **User Migration** | Quand un utilisateur inconnu tente de se connecter | Migrer depuis un ancien système d'auth |
-| **Define Auth Challenge** | Pour les flux d'auth custom | Implémenter un CAPTCHA, challenge personnalisé |
-
-### 9.3 Exemple : Pre Sign-up (validation de domaine)
-
-```typescript
-import type { PreSignUpTriggerHandler } from 'aws-lambda'
-
-export const handler: PreSignUpTriggerHandler = async (event) => {
-  const email = event.request.userAttributes.email
-  const allowedDomains = ['@entreprise.fr', '@filiale.fr']
-
-  const isAllowed = allowedDomains.some((domain) => email.endsWith(domain))
-  if (!isAllowed) {
-    throw new Error('Inscription réservée aux adresses @entreprise.fr')
-  }
-
-  // Auto-confirmer les utilisateurs du domaine principal
-  if (email.endsWith('@entreprise.fr')) {
-    event.response.autoConfirmUser = true
-    event.response.autoVerifyEmail = true
-  }
-
-  return event
-}
 ```
-
-### 9.4 Exemple : Post Confirmation (créer un profil DynamoDB)
-
-```typescript
-import type { PostConfirmationTriggerHandler } from 'aws-lambda'
-import { DynamoDBClient } from '@aws-sdk/client-dynamodb'
-import { DynamoDBDocumentClient, PutCommand } from '@aws-sdk/lib-dynamodb'
-
-const docClient = DynamoDBDocumentClient.from(new DynamoDBClient({}))
-
-export const handler: PostConfirmationTriggerHandler = async (event) => {
-  const { sub, email, name } = event.request.userAttributes
-
-  await docClient.send(new PutCommand({
-    TableName: 'UserProfiles',
-    Item: {
-      userId: sub,
-      email,
-      name,
-      createdAt: new Date().toISOString(),
-      tier: 'free',
-    },
-  }))
-
-  return event
-}
-```
-
-### 9.5 Exemple : Pre Token Generation (ajouter des claims)
-
-```typescript
-import type { PreTokenGenerationTriggerHandler } from 'aws-lambda'
-
-export const handler: PreTokenGenerationTriggerHandler = async (event) => {
-  // Ajouter des claims personnalisés au token ID
-  event.response = {
-    claimsOverrideDetails: {
-      claimsToAddOrOverride: {
-        tenant_id: 'tenant-42',
-        permissions: 'read,write,admin',
-      },
-      claimsToSuppress: ['phone_number'], // retirer un claim
-    },
-  }
-
-  return event
-}
+Cognito : différence entre User Pool et Identity Pool ?|User Pool = authentification, il émet des JWT (ID/access/refresh). Identity Pool = il échange un token contre des credentials AWS temporaires via STS pour accéder directement à S3/DynamoDB. Indépendants, souvent combinés.
+Quels sont les trois tokens d'un User Pool et lequel n'est pas décodable ?|ID token (identité), access token (scopes/cognito:groups), refresh token (obtenir de nouveaux tokens). Le refresh token est chiffré et opaque : non décodable, seul le pool le lit. ID et access sont des JWT base64url lisibles.
+Quelles vérifications faire sur un JWT Cognito avant de lui faire confiance ?|Signature via la clé du JWKS dont le kid correspond (RS256), iss = URL du pool, aud (ID) ou client_id (access) = app client, token_use (id ou access), exp non expiré. Décoder ne suffit pas : il faut vérifier la signature.
+Où se trouvent les clés publiques pour vérifier un JWT Cognito ?|Au JWKS URI du pool : https://cognito-idp.<region>.amazonaws.com/<userPoolId>/.well-known/jwks.json — on matche le kid du header du token à une clé du JWKS.
+Différence entre USER_SRP_AUTH et USER_PASSWORD_AUTH ?|USER_SRP_AUTH (Secure Remote Password) prouve la connaissance du mot de passe sans jamais le transmettre. USER_PASSWORD_AUTH envoie le mot de passe au service — à réserver au dev/CLI, SRP en prod.
+Quel est le cycle de vie d'un utilisateur local d'un User Pool ?|SignUp (statut UNCONFIRMED) → code de vérification par email/SMS → ConfirmSignUp (statut CONFIRMED) → InitiateAuth → tokens JWT (avec un challenge MFA intercalé via RespondToAuthChallenge si le MFA est actif).
+À quoi sert le trigger Pre Token Generation, exemple TribuZen ?|Ajouter/modifier/supprimer des claims dans les tokens avant émission. Ex TribuZen : graver family_id dans le JWT pour ne pas requêter la base à chaque appel API.
+Comment API Gateway REST valide-t-il un token Cognito et où sont les claims côté Lambda ?|Un authorizer de type COGNITO_USER_POOLS : le client met un ID ou access token dans le header Authorization, API Gateway le valide. Les claims arrivent à la Lambda via event.requestContext.authorizer.claims.
 ```
 
 ---
 
-## 10. Intégration avec API Gateway
+## Pont vers le lab
 
-### 10.1 Cognito Authorizer
-
-API Gateway peut utiliser Cognito comme **authorizer natif**. Le client envoie le token JWT dans le header `Authorization`, et API Gateway le valide automatiquement.
-
-```
-Client → Authorization: Bearer eyJra... → API Gateway → Cognito Authorizer (validation)
-                                                              ↓ valide
-                                                         Lambda backend
-                                                              ↓ invalide
-                                                         403 Forbidden
-```
-
-```bash
-# Créer un authorizer Cognito sur API Gateway
-aws apigateway create-authorizer \
-  --rest-api-id abc123 \
-  --name cognito-auth \
-  --type COGNITO_USER_POOLS \
-  --provider-arns arn:aws:cognito-idp:eu-west-1:123456789:userpool/eu-west-1_XXXXXXX \
-  --identity-source method.request.header.Authorization
-```
-
-### 10.2 Accès aux claims dans Lambda
-
-Quand API Gateway valide le token, il transmet les claims dans l'événement Lambda :
-
-```typescript
-import type { APIGatewayProxyHandler } from 'aws-lambda'
-
-export const handler: APIGatewayProxyHandler = async (event) => {
-  const claims = event.requestContext.authorizer?.claims
-  const userId = claims?.sub
-  const email = claims?.email
-  const tenantId = claims?.['custom:tenant_id']
-
-  return {
-    statusCode: 200,
-    body: JSON.stringify({ message: `Bonjour ${email}` }),
-  }
-}
-```
-
----
-
-## 11. TypeScript SDK v3
-
-### 11.1 Installation
-
-```bash
-pnpm add @aws-sdk/client-cognito-identity-provider
-```
-
-### 11.2 Opérations d'administration
-
-```typescript
-import {
-  CognitoIdentityProviderClient,
-  AdminCreateUserCommand,
-  AdminSetUserPasswordCommand,
-  AdminDisableUserCommand,
-  ListUsersCommand,
-} from '@aws-sdk/client-cognito-identity-provider'
-
-const cognito = new CognitoIdentityProviderClient({ region: 'eu-west-1' })
-const userPoolId = 'eu-west-1_XXXXXXX'
-
-// Créer un utilisateur (admin)
-await cognito.send(new AdminCreateUserCommand({
-  UserPoolId: userPoolId,
-  Username: 'bob@example.com',
-  UserAttributes: [
-    { Name: 'email', Value: 'bob@example.com' },
-    { Name: 'email_verified', Value: 'true' },
-    { Name: 'name', Value: 'Bob Martin' },
-  ],
-  TemporaryPassword: 'TempPass123!',
-  MessageAction: 'SUPPRESS', // ne pas envoyer l'email d'invitation
-}))
-
-// Définir un mot de passe permanent
-await cognito.send(new AdminSetUserPasswordCommand({
-  UserPoolId: userPoolId,
-  Username: 'bob@example.com',
-  Password: 'MotDePassePermanent456!',
-  Permanent: true,
-}))
-
-// Lister les utilisateurs
-const { Users } = await cognito.send(new ListUsersCommand({
-  UserPoolId: userPoolId,
-  Filter: 'email = "bob@example.com"',
-  Limit: 10,
-}))
-```
-
-### 11.3 Groupes d'utilisateurs
-
-```typescript
-import {
-  CreateGroupCommand,
-  AdminAddUserToGroupCommand,
-} from '@aws-sdk/client-cognito-identity-provider'
-
-// Créer un groupe
-await cognito.send(new CreateGroupCommand({
-  UserPoolId: userPoolId,
-  GroupName: 'admins',
-  Description: 'Administrateurs de la plateforme',
-  Precedence: 0, // priorité (0 = la plus haute)
-}))
-
-// Ajouter un utilisateur au groupe
-await cognito.send(new AdminAddUserToGroupCommand({
-  UserPoolId: userPoolId,
-  Username: 'alice@example.com',
-  GroupName: 'admins',
-}))
-```
-
-> Les groupes apparaissent dans le claim `cognito:groups` du token JWT.
-
----
-
-## 12. Bonnes pratiques
-
-1. **Utilisez SRP** (`ALLOW_USER_SRP_AUTH`) plutôt que `USER_PASSWORD_AUTH` — le mot de passe n'est jamais transmis
-2. **Activez le MFA** au minimum en mode OPTIONAL, idéalement ON pour les applications sensibles
-3. **Configurez les Lambda triggers** pour la logique métier (validation, provisioning)
-4. **Utilisez Pre Token Generation** pour ajouter des claims métier plutôt que de requêter la DB à chaque appel API
-5. **Limitez la durée des tokens** : Access/ID Token à 1h max, Refresh Token selon le contexte
-6. **Activez la protection contre les attaques** : Advanced Security Features (risk-based adaptive auth)
-7. **Ne stockez jamais les tokens en localStorage** — utilisez des cookies HttpOnly ou la mémoire
-8. **Prévoyez la migration** : le trigger User Migration permet de migrer progressivement depuis un ancien système
-
----
-
-## 13. Récapitulatif
-
-| Concept | Description |
-|---|---|
-| **User Pool** | Annuaire d'utilisateurs, authentification, tokens JWT |
-| **Identity Pool** | Échange de tokens contre des credentials AWS |
-| **ID Token** | Contient l'identité de l'utilisateur (claims) |
-| **Access Token** | Contient les autorisations (scopes, groupes) |
-| **Refresh Token** | Permet de renouveler les tokens sans re-login |
-| **Hosted UI** | Interface prête à l'emploi pour login/signup |
-| **Fédération** | Login via Google, Facebook, SAML, OIDC |
-| **Lambda Triggers** | Hooks pour personnaliser le cycle de vie utilisateur |
-| **Cognito Authorizer** | Validation JWT native dans API Gateway |
-| **Groupes** | Regrouper les utilisateurs pour l'autorisation |
+> Lab associé : `labs/lab-11-cognito/README.md`. Tu crées un **vrai** User Pool + app client à l'AWS CLI, tu déroules sign-up / confirm / initiate-auth, tu récupères les trois tokens et tu **décodes puis vérifies** l'ID token — puis tu **détruis tout** (teardown, Free Tier). Corrigé commenté, feedback coach, variante J+30.

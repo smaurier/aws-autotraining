@@ -1,431 +1,329 @@
-# Module 02 — VPC & Networking
-
-> **Objectif** : Comprendre et configurer un réseau privé virtuel AWS : sous-réseaux, passerelles, tables de routage, groupes de sécurité, et concevoir des architectures réseau sécurisées.
-> **Difficulté** : ⭐⭐⭐
-> **Prérequis** : Module 01
-> **Durée estimée** : 5 heures
-
+---
+titre: VPC & réseau — subnets, routage, NAT, pare-feux
+cours: 12-aws-cloud
+notions: [VPC régional, bloc CIDR, "subnet public vs privé (route IGW)", adresses réservées AWS, table de routage, longest-prefix-match, Internet Gateway, NAT Gateway, Elastic IP, "Security Group (stateful)", "NACL (stateless)", VPC endpoint Gateway vs Interface]
+outcomes:
+  - sait découper un VPC en subnets publics/privés multi-AZ avec un plan CIDR cohérent
+  - sait rendre un subnet public ou privé via sa table de routage (IGW vs NAT Gateway)
+  - sait distinguer Security Group (stateful, instance) et NACL (stateless, subnet) et choisir le bon
+  - sait pourquoi un NAT Gateway coûte cher et comment un VPC endpoint S3 réduit la facture
+prerequis: [Modules 00-01 du cours 12-aws-cloud — compte AWS + régions/AZ, IAM et moindre privilège]
+next: 03-ec2-compute
+libs: []
+tribuzen: infrastructure réseau TribuZen — le VPC qui isole l'API Lambda, la base de données et le NAT vers Internet
+last-reviewed: 2026-07
 ---
 
-## Table des matières
+# VPC & réseau — subnets, routage, NAT, pare-feux
 
-1. [Qu'est-ce qu'un VPC ?](#quest-ce-quun-vpc)
-2. [Notation CIDR](#notation-cidr)
-3. [Sous-réseaux publics et privés](#sous-réseaux-publics-et-privés)
-4. [Internet Gateway](#internet-gateway)
-5. [NAT Gateway](#nat-gateway)
-6. [Tables de routage](#tables-de-routage)
-7. [Security Groups vs NACLs](#security-groups-vs-nacls)
-8. [Elastic Network Interfaces (ENI)](#elastic-network-interfaces)
-9. [VPC Peering](#vpc-peering)
-10. [VPC Endpoints](#vpc-endpoints)
-11. [VPC Flow Logs](#vpc-flow-logs)
-12. [Architecture réseau complète](#architecture-réseau-complète)
-13. [Bonnes pratiques](#bonnes-pratiques)
+> **Outcomes — tu sauras FAIRE :** découper un VPC en subnets publics/privés multi-AZ, router un subnet vers Internet (IGW) ou en sortie seule (NAT Gateway), et choisir entre Security Group et NACL.
+> **Difficulté :** :star::star::star:
+>
+> **Portée :** ce module couvre **le réseau uniquement** — VPC, CIDR, subnets, tables de routage, Internet Gateway, NAT Gateway, Security Groups vs NACL, et un survol des VPC endpoints. Ce qu'on **branche dedans** (instances EC2, EBS, groupes d'auto-scaling) est le sujet du **module 03**. Les rôles/politiques qui autorisent les appels d'API réseau relèvent du **module 01 (IAM)**, supposé acquis.
 
----
+## 1. Cas concret d'abord
 
-## Qu'est-ce qu'un VPC ?
+Tu poses les fondations cloud de TribuZen. Avant la moindre ligne de code applicatif, une question : **où vivent la base de données et l'API ?**
 
-Un **VPC** (Virtual Private Cloud) est un réseau virtuel isolé dans le cloud AWS. C'est votre espace réseau privé où vous déployez vos ressources.
+Un stagiaire a tout lancé dans le **VPC par défaut**, tout dans un seul subnet, et a ouvert le Security Group de la base PostgreSQL en `0.0.0.0/0` sur le port 5432 « pour que ça marche vite ». Trois jours plus tard, GuardDuty signale des tentatives de connexion depuis l'autre bout du monde.
 
-### Caractéristiques fondamentales
-
-- Un VPC est **régional** — il s'étend sur toutes les AZ d'une région
-- Chaque compte a un **VPC par défaut** dans chaque région (à ne pas utiliser en production)
-- Vous pouvez créer jusqu'à **5 VPC par région** (limite augmentable)
-- Un VPC a un bloc CIDR principal (IPv4 obligatoire, IPv6 optionnel)
-
----
-
-## Notation CIDR
-
-Le **CIDR** (Classless Inter-Domain Routing) définit une plage d'adresses IP. Comprendre le CIDR est indispensable pour concevoir un réseau AWS.
-
-### Format
+Le cahier des charges réseau correct pour TribuZen :
 
 ```
-10.0.0.0/16
-│        │
-│        └── Masque : les 16 premiers bits sont fixes
-└── Adresse de base du réseau
+VPC TribuZen : 10.0.0.0/16
+
+  Subnet PUBLIC   10.0.0.0/24   (AZ eu-west-3a)  → l'API/le load balancer, joignable d'Internet
+  Subnet PUBLIC   10.0.1.0/24   (AZ eu-west-3b)
+  Subnet PRIVÉ    10.0.10.0/24  (AZ eu-west-3a)  → la base PostgreSQL, JAMAIS joignable d'Internet
+  Subnet PRIVÉ    10.0.11.0/24  (AZ eu-west-3b)
 ```
 
-### Tableau des masques courants
+Trois décisions que tu dois savoir justifier à la fin de ce module :
 
-| CIDR | Masque | Adresses disponibles | Usage typique |
-|------|--------|---------------------|---------------|
-| `/16` | 255.255.0.0 | 65 536 | VPC principal |
-| `/20` | 255.255.240.0 | 4 096 | Grand sous-réseau |
-| `/24` | 255.255.255.0 | 256 | Sous-réseau standard |
-| `/28` | 255.255.255.240 | 16 | Petit sous-réseau (minimum AWS) |
+1. **Pourquoi la base va dans un subnet privé** et l'API dans un subnet public — c'est la table de routage qui tranche, pas un attribut « privé ».
+2. **Comment la base télécharge quand même ses mises à jour** sans être joignable de l'extérieur — c'est le rôle du NAT Gateway (et pourquoi il te coûtera de l'argent).
+3. **Pourquoi le Security Group de la base ne référence jamais `0.0.0.0/0`** mais le Security Group de l'API — et la différence stateful/stateless qui rend ce choix sûr.
 
-### Règles AWS pour le CIDR
+## 2. Théorie complète, concise
 
-- Le bloc CIDR d'un VPC doit être entre `/16` (65 536 adresses) et `/28` (16 adresses)
-- AWS **réserve 5 adresses** dans chaque sous-réseau :
-  - `.0` — Adresse réseau
-  - `.1` — Passerelle VPC
-  - `.2` — Serveur DNS
-  - `.3` — Réservée par AWS pour usage futur
-  - `.255` — Adresse de diffusion (broadcast)
+### 2.1 Le VPC : un réseau régional isolé
 
-### Calcul rapide
+Un **VPC** (Virtual Private Cloud) est ton réseau IP privé dans AWS. Points structurants :
 
-```
-/16 = 2^(32-16) = 65 536 adresses
-/24 = 2^(32-24) = 256 adresses
-/28 = 2^(32-28) = 16 adresses
+- Un VPC est **régional** : il s'étend sur **toutes les AZ** de sa région (contrairement à un subnet, lié à **une seule** AZ).
+- Il possède au moins un **bloc CIDR IPv4** (taille comprise entre `/16` et `/28`), éventuellement un bloc IPv6.
+- Chaque compte a un **VPC par défaut** par région — pratique pour bricoler, à **éviter en production** (tout y est public par défaut).
 
-Pour un sous-réseau /24 : 256 - 5 (réservées) = 251 adresses utilisables
-```
+### 2.2 La notation CIDR
 
-### Plages d'adresses privées (RFC 1918)
-
-| Plage | CIDR | Utilisation recommandée |
-|-------|------|------------------------|
-| 10.0.0.0 – 10.255.255.255 | 10.0.0.0/8 | Grands réseaux d'entreprise |
-| 172.16.0.0 – 172.31.255.255 | 172.16.0.0/12 | Réseaux moyens |
-| 192.168.0.0 – 192.168.255.255 | 192.168.0.0/16 | Petits réseaux |
-
----
-
-## Sous-réseaux publics et privés
-
-Un **sous-réseau** (subnet) est une subdivision de votre VPC. Chaque sous-réseau réside dans **une seule AZ**.
-
-### Sous-réseau public vs privé
-
-| Caractéristique | Sous-réseau public | Sous-réseau privé |
-|-----------------|-------------------|-------------------|
-| Route vers Internet Gateway | Oui | Non |
-| IP publique automatique | Possible | Non |
-| Accessible depuis Internet | Oui (si SG le permet) | Non |
-| Accès à Internet sortant | Via IGW | Via NAT Gateway |
-| Usage typique | Load balancers, bastions | Serveurs d'application, BDD |
-
-### Plan d'adressage recommandé
+Le **CIDR** (Classless Inter-Domain Routing) décrit une plage d'adresses : `10.0.0.0/16` signifie « les 16 premiers bits sont fixes, les 16 restants sont libres ».
 
 ```
-VPC : 10.0.0.0/16
-
-Sous-réseaux publics :
-  10.0.1.0/24  → eu-west-3a (251 hôtes)
-  10.0.2.0/24  → eu-west-3b (251 hôtes)
-  10.0.3.0/24  → eu-west-3c (251 hôtes)
-
-Sous-réseaux privés (application) :
-  10.0.10.0/24 → eu-west-3a
-  10.0.11.0/24 → eu-west-3b
-  10.0.12.0/24 → eu-west-3c
-
-Sous-réseaux privés (base de données) :
-  10.0.20.0/24 → eu-west-3a
-  10.0.21.0/24 → eu-west-3b
-  10.0.22.0/24 → eu-west-3c
+/16 = 2^(32-16) = 65 536 adresses   ← taille d'un VPC confortable
+/24 = 2^(32-24) = 256 adresses      ← taille d'un subnet standard
+/28 = 2^(32-28) = 16 adresses       ← plus petit subnet AWS possible
 ```
 
----
+Utilise les plages **privées RFC 1918** : `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`.
 
-## Internet Gateway
+**AWS réserve 5 adresses dans CHAQUE subnet** (les 4 premières + la dernière). Pour `10.0.0.0/24` :
 
-L'**Internet Gateway** (IGW) est la passerelle qui connecte votre VPC à Internet. Sans IGW, aucune ressource de votre VPC ne peut communiquer avec Internet.
+| Adresse | Rôle (doc AWS) |
+|---------|----------------|
+| `10.0.0.0` | Adresse réseau |
+| `10.0.0.1` | Réservée AWS — **routeur du VPC** |
+| `10.0.0.2` | Réservée AWS — **serveur DNS** (base du réseau + 2) |
+| `10.0.0.3` | Réservée AWS — usage futur |
+| `10.0.0.255` | Adresse de broadcast (le broadcast n'est pas supporté dans un VPC) |
 
-### Caractéristiques
+Un subnet `/24` offre donc **256 − 5 = 251** adresses utilisables. C'est pour ça qu'un subnet ne peut pas être plus petit que `/28` (16 adresses → 11 utilisables).
 
-- **Un seul IGW par VPC** (relation 1:1)
-- Hautement disponible et redondant par conception
-- Gratuit (pas de frais supplémentaires)
-- Effectue le NAT pour les instances avec une IP publique
+### 2.3 Subnets : public vs privé — c'est la ROUTE qui décide
 
----
+Un **subnet** est une subdivision du VPC dans **une seule AZ**. Il n'y a **pas de case à cocher « privé »**. La doc AWS est explicite : *« le type de subnet est déterminé par la façon dont tu configures le routage »*.
 
-## NAT Gateway
+- **Subnet public** = sa table de routage a une **route directe vers un Internet Gateway**.
+- **Subnet privé** = sa table de routage **n'a pas** de route vers un Internet Gateway (il lui faut un NAT device pour sortir).
 
-Le **NAT Gateway** permet aux instances dans un sous-réseau **privé** d'accéder à Internet (pour les mises à jour, appels API, etc.) **sans être accessibles depuis Internet**.
+Chaque subnet doit être associé à **exactement une** table de routage (par défaut, la *main route table* du VPC). Répartis toujours tes subnets sur **≥ 2 AZ** : un subnet ne survit pas à la panne de son AZ.
 
-### Fonctionnement
+### 2.4 Tables de routage & priorité
 
-```
-Instance privée → NAT Gateway (sous-réseau public) → Internet Gateway → Internet
-                      ↑
-               Traduit l'IP privée en IP publique (Elastic IP)
-```
+Une **table de routage** contient des routes `destination → cible`. Le trafic est dirigé selon l'**adresse IP de destination**.
 
-### NAT Gateway vs NAT Instance
+Table d'un **subnet public** :
 
-| Caractéristique | NAT Gateway | NAT Instance |
-|-----------------|-------------|--------------|
-| Disponibilité | Managé, haute dispo dans une AZ | Vous gérez |
-| Bande passante | Jusqu'à 100 Gbps | Dépend du type d'instance |
-| Maintenance | Aucune | Patches, monitoring à votre charge |
-| Coût | ~0,052 $/h + données | Coût de l'instance |
-| Security Groups | Non applicable | Oui |
+| Destination | Cible | Sens |
+|-------------|-------|------|
+| `10.0.0.0/16` | `local` | trafic interne au VPC |
+| `0.0.0.0/0` | `igw-xxxx` | tout le reste → Internet |
 
-### Haute disponibilité
+Table d'un **subnet privé** :
 
-Un NAT Gateway est résilient **dans une seule AZ**. Pour la haute disponibilité, créez un NAT Gateway **dans chaque AZ** :
+| Destination | Cible | Sens |
+|-------------|-------|------|
+| `10.0.0.0/16` | `local` | trafic interne au VPC |
+| `0.0.0.0/0` | `nat-xxxx` | sortie Internet via NAT Gateway |
 
-```
-AZ-a : NAT Gateway A → sous-réseau public A
-AZ-b : NAT Gateway B → sous-réseau public B
-AZ-c : NAT Gateway C → sous-réseau public C
-```
+La route `local` est **implicite et impossible à supprimer** — elle assure la communication entre tous les subnets du VPC.
 
-Chaque sous-réseau privé utilise le NAT Gateway de sa propre AZ dans sa table de routage.
+**Priorité — longest prefix match :** quand plusieurs routes correspondent, AWS choisit **la plus spécifique** (le préfixe le plus long). Un paquet vers `10.0.10.5` matche à la fois `10.0.0.0/16` (local) et `0.0.0.0/0` ; `/16` étant plus spécifique que `/0`, il part en `local`. C'est ce qui garantit que le trafic interne ne fuit jamais par Internet.
 
----
+### 2.5 Internet Gateway (IGW)
 
-## Tables de routage
+L'**Internet Gateway** connecte le VPC à Internet.
 
-Une **table de routage** contient des règles (routes) qui déterminent où diriger le trafic réseau.
+- **Un seul IGW par VPC** (relation 1:1), attaché au VPC.
+- Hautement disponible et redondant **par conception** (pas de gestion, pas de goulot).
+- **Gratuit** (tu paies le transfert de données, pas la passerelle).
+- Il fait le NAT entre l'IP privée d'une instance et son **IP publique/Elastic IP**.
 
-### Table de routage du sous-réseau public
+Sans route `0.0.0.0/0 → igw` **et** sans IP publique, une instance ne voit pas Internet, même dans un subnet « public ».
 
-| Destination | Cible | Description |
-|------------|-------|-------------|
-| 10.0.0.0/16 | local | Trafic interne au VPC |
-| 0.0.0.0/0 | igw-xxx | Tout le reste → Internet |
+### 2.6 NAT Gateway — la sortie des subnets privés (⚠️ payant)
 
-### Table de routage du sous-réseau privé
+Un **NAT Gateway** (public) permet aux instances d'un subnet **privé** de **sortir** vers Internet (mises à jour, appels d'API externes) **sans jamais accepter de connexion entrante** venue d'Internet. Facts (doc AWS) :
 
-| Destination | Cible | Description |
-|------------|-------|-------------|
-| 10.0.0.0/16 | local | Trafic interne au VPC |
-| 0.0.0.0/0 | nat-xxx | Tout le reste → NAT Gateway |
+- Se crée **dans un subnet public** et exige une **Elastic IP** à la création.
+- **Managé** par AWS, résilient **dans une seule AZ** → pour la HA, un NAT Gateway **par AZ**.
+- *« Les connexions doivent toujours être initiées depuis l'intérieur du VPC »* — il est **unidirectionnel sortant**.
+- Le subnet privé le vise via `0.0.0.0/0 → nat-xxxx` ; le NAT, lui, route vers l'IGW.
+- **Payant** : tarif **horaire** (dès sa création, qu'il serve ou non) **+ frais par Go traité**. C'est le piège de facture n°1 en apprentissage → **teardown obligatoire**.
 
-### Règle importante
+Distinction utile : un **IGW** rend une instance joignable **des deux sens** (si elle a une IP publique) ; un **NAT Gateway** n'autorise que le **sortant**.
 
-La route **la plus spécifique** l'emporte toujours. Si vous avez :
-- `10.0.0.0/16 → local`
-- `0.0.0.0/0 → igw-xxx`
+### 2.7 Security Groups vs NACL — les deux pare-feux
 
-Un paquet destiné à `10.0.1.5` ira vers `local` car `/16` est plus spécifique que `/0`.
+Deux couches de filtrage, souvent confondues. La distinction **stateful / stateless** est le cœur du sujet (et une question d'entretien classique).
 
----
+**Security Group (SG)** — pare-feu au niveau **de la ressource / ENI** :
 
-## Security Groups vs NACLs
+- **Stateful** : si une requête sort (ou une requête entrante est autorisée), le **trafic retour est automatiquement permis**, quelles que soient les autres règles. Tu n'écris jamais la règle de retour.
+- Règles **ALLOW uniquement** (pas de DENY possible).
+- Par défaut sur un SG neuf : **tout entrant refusé**, **tout sortant autorisé**.
+- Peut **référencer un autre Security Group** comme source (ex. « SG-app autorise SG-base ») — bien plus robuste qu'un CIDR.
 
-Ce sont les deux couches de pare-feu dans un VPC. Comprendre leur différence est essentiel.
+**Network ACL (NACL)** — pare-feu au niveau **du subnet** :
 
-### Security Groups (SG)
+- **Stateless** : entrant et sortant sont évalués **indépendamment**. Autoriser l'entrant n'autorise **pas** le retour → il faut penser aux **ports éphémères** en sortie.
+- Règles **ALLOW et DENY**.
+- Règles **numérotées de 1 à 32766**, évaluées **de la plus petite à la plus grande** ; **première règle qui matche = appliquée**, on arrête là.
+- La **NACL par défaut autorise tout** ; une **NACL custom refuse tout** tant que tu n'ajoutes pas de règle.
+- Un subnet est associé à **exactement une** NACL.
 
-Un Security Group est un pare-feu **au niveau de l'instance** (ENI).
+| Critère | Security Group | NACL |
+|---------|----------------|------|
+| Niveau | Ressource / ENI | Subnet |
+| État | **Stateful** (retour auto) | **Stateless** (retour à gérer) |
+| Règles | ALLOW seulement | ALLOW **et** DENY |
+| Évaluation | Toutes les règles (OR) | Par n° croissant, 1re match gagne |
+| Défaut | Entrant deny, sortant allow | Défaut = allow tout ; custom = deny tout |
+| Référencer un SG | Oui | Non (CIDR seulement) |
 
-**Caractéristiques** :
-- **Stateful** : si le trafic entrant est autorisé, le trafic de retour est automatiquement autorisé
-- Règles **ALLOW uniquement** (pas de règle Deny)
-- Par défaut : tout le trafic sortant autorisé, tout le trafic entrant refusé
-- Vous pouvez référencer un **autre Security Group** comme source
+**Règle de choix :** le SG est ton outil principal (99 % des cas). La NACL ajoute une couche de subnet — utile pour bloquer explicitement une plage d'IP (DENY), ce que le SG ne sait pas faire.
 
-### Network ACLs (NACLs)
+### 2.8 VPC Endpoints — survol
 
-Les NACLs sont des pare-feux **au niveau du sous-réseau**.
+Un **VPC endpoint** permet d'atteindre un service AWS **sans passer par Internet** (le trafic reste sur le backbone AWS). Deux types :
 
-**Caractéristiques** :
-- **Stateless** : trafic entrant et sortant évalués indépendamment
-- Règles **ALLOW et DENY**
-- Évaluées **par numéro de règle** (du plus petit au plus grand)
-- La NACL par défaut autorise tout
+| Type | Services | Mécanisme |
+|------|----------|-----------|
+| **Gateway Endpoint** | **S3 et DynamoDB uniquement** | une entrée ajoutée dans la table de routage (gratuit) |
+| **Interface Endpoint** | la plupart des services (SQS, Secrets Manager…) | une ENI à IP privée dans tes subnets (PrivateLink, payant) |
 
-### Tableau comparatif
+Intérêt clé : un **Gateway Endpoint S3** évite de faire transiter le trafic S3 par le **NAT Gateway** → **économie directe** sur les frais de données NAT. On y revient au module 04 (S3).
 
-| Caractéristique | Security Group | NACL |
-|-----------------|---------------|------|
-| Niveau | Instance (ENI) | Sous-réseau |
-| État | Stateful | Stateless |
-| Règles | Allow uniquement | Allow + Deny |
-| Évaluation | Toutes les règles | Par ordre de numéro |
-| Par défaut | Deny entrant, Allow sortant | Allow tout |
-| Référence SG | Oui | Non |
+## 3. Worked examples
 
----
+### Exemple 1 — Rendre le subnet base de données de TribuZen réellement privé
 
-## Elastic Network Interfaces
+**Objectif :** la base PostgreSQL de TribuZen dans `10.0.10.0/24` doit pouvoir **télécharger ses mises à jour** mais rester **injoignable d'Internet**.
 
-Une **ENI** (Elastic Network Interface) est une carte réseau virtuelle attachée à une instance.
-
-### Attributs d'une ENI
-
-- Une adresse IPv4 privée principale
-- Une ou plusieurs adresses IPv4 privées secondaires
-- Une adresse IPv4 publique (optionnelle)
-- Une ou plusieurs adresses IPv6
-- Un ou plusieurs Security Groups
-- Une adresse MAC
-- Un flag source/destination check
-
-### Cas d'usage
-
-- **Dual-homing** : une instance avec une ENI dans un sous-réseau public et une dans un sous-réseau privé
-- **Failover** : déplacer une ENI d'une instance défaillante vers une instance saine
-- **Licensing** : certaines licences sont liées à l'adresse MAC
-
----
-
-## VPC Peering
-
-Le **VPC Peering** permet de connecter deux VPC entre eux via le réseau privé AWS (sans passer par Internet).
-
-### Caractéristiques
-
-- Fonctionne **entre régions** et **entre comptes**
-- Le trafic reste sur le backbone AWS (pas de goulot d'étranglement Internet)
-- **Non transitif** : si VPC-A est peered avec VPC-B, et VPC-B avec VPC-C, VPC-A ne peut PAS communiquer avec VPC-C via VPC-B
-- Les blocs CIDR ne doivent **pas se chevaucher**
-
-### Limitation de transitivité
-
-```
-VPC-A ←→ VPC-B ←→ VPC-C
-
-VPC-A peut parler à VPC-B       ✅
-VPC-B peut parler à VPC-C       ✅
-VPC-A peut parler à VPC-C       ❌ (il faut un peering direct A↔C)
-```
-
-Pour des architectures avec beaucoup de VPC, utilisez **AWS Transit Gateway** à la place.
-
----
-
-## VPC Endpoints
-
-Les **VPC Endpoints** permettent de connecter votre VPC aux services AWS **sans passer par Internet**. Le trafic reste entièrement sur le réseau AWS.
-
-### Types de VPC Endpoints
-
-| Type | Services supportés | Fonctionnement |
-|------|-------------------|----------------|
-| **Gateway Endpoint** | S3, DynamoDB uniquement | Entrée dans la table de routage |
-| **Interface Endpoint** | La plupart des services AWS | ENI avec IP privée (PrivateLink) |
-
-### Gateway Endpoint (S3, DynamoDB)
+Étape par étape (concepts + CLI AWS) :
 
 ```bash
-# Créer un Gateway Endpoint pour S3
-aws ec2 create-vpc-endpoint \
-  --vpc-id vpc-0abc123def456 \
-  --service-name com.amazonaws.eu-west-3.s3 \
-  --route-table-ids rtb-0abc123-private
+# 1. Le VPC (bloc /16)
+aws ec2 create-vpc --cidr-block 10.0.0.0/16
+# → renvoie vpc-0aaa...
 
-# Vérifier
-aws ec2 describe-vpc-endpoints \
-  --filters "Name=vpc-id,Values=vpc-0abc123def456"
+# 2. Un subnet PUBLIC (pour le NAT) et un subnet PRIVÉ (pour la base), même AZ
+aws ec2 create-subnet --vpc-id vpc-0aaa --cidr-block 10.0.0.0/24  --availability-zone eu-west-3a   # public
+aws ec2 create-subnet --vpc-id vpc-0aaa --cidr-block 10.0.10.0/24 --availability-zone eu-west-3a   # privé
+
+# 3. Internet Gateway attaché au VPC (gratuit)
+aws ec2 create-internet-gateway                    # → igw-0ccc
+aws ec2 attach-internet-gateway --vpc-id vpc-0aaa --internet-gateway-id igw-0ccc
+
+# 4. Le subnet PUBLIC route 0.0.0.0/0 vers l'IGW → il devient "public"
+aws ec2 create-route --route-table-id rtb-public --destination-cidr-block 0.0.0.0/0 --gateway-id igw-0ccc
+
+# 5. Un NAT Gateway DANS le subnet public, avec une Elastic IP  (⚠️ facturation démarre ici)
+aws ec2 allocate-address --domain vpc              # → eipalloc-0eee
+aws ec2 create-nat-gateway --subnet-id subnet-public --allocation-id eipalloc-0eee   # → nat-0fff
+
+# 6. Le subnet PRIVÉ route 0.0.0.0/0 vers le NAT → sortie seule, pas d'entrée
+aws ec2 create-route --route-table-id rtb-private --destination-cidr-block 0.0.0.0/0 --nat-gateway-id nat-0fff
 ```
 
-**Avantage** : le trafic vers S3 ne passe plus par le NAT Gateway → **économie significative** sur les frais de données NAT.
+**Pourquoi c'est correct :**
+- Le subnet base n'a **aucune** route vers l'IGW → rien venu d'Internet ne peut l'atteindre (la doc AWS définit « privé » ainsi).
+- Il a une route `0.0.0.0/0 → nat` → il **sort** pour ses mises à jour, mais le NAT refuse toute connexion initiée de l'extérieur.
+- La route `local` (implicite) laisse l'API du subnet public parler à la base — sans passer par Internet.
 
-### Interface Endpoint (PrivateLink)
+**Teardown (sinon ça facture) :** `delete-nat-gateway`, puis `release-address` de l'Elastic IP, puis les subnets, l'IGW (détacher d'abord), le VPC.
 
-Les Interface Endpoints créent une ENI avec une IP privée dans vos sous-réseaux. Ils supportent la plupart des services AWS (SQS, SNS, CloudWatch, etc.). Activez le DNS privé pour que les appels SDK utilisent automatiquement l'endpoint.
+### Exemple 2 — SG stateful vs NACL stateless sur le port PostgreSQL
 
-Vous pouvez restreindre l'accès via une **politique d'endpoint** (IAM policy attachée au VPC endpoint).
+**Objectif :** seule l'API (subnet public) doit joindre la base sur le **port 5432**.
+
+**Avec un Security Group (recommandé) :**
+
+```
+SG-api   (attaché à l'API)   : entrant  443 depuis 0.0.0.0/0
+SG-base  (attaché à la base) : entrant  5432 depuis  SG-api      ← on référence un SG, pas un CIDR
+```
+
+Une seule règle entrante sur `SG-base`. **Pas de règle de retour** : le SG étant **stateful**, la réponse de PostgreSQL vers l'API repart automatiquement. Et comme la source est `SG-api` (pas un CIDR), n'importe quelle instance qui rejoint `SG-api` est autorisée sans retoucher la base.
+
+**Le même besoin avec une NACL (stateless) est plus lourd :**
+
+```
+NACL du subnet base :
+  Entrant  100 : ALLOW  TCP 5432        depuis 10.0.0.0/24   (le subnet API)
+  Sortant  100 : ALLOW  TCP 1024-65535  vers   10.0.0.0/24   ← ports éphémères du RETOUR, à la main
+```
+
+Comme la NACL est **stateless**, oublier la règle **sortante** sur les ports éphémères casse la connexion : la requête entre, mais la réponse est bloquée. C'est l'illustration concrète de « stateful vs stateless », et la raison pour laquelle on pilote l'accès applicatif par **Security Group**, la NACL servant de garde-fou grossier au niveau subnet.
+
+## 4. Pièges & misconceptions
+
+### PIÈGE #1 — « Un subnet privé, c'est une option à cocher »
+
+Faux. Il n'existe pas d'attribut « privé ». Un subnet est privé **uniquement parce que sa table de routage n'a pas de route vers un IGW**. Ajoute cette route par erreur (ou mets l'instance dans la mauvaise table) et ton subnet « privé » devient public sans avertissement.
+
+### PIÈGE #2 — Confondre stateful (SG) et stateless (NACL)
+
+Sur un **Security Group**, tu n'écris **jamais** la règle de retour : il est stateful. Sur une **NACL**, tu **dois** autoriser explicitement le trafic retour (souvent les ports éphémères `1024-65535` en sortie), sinon la connexion se bloque à la réponse. Beaucoup de « la connexion timeout » viennent d'une NACL custom dont on a oublié la règle sortante.
+
+### PIÈGE #3 — Croire que le NAT Gateway est gratuit ou bidirectionnel
+
+Deux erreurs en une. (a) Le NAT Gateway est **facturé à l'heure dès sa création** *plus* au Go traité — un NAT oublié un week-end coûte réellement. (b) Il est **sortant uniquement** : *« les connexions doivent toujours être initiées depuis l'intérieur du VPC »*. Pour exposer un service à Internet, c'est un **IGW + IP publique/load balancer**, pas un NAT.
+
+### PIÈGE #4 — Ouvrir un Security Group en `0.0.0.0/0` sur un port de base de données
+
+`0.0.0.0/0` sur 5432/3306 expose la base au monde entier (le scénario du cas concret). La bonne pratique : référencer le **Security Group** de la couche appelante comme source. Réserve `0.0.0.0/0` aux ports publics légitimes (443) sur les ressources **faites** pour être exposées.
+
+### PIÈGE #5 — Croire que le VPC Peering est transitif / oublier le chevauchement CIDR
+
+Le VPC Peering n'est **pas transitif** (A↔B et B↔C ne donnent pas A↔C) et exige des **CIDR qui ne se chevauchent pas**. C'est pour ça qu'on choisit des plages disjointes dès la conception (`10.0.0.0/16` vs `10.1.0.0/16`), même pour un seul VPC aujourd'hui.
+
+### PIÈGE #6 — Croire qu'un `/24` offre 256 adresses utilisables
+
+Non : AWS **réserve 5 adresses par subnet** (`.0`, `.1`, `.2`, `.3`, `.255`). Un `/24` fournit **251** adresses assignables. À l'échelle d'un `/28` (16 → **11** utilisables), l'écart devient critique.
+
+## 5. Ancrage TribuZen
+
+Le VPC est la **couche 0** de l'infrastructure TribuZen : tout ce qui suivra dans le cours (EC2, RDS, Lambda, ElastiCache) se déploie **dedans**.
+
+Topologie cible de TribuZen :
+
+```
+VPC TribuZen  10.0.0.0/16   (région eu-west-3, 2 AZ)
+
+  Subnets PUBLICS   10.0.0.0/24  · 10.0.1.0/24
+     └─ Application Load Balancer (front de l'API)   ← route vers IGW
+     └─ NAT Gateway (1 par AZ en prod)
+
+  Subnets PRIVÉS-APP  10.0.10.0/24 · 10.0.11.0/24
+     └─ compute de l'API TribuZen                    ← sort via NAT, jamais joignable d'Internet
+
+  Subnets PRIVÉS-DATA 10.0.20.0/24 · 10.0.21.0/24
+     └─ RDS PostgreSQL (données familles/membres)    ← SG n'autorise que le SG-app sur 5432
+     └─ ElastiCache (module 08)
+```
+
+Décisions de sécurité TribuZen ancrées ici :
+- La **base familles/membres** est en subnet **privé-data**, injoignable d'Internet — obligation RGPD de fait sur des données de mineurs.
+- Le **Security Group de RDS** ne référence **que** le SG de l'API, jamais un CIDR public.
+- Un **Gateway Endpoint S3** (avatars TribuZen, module 04) évite de payer le NAT pour le trafic S3.
+
+> Ce qu'on **place** dans ces subnets — instances, base managée, fonctions — arrive aux modules suivants. Ici, on a bâti et sécurisé **le réseau** qui les accueillera.
+
+Fichiers cibles côté IaC (le VPC sera codé en CDK au module 05) :
+```
+tribuzen-infra/
+  lib/
+    network-stack.ts     ← VPC, subnets publics/privés, IGW, NAT, tables de routage
+    security-groups.ts   ← SG-alb, SG-api, SG-rds (références croisées)
+```
+
+## 6. Points clés
+
+1. Un **VPC** est régional ; un **subnet** vit dans **une seule AZ** → répartir sur ≥ 2 AZ.
+2. **Public vs privé** ne se coche pas : c'est la **table de routage** (route vers IGW = public) qui tranche.
+3. AWS **réserve 5 adresses par subnet** ; un `/24` = 251 utilisables ; taille de subnet `/28` → `/16`.
+4. **Priorité de routage = longest prefix match** : la route la plus spécifique gagne, `local` protège le trafic interne.
+5. **Internet Gateway** : 1 par VPC, gratuit, bidirectionnel (avec IP publique).
+6. **NAT Gateway** : sortie seule des subnets privés, dans un subnet public, Elastic IP requise, **payant (horaire + par Go) → teardown**.
+7. **Security Group** : stateful, ALLOW-only, niveau ressource, peut référencer un autre SG.
+8. **NACL** : stateless (gérer le retour), ALLOW+DENY, niveau subnet, règles numérotées 1re-match.
+9. **VPC endpoint** : accès privé aux services AWS ; Gateway (S3/DynamoDB, gratuit) vs Interface (PrivateLink, payant).
+
+## 7. Seeds Anki
+
+```
+Qu'est-ce qui rend un subnet AWS "public" ou "privé" ?|Sa table de routage : un subnet est public s'il a une route directe vers un Internet Gateway, privé s'il n'en a pas (il lui faut alors un NAT device pour sortir). Il n'existe aucun attribut "privé" à cocher.
+Combien d'adresses AWS réserve-t-il dans chaque subnet et lesquelles ?|5 : les 4 premières (.0 réseau, .1 routeur VPC, .2 DNS, .3 usage futur) et la dernière (.255 broadcast). Un /24 offre donc 251 adresses utilisables.
+Différence entre Security Group et NACL sur l'état ?|SG = stateful : le trafic retour est automatiquement autorisé, on n'écrit jamais la règle de réponse. NACL = stateless : entrant et sortant évalués indépendamment, il faut autoriser explicitement le retour (ports éphémères).
+Security Group vs NACL : règles autorisées et niveau ?|SG : ALLOW uniquement, au niveau ressource/ENI, peut référencer un autre SG comme source. NACL : ALLOW et DENY, au niveau subnet, règles numérotées 1-32766 évaluées de la plus petite à la plus grande (1re match gagne), CIDR seulement.
+À quoi sert un NAT Gateway et quel est son piège ?|Il laisse les instances d'un subnet privé SORTIR vers Internet sans accepter de connexion entrante. Il se crée dans un subnet public avec une Elastic IP. Piège : facturé à l'heure dès sa création + par Go traité → toujours le détruire (teardown) après un lab.
+Comment fonctionne la priorité entre routes d'une table de routage ?|Longest prefix match : la route la plus spécifique (préfixe le plus long) gagne. Ex. un paquet vers 10.0.10.5 matche 10.0.0.0/16 (local) et 0.0.0.0/0 ; /16 étant plus spécifique, il reste en local.
+Internet Gateway vs NAT Gateway ?|IGW : 1 par VPC, gratuit, rend une instance joignable dans les deux sens si elle a une IP publique. NAT Gateway : payant, sortie uniquement pour les subnets privés, les connexions doivent toujours être initiées depuis le VPC.
+Quels sont les deux types de VPC endpoint ?|Gateway Endpoint (S3 et DynamoDB seulement, entrée dans la table de routage, gratuit) et Interface Endpoint (la plupart des services via PrivateLink, une ENI à IP privée, payant). Un Gateway Endpoint S3 évite de payer le NAT pour le trafic S3.
+```
 
 ---
 
-## VPC Flow Logs
+## Pont vers le lab
 
-Les **VPC Flow Logs** capturent les informations sur le trafic IP entrant et sortant des interfaces réseau de votre VPC.
-
-### Niveaux de capture
-
-- **VPC** : tout le trafic du VPC
-- **Sous-réseau** : tout le trafic d'un sous-réseau
-- **ENI** : trafic d'une interface réseau spécifique
-
-### Format d'un enregistrement
-
-```
-version account-id interface-id srcaddr dstaddr srcport dstport protocol packets bytes start end action log-status
-
-2 123456789012 eni-0abc123 10.0.1.5 10.0.2.10 443 49152 6 25 5000 1620000000 1620000060 ACCEPT OK
-2 123456789012 eni-0abc123 203.0.113.5 10.0.1.5 0 0 1 4 336 1620000000 1620000060 REJECT OK
-```
-
-### Destinations
-
-Les Flow Logs peuvent être envoyés vers **CloudWatch Logs** (analyse temps réel) ou **S3** (stockage long terme, moins cher).
-
----
-
-## Architecture réseau complète
-
-Voici l'architecture réseau typique d'une application en production :
-
-```
-                        Internet
-                           │
-                    ┌──────┴──────┐
-                    │ Internet GW │
-                    └──────┬──────┘
-                           │
-          ┌────────────────┼────────────────┐
-          │                │                │
-    ┌─────┴─────┐   ┌─────┴─────┐   ┌─────┴─────┐
-    │ Public-A  │   │ Public-B  │   │ Public-C  │
-    │ 10.0.1/24 │   │ 10.0.2/24 │   │ 10.0.3/24 │
-    │    ALB    │   │    ALB    │   │    ALB    │
-    │  NAT GW   │   │  NAT GW   │   │  NAT GW   │
-    └─────┬─────┘   └─────┬─────┘   └─────┬─────┘
-          │                │                │
-    ┌─────┴─────┐   ┌─────┴─────┐   ┌─────┴─────┐
-    │ Private-A │   │ Private-B │   │ Private-C │
-    │10.0.10/24 │   │10.0.11/24 │   │10.0.12/24 │
-    │   EC2 App │   │   EC2 App │   │   EC2 App │
-    └─────┬─────┘   └─────┬─────┘   └─────┬─────┘
-          │                │                │
-    ┌─────┴─────┐   ┌─────┴─────┐   ┌─────┴─────┐
-    │  Data-A   │   │  Data-B   │   │  Data-C   │
-    │10.0.20/24 │   │10.0.21/24 │   │10.0.22/24 │
-    │    RDS    │   │    RDS    │   │    RDS    │
-    └───────────┘   └───────────┘   └───────────┘
-```
-
----
-
-## Bonnes pratiques
-
-### Checklist réseau
-
-1. **Plan d'adressage**
-   - [ ] Utiliser un CIDR `/16` pour le VPC (assez d'espace)
-   - [ ] Ne pas chevaucher les CIDR avec d'autres VPC ou le réseau on-premise
-   - [ ] Documenter le plan d'adressage
-
-2. **Sous-réseaux**
-   - [ ] Minimum 2 AZ (idéalement 3) pour la haute disponibilité
-   - [ ] Séparer public / privé / données
-   - [ ] Les bases de données dans des sous-réseaux dédiés sans accès Internet
-
-3. **Sécurité**
-   - [ ] Security Groups : principe du moindre privilège
-   - [ ] Référencer des SG plutôt que des CIDR quand possible
-   - [ ] NACLs en couche supplémentaire pour les sous-réseaux sensibles
-   - [ ] Activer les VPC Flow Logs
-
-4. **Coûts**
-   - [ ] VPC Endpoint Gateway pour S3 et DynamoDB (gratuit, économise le NAT)
-   - [ ] Un NAT Gateway par AZ (éviter le trafic cross-AZ)
-   - [ ] Surveiller les coûts de transfert de données
-
-5. **Connectivité**
-   - [ ] VPC Peering pour 2-3 VPC
-   - [ ] Transit Gateway pour des architectures à plusieurs VPC
-   - [ ] VPN ou Direct Connect pour la connectivité on-premise
-
----
-
-## Résumé du module
-
-| Concept | Points clés |
-|---------|-------------|
-| VPC | Réseau isolé, régional, CIDR /16 à /28 |
-| Sous-réseaux | Public (route IGW) vs Privé (route NAT), liés à une AZ |
-| Internet Gateway | Porte vers Internet, 1 par VPC, gratuit |
-| NAT Gateway | Accès Internet sortant pour sous-réseaux privés, ~0,05 $/h |
-| Tables de routage | Dirigent le trafic, route la plus spécifique gagne |
-| Security Groups | Stateful, Allow only, niveau instance |
-| NACLs | Stateless, Allow + Deny, niveau sous-réseau |
-| VPC Peering | Connexion privée entre VPC, non transitif |
-| VPC Endpoints | Accès privé aux services AWS, Gateway (S3/DDB) ou Interface |
-
+> Lab associé : `labs/lab-02-vpc/README.md`. Construire de bout en bout le VPC TribuZen (subnets public/privé, IGW, NAT, tables de routage, SG) dans la Console AWS + CLI, tester la connectivité, puis **tout détruire** — le NAT Gateway est payant.

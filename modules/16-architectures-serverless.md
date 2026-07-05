@@ -1,737 +1,445 @@
-# 16 — Architectures Serverless Avancees
+---
+titre: Architectures serverless — event-driven, Step Functions et coordination
+cours: 12-aws-cloud
+notions: [architecture serverless, event-driven, "assemblage API Gateway + Lambda + DynamoDB", orchestration, chorégraphie, "Step Functions (state machine)", "Amazon States Language (ASL)", "état Task", "état Choice", "état Parallel", "état Map", "état Wait / Pass / Succeed / Fail", "Retry / Catch", "intégrations directes (arn:aws:states:::dynamodb:putItem)", workflow Standard, workflow Express, "exactly-once vs at-least-once", idempotence, "clé d'idempotence", saga, transaction compensatoire, DLQ]
+outcomes:
+  - sait assembler API Gateway + Lambda + DynamoDB + messaging en une architecture serverless event-driven cohérente
+  - sait distinguer orchestration (Step Functions) et chorégraphie (events) et choisir selon le couplage voulu
+  - sait écrire une state machine ASL avec Task/Choice/Parallel/Map, Retry et Catch, et choisir Standard vs Express sur des faits (durée, sémantique, prix)
+  - sait rendre un handler idempotent et esquisser une saga avec transactions compensatoires
+prerequis: [Modules 00 à 15 du cours 12-aws-cloud, Module 06 — Lambda, Module 07 — API Gateway, Module 09 — DynamoDB, Module 10 — messaging (SQS/SNS/EventBridge)]
+next: 17-cicd-devops
+libs: []
+tribuzen: infra cloud TribuZen — workflow serverless de traitement d'un upload d'avatar (S3 → validation → miniature → écriture feed → notification), orchestré par Step Functions
+last-reviewed: 2026-07
+---
 
-> **Duree estimee** : 5h00
-> **Difficulte** : 4/5
-> **Prerequis** : Module 05 (Lambda), Module 07 (DynamoDB), Module 08 (SQS/SNS/EventBridge)
-> **Objectifs** :
+# Architectures serverless — event-driven, Step Functions et coordination
+
+> **Outcomes — tu sauras FAIRE :** assembler API Gateway + Lambda + DynamoDB + messaging en une architecture event-driven, distinguer orchestration et chorégraphie, écrire une state machine ASL (Task/Choice/Parallel/Map + Retry/Catch) et choisir Standard vs Express, rendre un handler idempotent et esquisser une saga.
+> **Difficulté :** :star::star::star::star:
 >
-> - Maitriser **Step Functions** (machine a etats, types d'etats)
-> - Implementer des patterns **event-driven** (CQRS, Saga)
-> - Construire des APIs temps reel avec **WebSocket API**
-> - Decouvrir **AppSync** pour les APIs GraphQL
-> - Optimiser les **couts** des architectures serverless
-
----
-
-## Step Functions
-
-### Pourquoi un orchestrateur ?
-
-Quand une operation metier implique plusieurs etapes, les enchainer dans une seule Lambda devient vite complexe :
-
-```typescript
-// Anti-pattern : Lambda monolithique
-export async function handler() {
-  const order = await validateOrder(); // etape 1
-  const payment = await processPayment(); // etape 2
-  await updateInventory(); // etape 3
-  await sendConfirmation(); // etape 4
-  // Que faire si l'etape 3 echoue ?
-  // Comment reprendre apres une panne ?
-  // Comment gerer les timeouts ?
-}
-```
-
-**Step Functions** est un orchestrateur visuel qui gere :
-
-- L'**enchainement** des etapes
-- Les **erreurs** et les **retries**
-- Les **branches conditionnelles**
-- Le **parallelisme**
-- L'**etat** entre les etapes (pas besoin de base de donnees intermediaire)
-
-### Machine a etats
-
-Une **state machine** (machine a etats) definit un workflow sous forme de JSON (Amazon States Language) :
-
-```json
-{
-  "Comment": "Traitement de commande",
-  "StartAt": "ValidateOrder",
-  "States": {
-    "ValidateOrder": {
-      "Type": "Task",
-      "Resource": "arn:aws:lambda:eu-west-1:123:function:validate-order",
-      "Next": "ProcessPayment",
-      "Catch": [
-        {
-          "ErrorEquals": ["ValidationError"],
-          "Next": "OrderFailed"
-        }
-      ]
-    },
-    "ProcessPayment": {
-      "Type": "Task",
-      "Resource": "arn:aws:lambda:eu-west-1:123:function:process-payment",
-      "Retry": [
-        {
-          "ErrorEquals": ["PaymentTimeout"],
-          "IntervalSeconds": 5,
-          "MaxAttempts": 3,
-          "BackoffRate": 2.0
-        }
-      ],
-      "Next": "OrderSuccess"
-    },
-    "OrderSuccess": {
-      "Type": "Succeed"
-    },
-    "OrderFailed": {
-      "Type": "Fail",
-      "Error": "OrderProcessingFailed",
-      "Cause": "La commande n'a pas pu etre traitee"
-    }
-  }
-}
-```
-
-### Types d'etats
-
-| Type         | Description                                 | Cas d'usage                              |
-| ------------ | ------------------------------------------- | ---------------------------------------- |
-| **Task**     | Execute une action (Lambda, API AWS, HTTP)  | Appeler une fonction, ecrire en DynamoDB |
-| **Choice**   | Branche conditionnelle (if/else)            | Router selon le montant, le pays...      |
-| **Parallel** | Execute plusieurs branches en parallele     | Envoyer email ET SMS en meme temps       |
-| **Map**      | Itere sur une liste (forEach)               | Traiter chaque item d'une commande       |
-| **Wait**     | Pause pendant une duree ou jusqu'a une date | Attendre 24h avant un rappel             |
-| **Pass**     | Transforme les donnees (sans action)        | Reformater le JSON entre deux etapes     |
-| **Succeed**  | Termine avec succes                         | Fin du workflow                          |
-| **Fail**     | Termine en erreur                           | Echec definitif                          |
-
-### Etat Choice — branchement conditionnel
-
-```json
-{
-  "Type": "Choice",
-  "Choices": [
-    {
-      "Variable": "$.orderTotal",
-      "NumericGreaterThan": 1000,
-      "Next": "RequireApproval"
-    },
-    {
-      "Variable": "$.customerType",
-      "StringEquals": "VIP",
-      "Next": "PriorityProcessing"
-    }
-  ],
-  "Default": "StandardProcessing"
-}
-```
-
-### Etat Parallel — execution simultanee
-
-```json
-{
-  "Type": "Parallel",
-  "Branches": [
-    {
-      "StartAt": "SendEmail",
-      "States": {
-        "SendEmail": {
-          "Type": "Task",
-          "Resource": "arn:aws:lambda:...:send-email",
-          "End": true
-        }
-      }
-    },
-    {
-      "StartAt": "SendSMS",
-      "States": {
-        "SendSMS": {
-          "Type": "Task",
-          "Resource": "arn:aws:lambda:...:send-sms",
-          "End": true
-        }
-      }
-    }
-  ],
-  "Next": "AllNotificationsSent"
-}
-```
-
-Le resultat est un tableau avec les sorties de chaque branche.
-
-### Etat Map — iteration
-
-```json
-{
-  "Type": "Map",
-  "ItemsPath": "$.orderItems",
-  "MaxConcurrency": 10,
-  "ItemProcessor": {
-    "ProcessorConfig": {
-      "Mode": "INLINE"
-    },
-    "StartAt": "ProcessItem",
-    "States": {
-      "ProcessItem": {
-        "Type": "Task",
-        "Resource": "arn:aws:lambda:...:process-item",
-        "End": true
-      }
-    }
-  },
-  "Next": "OrderComplete"
-}
-```
-
-### Standard vs Express
-
-| Critere         | Standard                                  | Express                                     |
-| --------------- | ----------------------------------------- | ------------------------------------------- |
-| **Duree max**   | 1 an                                      | 5 minutes                                   |
-| **Execution**   | Exactement une fois                       | Au moins une fois                           |
-| **Prix**        | Par transition d'etat                     | Par execution + duree                       |
-| **Historique**  | Complet (console)                         | CloudWatch Logs                             |
-| **Cas d'usage** | Workflows longs (commandes, approbations) | Traitement haute frequence (IoT, streaming) |
-
-### Parametres de depart recommandes
-
-Pour eviter les configurations arbitraires, voici une base simple a appliquer puis ajuster avec la production :
-
-| Sujet                           | Point de depart                                            |
-| ------------------------------- | ---------------------------------------------------------- |
-| Retry Task Step Functions       | `MaxAttempts: 3`, `IntervalSeconds: 2`, `BackoffRate: 2.0` |
-| Timeout d'une Lambda metier     | 10-30 s (eviter 120+ s par defaut)                         |
-| DLQ / destination d'echec async | Activee systematiquement                                   |
-| Correlation ID                  | Propage de l'entree API jusqu'aux events                   |
-| Alarme erreurs                  | seuil initial a 1% sur 5 min                               |
-
-L'idee n'est pas d'etre parfait du premier coup, mais d'avoir une baseline mesurable et defendable.
-
----
-
-## Step Functions + Lambda + DynamoDB
-
-### Pattern courant : workflow CRUD
-
-```
-API Gateway → Step Functions → Lambda (validate) → DynamoDB (write)
-                                    ↓
-                              Lambda (notify) → SNS
-                                    ↓
-                              Lambda (audit) → CloudWatch
-```
-
-### Integration directe (SDK Integration)
-
-Step Functions peut appeler des services AWS **directement**, sans Lambda intermediaire :
-
-```json
-{
-  "Type": "Task",
-  "Resource": "arn:aws:states:::dynamodb:putItem",
-  "Parameters": {
-    "TableName": "Orders",
-    "Item": {
-      "orderId": { "S.$": "$.orderId" },
-      "status": { "S": "CREATED" },
-      "createdAt": { "S.$": "$$.State.EnteredTime" }
-    }
-  },
-  "Next": "SendNotification"
-}
-```
-
-Services integrables directement :
-
-- **DynamoDB** : GetItem, PutItem, UpdateItem, DeleteItem, Query
-- **SQS** : SendMessage
-- **SNS** : Publish
-- **EventBridge** : PutEvents
-- **ECS** : RunTask
-- **Lambda** : Invoke
-- **HTTP** : Appels API externes
-
----
-
-## Patterns Event-Driven
-
-### CQRS avec DynamoDB Streams
-
-**CQRS** (Command Query Responsibility Segregation) separe les operations d'ecriture (commands) et de lecture (queries) :
-
-```
-Ecriture (Command) :
-  API POST /orders → Lambda → DynamoDB (table Orders)
-                                    ↓
-                              DynamoDB Streams
-                                    ↓
-                              Lambda (projector)
-                                    ↓
-                    DynamoDB (table OrdersByCustomer)  ← vue optimisee
-                    DynamoDB (table OrdersByDate)      ← vue optimisee
-                    ElastiCache (cache)                ← vue optimisee
-
-Lecture (Query) :
-  API GET /customers/:id/orders → Lambda → DynamoDB (OrdersByCustomer)
-  API GET /orders/today → Lambda → DynamoDB (OrdersByDate)
-```
-
-**Avantages** :
-
-- Les lectures sont **ultra-rapides** (vues pre-calculees)
-- Les ecritures ne sont pas ralenties par des index complexes
-- Chaque vue est optimisee pour un **pattern d'acces** specifique
-
-### Pattern Saga
-
-Le **Saga pattern** gere les transactions distribuees quand plusieurs services doivent rester coherents :
-
-```
-Commande e-commerce :
-  1. Reserver le stock      (Inventaire)
-  2. Debiter le paiement    (Paiement)
-  3. Creer l'expedition     (Expedition)
-
-Si l'etape 3 echoue :
-  3c. Annuler l'expedition  (compensation)
-  2c. Rembourser le client  (compensation)
-  1c. Liberer le stock      (compensation)
-```
-
-Implementation avec Step Functions :
-
-```json
-{
-  "StartAt": "ReserveStock",
-  "States": {
-    "ReserveStock": {
-      "Type": "Task",
-      "Resource": "arn:aws:lambda:...:reserve-stock",
-      "Next": "ProcessPayment",
-      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "SagaFailed" }]
-    },
-    "ProcessPayment": {
-      "Type": "Task",
-      "Resource": "arn:aws:lambda:...:process-payment",
-      "Next": "CreateShipment",
-      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "CompensateStock" }]
-    },
-    "CreateShipment": {
-      "Type": "Task",
-      "Resource": "arn:aws:lambda:...:create-shipment",
-      "Next": "OrderComplete",
-      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "CompensatePayment" }]
-    },
-    "CompensatePayment": {
-      "Type": "Task",
-      "Resource": "arn:aws:lambda:...:refund-payment",
-      "Next": "CompensateStock"
-    },
-    "CompensateStock": {
-      "Type": "Task",
-      "Resource": "arn:aws:lambda:...:release-stock",
-      "Next": "SagaFailed"
-    },
-    "OrderComplete": { "Type": "Succeed" },
-    "SagaFailed": { "Type": "Fail", "Error": "SagaFailed" }
-  }
-}
-```
-
-### API Composition
-
-L'**API Composition** pattern agrege les donnees de plusieurs microservices pour repondre a une seule requete :
-
-```
-Client : GET /dashboard
-       ↓
-Lambda (composer) :
-  ├── appel parallele → Service Utilisateur → profil
-  ├── appel parallele → Service Commandes   → dernieres commandes
-  └── appel parallele → Service Analytics   → statistiques
-       ↓
-  Agrement les resultats → reponse unifiee au client
-```
-
-Avec Step Functions (Parallel) :
-
-```json
-{
-  "Type": "Parallel",
-  "Branches": [
-    {
-      "StartAt": "GetProfile",
-      "States": {
-        "GetProfile": {
-          "Type": "Task",
-          "Resource": "...:get-profile",
-          "End": true
-        }
-      }
-    },
-    {
-      "StartAt": "GetOrders",
-      "States": {
-        "GetOrders": {
-          "Type": "Task",
-          "Resource": "...:get-orders",
-          "End": true
-        }
-      }
-    },
-    {
-      "StartAt": "GetStats",
-      "States": {
-        "GetStats": { "Type": "Task", "Resource": "...:get-stats", "End": true }
-      }
-    }
-  ],
-  "Next": "MergeResults"
-}
-```
-
----
-
-## WebSocket API
-
-### APIs temps reel
-
-L'API REST classique est **request-response** : le client envoie une requete et attend une reponse. Mais certains cas necessitent une communication **bidirectionnelle** en temps reel :
-
-- Chat en direct
-- Notifications push
-- Tableaux de bord en temps reel
-- Jeux multijoueurs
-
-### WebSocket API avec API Gateway
-
-```
-Client ←──WebSocket──→ API Gateway WebSocket
-                              ↓
-                    Routes :
-                      $connect    → Lambda (connexion)
-                      $disconnect → Lambda (deconnexion)
-                      $default    → Lambda (messages non routes)
-                      sendMessage → Lambda (envoyer un message)
-```
-
-### Gestion des connexions
-
-```typescript
-import {
-  ApiGatewayManagementApiClient,
-  PostToConnectionCommand,
-} from "@aws-sdk/client-apigatewaymanagementapi";
-import {
-  DynamoDBClient,
-  PutItemCommand,
-  DeleteItemCommand,
-  ScanCommand,
-} from "@aws-sdk/client-dynamodb";
-
-const dynamodb = new DynamoDBClient({});
-
-// $connect : stocker la connexion
-export async function connectHandler(event: any) {
-  const connectionId = event.requestContext.connectionId;
-  await dynamodb.send(
-    new PutItemCommand({
-      TableName: "WebSocketConnections",
-      Item: {
-        connectionId: { S: connectionId },
-        connectedAt: { S: new Date().toISOString() },
-      },
-    }),
-  );
-  return { statusCode: 200 };
-}
-
-// $disconnect : supprimer la connexion
-export async function disconnectHandler(event: any) {
-  const connectionId = event.requestContext.connectionId;
-  await dynamodb.send(
-    new DeleteItemCommand({
-      TableName: "WebSocketConnections",
-      Key: { connectionId: { S: connectionId } },
-    }),
-  );
-  return { statusCode: 200 };
-}
-
-// sendMessage : broadcaster a tous les connectes
-export async function sendMessageHandler(event: any) {
-  const body = JSON.parse(event.body);
-  const { connectionId: senderId } = event.requestContext;
-
-  // Recuperer toutes les connexions
-  const connections = await dynamodb.send(
-    new ScanCommand({
-      TableName: "WebSocketConnections",
-    }),
-  );
-
-  const api = new ApiGatewayManagementApiClient({
-    endpoint: `https://${event.requestContext.domainName}/${event.requestContext.stage}`,
-  });
-
-  // Envoyer a chaque connexion
-  for (const conn of connections.Items || []) {
-    try {
-      await api.send(
-        new PostToConnectionCommand({
-          ConnectionId: conn.connectionId.S!,
-          Data: JSON.stringify({
-            from: senderId,
-            message: body.message,
-          }),
-        }),
-      );
-    } catch (e: any) {
-      if (e.statusCode === 410) {
-        // Connexion fermee, nettoyer
-        await dynamodb.send(
-          new DeleteItemCommand({
-            TableName: "WebSocketConnections",
-            Key: { connectionId: conn.connectionId },
-          }),
-        );
-      }
-    }
-  }
-
-  return { statusCode: 200 };
-}
-```
-
----
-
-## AppSync — GraphQL
-
-### Pourquoi GraphQL ?
-
-REST a des limites pour les applications complexes :
-
-- **Over-fetching** : GET `/users/123` retourne tous les champs meme si on veut juste le nom
-- **Under-fetching** : il faut 3 appels pour avoir user + commandes + adresses
-- **N+1** : obtenir une liste de commandes puis les details de chaque produit
-
-**GraphQL** resout ces problemes avec un seul endpoint et des requetes flexibles.
-
-### AppSync
-
-**AppSync** est le service manage AWS pour GraphQL :
-
-```
-Client → AppSync (GraphQL endpoint)
-              ↓
-         Resolvers :
-           Query.getUser → DynamoDB
-           Query.listOrders → Lambda
-           Mutation.createOrder → Lambda + DynamoDB
-           Subscription.onNewOrder → WebSocket temps reel
-```
-
-### Schema exemple
-
-```graphql
-type User {
-  id: ID!
-  name: String!
-  email: String!
-  orders: [Order!]!
-}
-
-type Order {
-  id: ID!
-  total: Float!
-  status: OrderStatus!
-  items: [OrderItem!]!
-  createdAt: String!
-}
-
-enum OrderStatus {
-  PENDING
-  PROCESSING
-  SHIPPED
-  DELIVERED
-}
-
-type Query {
-  getUser(id: ID!): User
-  listOrders(userId: ID!, limit: Int): [Order!]!
-}
-
-type Mutation {
-  createOrder(input: CreateOrderInput!): Order!
-}
-
-type Subscription {
-  onNewOrder(userId: ID!): Order @aws_subscribe(mutations: ["createOrder"])
-}
-```
-
-### Sources de donnees
-
-AppSync peut se connecter a :
-
-- **DynamoDB** (resolvers directs via VTL ou JavaScript)
-- **Lambda** (logique custom)
-- **RDS** (via Data API)
-- **HTTP** (APIs externes)
-- **OpenSearch** (recherche)
-- **EventBridge** (evenements)
-
-### Avantages d'AppSync
-
-| Avantage          | Description                         |
-| ----------------- | ----------------------------------- |
-| **Subscriptions** | Temps reel natif via WebSocket      |
-| **Caching**       | Cache integre au niveau du resolver |
-| **Offline**       | Sync offline avec Amplify DataStore |
-| **Auth**          | Cognito, IAM, API Key, OIDC         |
-| **Batching**      | Resolution N+1 optimisee            |
-
----
-
-## Optimisation des couts serverless
-
-### Lambda
-
-| Optimisation                | Economie                                            |
-| --------------------------- | --------------------------------------------------- |
-| **Memoire**                 | Trouver le sweet spot (256-512 Mo souvent optimal)  |
-| **Architecture ARM**        | 20% moins cher que x86                              |
-| **Provisioned Concurrency** | Evite les cold starts mais coute en permanence      |
-| **Reserved Concurrency**    | Gratuit, limite le nombre max d'invocations         |
-| **Duration**                | Optimiser le code pour reduire le temps d'execution |
-
-### Step Functions
-
-| Optimisation           | Detail                                                    |
-| ---------------------- | --------------------------------------------------------- |
-| **Express**            | 90% moins cher que Standard pour les workflows courts     |
-| **SDK Integrations**   | Appel direct DynamoDB/SQS au lieu de Lambda intermediaire |
-| **Reduce transitions** | Chaque transition coute, minimiser les etats Pass         |
-
-### DynamoDB
-
-| Optimisation     | Detail                                                |
-| ---------------- | ----------------------------------------------------- |
-| **On-Demand**    | Pour les charges impredictibles                       |
-| **Provisioned**  | Pour les charges stables (+ Reserved Capacity = -75%) |
-| **TTL**          | Supprimer automatiquement les donnees expirees        |
-| **Single-table** | Reduire le nombre de tables (moins d'overhead)        |
-
-### API Gateway
-
-| Optimisation    | Detail                                           |
-| --------------- | ------------------------------------------------ |
-| **HTTP API**    | 70% moins cher que REST API pour les cas simples |
-| **Caching**     | Reduire les invocations Lambda                   |
-| **Compression** | Reduire le volume de donnees transferees         |
-
-### Calcul de cout exemple
-
-```
-Application : 1M requetes/mois, 200ms moyenne, 256 Mo memoire
-
-API Gateway (HTTP API) :
-  1M × $1.00/M = $1.00
-
-Lambda :
-  1M invocations × $0.20/M = $0.20
-  1M × 200ms × 256Mo = 51,200 Go-s × $0.0000166667 = $0.85
-
-DynamoDB (On-Demand) :
-  1M writes × $1.25/M = $1.25
-  2M reads × $0.25/M = $0.50
-
-Total : ~$3.80/mois pour 1M requetes
-```
-
-Comparaison avec un serveur EC2 (t3.small 24/7) : ~$15/mois — et le serverless scale a zero.
-
----
-
-## SST (Serverless Stack) — Le framework serverless TypeScript-first
-
-[SST](https://sst.dev) est un framework open-source qui simplifie le développement serverless avec TypeScript. Il s'appuie sur CDK (ou Pulumi via SST Ion v3) mais ajoute des fonctionnalités cruciales pour le DX.
-
-### Pourquoi SST vs CDK pur ?
-
-| Feature                | CDK                                     | SST                                             |
-| ---------------------- | --------------------------------------- | ----------------------------------------------- |
-| Langage                | TypeScript/Python/Java                  | TypeScript uniquement                           |
-| Live Lambda Dev        | Non (redéploiement à chaque changement) | **Oui** (hot reload en ~1s)                     |
-| Constructs haut niveau | L2/L3 génériques                        | Spécialisés web (Api, NextjsSite, etc.)         |
-| Console de debug       | CloudWatch                              | **SST Console** (temps réel, invocations, logs) |
-| Courbe d'apprentissage | Raide                                   | Plus douce                                      |
-
-### Constructs SST
-
-```typescript
-// sst.config.ts
-import { Api, Function, Table, StaticSite, NextjsSite } from "sst/constructs";
-
-export default {
-  config() {
-    return { name: "my-app", region: "eu-west-1" };
-  },
-  stacks(app) {
-    app.stack(function MyStack({ stack }) {
-      // API + Lambda en 3 lignes
-      const api = new Api(stack, "api", {
-        routes: {
-          "GET /users": "packages/functions/src/users.list",
-          "POST /users": "packages/functions/src/users.create",
-        },
-      });
-
-      // DynamoDB
-      const table = new Table(stack, "users", {
-        fields: { userId: "string" },
-        primaryIndex: { partitionKey: "userId" },
-      });
-
-      // Next.js deployé sur Lambda@Edge + S3 + CloudFront
-      new NextjsSite(stack, "site", {
-        path: "packages/web",
-        environment: { API_URL: api.url },
-      });
-    });
-  },
+> **Portée :** ce module **n'introduit aucun service nouveau** — il **assemble** ceux que tu connais déjà : Lambda (module 06), API Gateway (module 07), DynamoDB (module 09), SQS/SNS/EventBridge (module 10). La seule brique inédite est **Step Functions**, l'orchestrateur qui coordonne ces briques. On répond à une question : *comment enchaîner plusieurs Lambdas et services en un workflow fiable, sans boucle `while` maison ni Lambda monolithique ?* Le déploiement automatisé de tout ça (CodePipeline, GitHub Actions → AWS) est le sujet du **module 17**.
+
+## 1. Cas concret d'abord
+
+Tu montes l'infra AWS de TribuZen. Un parent poste une photo de famille dans le bucket `tribuzen-avatars`. Pour que cette photo devienne un avatar utilisable, il faut enchaîner **quatre étapes** :
+
+1. **Valider** le fichier (type MIME image, taille < 5 Mo, pas de contenu interdit).
+2. **Générer** une miniature 200×200 (la Lambda `generateThumbnail` du module 06).
+3. **Écrire** l'entrée dans DynamoDB `TribuZenFeed` (« Alice a changé sa photo »).
+4. **Notifier** la famille (SNS → module 10).
+
+Un collègue te tend ce premier jet : **une seule Lambda** qui fait tout à la chaîne.
+
+```javascript
+// handler processAvatar — anti-pattern : la Lambda monolithique
+export const handler = async (event) => {
+  const valid = await validate(event);        // étape 1
+  if (!valid) return;                          // et si c'est invalide, on notifie qui ?
+  const thumb = await generateThumbnail(event); // étape 2 — peut durer 10 s
+  await writeFeed(event, thumb);               // étape 3
+  await notifyFamily(event);                   // étape 4
+  // Si l'étape 3 échoue APRÈS la miniature : on a une miniature orpheline.
+  // Si l'invocation timeout à l'étape 2 : Lambda REJOUE tout depuis le début
+  //   → deuxième miniature, deuxième entrée feed, deuxième notification. Doublons.
 };
 ```
 
-### Live Lambda Development
+Quatre problèmes concrets qui vont te sauter à la figure en production :
 
-La killer feature de SST : modifier le code d'une Lambda, sauvegarder, et voir le résultat en ~1 seconde — sans redéployer la stack.
+1. **Aucune visibilité** : si ça casse, tu ne sais pas à *quelle* étape. Tu lis des logs CloudWatch à la main.
+2. **Pas de retry ciblé** : l'étape 2 (image) échoue de temps en temps ? Tout le workflow rejoue, y compris la validation déjà réussie.
+3. **Pas de compensation** : une miniature créée puis un échec en étape 3 laisse un fichier orphelin. Personne ne nettoie.
+4. **Rejeu = doublons** : Lambda asynchrone **réessaie** en cas d'échec (module 06). Sans **idempotence**, on écrit deux fois dans le feed et on notifie deux fois.
 
-```bash
-npx sst dev  # Lance le mode développement
-```
-
-SST redirige les invocations Lambda de votre compte AWS vers votre machine locale via WebSocket. Le code s'exécute localement avec accès aux vraies ressources AWS.
-
-### SST Ion (v3) — Transition vers Pulumi
-
-SST v3 ("Ion") abandonne CDK pour Pulumi/Terraform, offrant :
-
-- Déploiement 10-100x plus rapide (pas de CloudFormation)
-- Support multi-cloud (AWS, Cloudflare, Vercel)
-- Même API développeur
-
-### Quand utiliser SST vs CDK ?
-
-- **SST** : projets web (API + frontend), rapid prototyping, équipes petites/moyennes
-- **CDK** : infrastructure complexe, besoins multi-langage, entreprises avec standards CDK existants
-- **SAM** : projets serverless simples, déjà dans l'écosystème AWS officiel
+À la fin de ce module, tu remplaces cette Lambda monolithique par une **state machine Step Functions** : chaque étape est un état isolé, avec son propre `Retry`, un `Catch` qui déclenche une **compensation**, et des handlers **idempotents**. Tu sauras aussi *quand* Step Functions est le bon outil (orchestration) et quand un simple chaînage d'**events** suffit (chorégraphie).
 
 ---
 
-## Recapitulatif
+## 2. Théorie complète, concise
 
-| Concept                      | A retenir                                                        |
-| ---------------------------- | ---------------------------------------------------------------- |
-| **Step Functions**           | Orchestrateur visuel de workflows (machine a etats)              |
-| **Task/Choice/Parallel/Map** | Types d'etats pour actions, conditions, parallelisme, iterations |
-| **Standard vs Express**      | Long workflows vs haute frequence                                |
-| **CQRS**                     | Separer ecritures et lectures avec des vues optimisees           |
-| **Saga**                     | Transactions distribuees avec compensations                      |
-| **API Composition**          | Agreger plusieurs services en une seule reponse                  |
-| **WebSocket API**            | Communication bidirectionnelle temps reel                        |
-| **AppSync**                  | GraphQL manage avec subscriptions temps reel                     |
-| **Cout serverless**          | Scale a zero, paiement a l'usage, optimiser memoire/duree        |
+### 2.1 Ce qu'est une architecture serverless
+
+Une **architecture serverless** compose des services **managés** qui scalent à zéro et se facturent à l'usage : Lambda (calcul), API Gateway (HTTP), DynamoDB (données), S3 (objets), SQS/SNS/EventBridge (messages). Aucun serveur à patcher, aucune capacité à provisionner en permanence. Ce module ne t'apprend pas ces briques — tu les connais — il t'apprend à les **assembler** proprement.
+
+Le fil conducteur est l'**event-driven** : un composant émet un **événement** (objet créé dans S3, message publié sur SNS, item modifié dans un DynamoDB Stream), un autre y **réagit**. Le producteur ne connaît pas le consommateur. C'est le contraire d'un appel synchrone en cascade.
+
+### 2.2 Le pattern de base : API + Lambda + DynamoDB
+
+La colonne vertébrale de la plupart des back-ends serverless :
+
+```
+Client → API Gateway (HTTP API) → Lambda (handler) → DynamoDB (table)
+```
+
+- **API Gateway** (module 07) reçoit la requête HTTP, l'authentifie (autoriser Cognito), route vers la Lambda.
+- **Lambda** (module 06) exécute la logique métier, stateless.
+- **DynamoDB** (module 09) persiste, sans serveur de base à gérer.
+
+Ce triptyque suffit pour un CRUD. Dès qu'une **opération métier fait plusieurs étapes** (valider → transformer → écrire → notifier), on ne les empile pas dans une seule Lambda (le cas concret) : on **coordonne**. Deux façons de coordonner — c'est le cœur du module.
+
+### 2.3 Orchestration vs chorégraphie
+
+Ce sont les **deux styles de coordination** d'un système distribué.
+
+- **Orchestration** : un **chef d'orchestre central** (une state machine Step Functions) connaît toutes les étapes, les appelle dans l'ordre, gère les erreurs et l'état. Flux **explicite**, visible d'un coup d'œil. Couplage plus fort au chef d'orchestre.
+- **Chorégraphie** : **pas de chef**. Chaque service émet des **events** ; les autres s'abonnent et réagissent. Flux **implicite**, distribué. Couplage faible, mais aucune vue d'ensemble : comprendre le parcours d'un event demande de lire N abonnements.
+
+| Critère | Orchestration (Step Functions) | Chorégraphie (EventBridge/SNS/Streams) |
+|---------|-------------------------------|----------------------------------------|
+| Contrôle du flux | Central, explicite | Distribué, implicite |
+| Visibilité | Une console visuelle, un historique | Éparpillée dans les abonnements |
+| Couplage | Plus fort (au workflow) | Faible (par events) |
+| Gestion d'erreur / retry / compensation | Native (Retry/Catch) | À la charge de chaque consommateur |
+| Bon pour | Un processus métier ordonné, à état | Réactions découplées, fan-out |
+
+Règle pratique : **workflow à étapes ordonnées avec état et erreurs à gérer → orchestration**. **Réactions indépendantes et découplées → chorégraphie**. Les deux se combinent (une étape orchestrée peut émettre un event qui déclenche une chorégraphie ailleurs).
+
+### 2.4 Step Functions — l'orchestrateur
+
+**AWS Step Functions** est un orchestrateur serverless. Tu définis un **workflow** sous forme de **machine à états** (*state machine*) : une suite d'états, chacun fait une chose et pointe vers le suivant. Step Functions gère pour toi l'**enchaînement**, l'**état** transporté entre les étapes (pas besoin de table intermédiaire), les **retries**, les **branches** et le **parallélisme**. Il s'intègre nativement à Lambda et à des centaines d'API AWS.
+
+Une state machine se décrit en **Amazon States Language (ASL)** — du JSON. Champs communs à (presque) tous les états :
+
+- `Type` : le type d'état (voir 2.5).
+- `Next` : l'état suivant. Un état terminal met plutôt `End: true`, ou est un `Succeed`/`Fail`.
+- `Comment` : description humaine optionnelle.
+
+Squelette minimal :
+
+```json
+{
+  "Comment": "Traitement d'un avatar TribuZen",
+  "StartAt": "ValidateUpload",
+  "States": {
+    "ValidateUpload": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:eu-west-1:123456789012:function:tribuzen-validate",
+      "Next": "GenerateThumbnail"
+    },
+    "GenerateThumbnail": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:eu-west-1:123456789012:function:tribuzen-thumbnail",
+      "End": true
+    }
+  }
+}
+```
+
+### 2.5 Les types d'états ASL
+
+Step Functions distingue les **Task states** (font un travail) et sept **Flow states** (dirigent le flux) :
+
+| Type | Rôle | Exemple TribuZen |
+|------|------|------------------|
+| **Task** | Une unité de travail : invoquer une Lambda, appeler une API AWS, un endpoint HTTP | valider le fichier, générer la miniature |
+| **Choice** | Branche conditionnelle (if/else) | image lourde → chemin async, sinon direct |
+| **Parallel** | Plusieurs branches **en même temps**, résultat = tableau des sorties | écrire feed **ET** logguer l'audit |
+| **Map** | Itère les mêmes étapes sur **chaque élément** d'un tableau | traiter plusieurs photos d'un même post |
+| **Wait** | Pause : une durée, ou jusqu'à une date | attendre 24 h avant un rappel |
+| **Pass** | Passe l'entrée en sortie (option : transformer/injecter) | reformater le JSON entre deux étapes |
+| **Succeed** | Termine le workflow en succès | fin nominale |
+| **Fail** | Termine le workflow en échec (`Error`, `Cause`) | échec définitif |
+
+`Map` diffère de `Parallel` : `Parallel` lance des branches **différentes** simultanément ; `Map` lance les **mêmes** étapes sur les éléments d'un tableau.
+
+### 2.6 Retry et Catch — la robustesse déclarative
+
+Chaque `Task` peut déclarer, **en JSON**, comment réagir aux erreurs — sans code de retry dans la Lambda.
+
+- **`Retry`** : réessaie l'étape en cas d'erreur, avec backoff.
+- **`Catch`** : route vers un autre état si l'erreur persiste (le filet de sécurité).
+
+```json
+"GenerateThumbnail": {
+  "Type": "Task",
+  "Resource": "arn:aws:lambda:eu-west-1:123456789012:function:tribuzen-thumbnail",
+  "Retry": [
+    {
+      "ErrorEquals": ["States.TaskFailed"],
+      "IntervalSeconds": 2,
+      "MaxAttempts": 3,
+      "BackoffRate": 2.0
+    }
+  ],
+  "Catch": [
+    { "ErrorEquals": ["States.ALL"], "Next": "CleanupAndFail" }
+  ],
+  "Next": "WriteFeed"
+}
+```
+
+`IntervalSeconds` = délai initial, `MaxAttempts` = nombre de reprises, `BackoffRate` = multiplicateur entre reprises (2.0 → 2 s, 4 s, 8 s). `States.ALL` attrape toute erreur. Baseline raisonnable : `MaxAttempts: 3`, `IntervalSeconds: 2`, `BackoffRate: 2.0`.
+
+### 2.7 Intégrations directes (SDK integrations)
+
+Un `Task` n'a pas besoin d'une Lambda pour toucher un service AWS. Step Functions appelle **directement** DynamoDB, SNS, SQS, EventBridge… via un ARN de service. Ça **supprime une Lambda intermédiaire** (moins de code, moins de coût, moins de latence) :
+
+```json
+"WriteFeed": {
+  "Type": "Task",
+  "Resource": "arn:aws:states:::dynamodb:putItem",
+  "Parameters": {
+    "TableName": "TribuZenFeed",
+    "Item": {
+      "pk":        { "S.$": "$.familyId" },
+      "sk":        { "S.$": "$.uploadId" },
+      "type":      { "S": "AVATAR_UPDATED" },
+      "createdAt": { "S.$": "$$.State.EnteredTime" }
+    }
+  },
+  "Next": "NotifyFamily"
+}
+```
+
+`$.familyId` lit l'entrée du workflow ; `$$.State.EnteredTime` lit le **contexte d'exécution** (double `$$`). Services directement intégrables courants : `dynamodb:putItem/getItem/updateItem`, `sns:publish`, `sqs:sendMessage`, `events:putEvents`, `lambda:invoke`.
+
+### 2.8 Standard vs Express — le choix structurant
+
+Le **type de workflow** se choisit à la création et **ne peut plus changer** (immuable). Faits vérifiés (doc AWS) :
+
+| Critère | **Standard** | **Express** |
+|---------|-------------|-------------|
+| Durée max | **1 an** | **5 minutes** |
+| Sémantique d'exécution | **exactly-once** | **at-least-once** (async) / **at-most-once** (sync) |
+| État persisté entre transitions | Oui (durable, reprenable) | Non |
+| Facturation | par **transition d'état** | par **nombre d'exécutions + durée + mémoire** |
+| Historique | API + console visuelle, conservé **90 jours** | Uniquement via **CloudWatch Logs** (à activer) |
+| Débit de transitions | plafonné (quotas) | **illimité** |
+| Bon pour | workflows longs, auditables, actions **non-idempotentes** (paiement) | haut volume, court, actions **idempotentes** (transformation de données) |
+
+Points à ne pas confondre :
+
+- **exactly-once (Standard)** : une étape ne tourne jamais deux fois, sauf `Retry` explicite → adapté aux actions **non-idempotentes** (débiter un paiement, démarrer un cluster).
+- **at-least-once (Express async)** : une exécution peut tourner **plus d'une fois** → n'utilise Express **que** pour des actions **idempotentes**.
+- Express **ne supporte pas** les patterns `.sync` (Job-run) ni `.waitForTaskToken` (Callback), ni le Distributed Map.
+
+### 2.9 Idempotence — le prérequis non négociable de l'event-driven
+
+Un système event-driven **rejoue** : Lambda asynchrone réessaie (module 06), SQS livre **au moins une fois**, Express est at-least-once. Donc **le même event peut arriver deux fois**. Un handler est **idempotent** si le traiter N fois produit le **même état final** qu'une seule fois.
+
+Technique standard : une **clé d'idempotence** (un identifiant unique de l'opération — `uploadId`, `messageId`) + une écriture conditionnelle.
+
+```javascript
+// Écriture DynamoDB idempotente : n'insère QUE si la clé n'existe pas déjà
+await ddb.send(new PutItemCommand({
+  TableName: 'TribuZenFeed',
+  Item: { pk: { S: familyId }, sk: { S: uploadId }, type: { S: 'AVATAR_UPDATED' } },
+  ConditionExpression: 'attribute_not_exists(sk)', // rejeu → ConditionalCheckFailed, pas de doublon
+}));
+```
+
+Le deuxième passage lève `ConditionalCheckFailedException` : tu l'attrapes et tu considères l'opération **déjà faite**. Aucun doublon dans le feed, aucune double notification.
+
+### 2.10 Saga et transactions compensatoires (survol)
+
+Pas de transaction ACID à travers plusieurs services serverless. Le **pattern saga** gère la cohérence d'un processus multi-étapes : si une étape échoue, on **compense** (on annule) les étapes déjà réussies, dans l'ordre inverse.
+
+```
+Upload avatar :  1. générer miniature   2. écrire feed   3. notifier
+Échec en 2  →    1c. supprimer la miniature orpheline   (compensation)
+```
+
+Avec Step Functions, chaque `Task` a un `Catch` qui route vers son état de **compensation**. La state machine **est** l'implémentation de la saga : le `Catch` de `WriteFeed` déclenche `DeleteThumbnail` avant de finir en `Fail`. On n'implémente pas une saga complète ici (c'est un sujet d'architecture avancé) — retiens le principe : **pour chaque action, une compensation, déclenchée par un `Catch`**.
+
+### 2.11 Dead Letter Queue — le dernier filet
+
+Quand tout a échoué (retries épuisés, catch en `Fail`), l'event ne doit pas **disparaître**. On le route vers une **DLQ** (SQS, module 10) : file d'attente des échecs, qu'on inspecte et rejoue à la main. Une invocation Lambda asynchrone, une souscription SNS, une file SQS peuvent toutes déclarer une DLQ. Règle : **toute branche d'échec asynchrone a une DLQ**, sinon tu perds des données silencieusement.
+
+---
+
+## 3. Worked examples
+
+### Exemple 1 — La state machine « traitement d'avatar » complète
+
+On remplace la Lambda monolithique du cas concret par une orchestration : valider → miniature → (écrire feed **et** audit en parallèle) → notifier, avec compensation si la miniature échoue plus loin.
+
+```json
+{
+  "Comment": "TribuZen — traitement d'un upload d'avatar (orchestration + compensation)",
+  "StartAt": "ValidateUpload",
+  "States": {
+    "ValidateUpload": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:eu-west-1:123456789012:function:tribuzen-validate",
+      "Catch": [
+        { "ErrorEquals": ["ValidationError"], "Next": "RejectUpload" }
+      ],
+      "Next": "GenerateThumbnail"
+    },
+    "GenerateThumbnail": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:eu-west-1:123456789012:function:tribuzen-thumbnail",
+      "Retry": [
+        { "ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 2, "MaxAttempts": 3, "BackoffRate": 2.0 }
+      ],
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "Next": "Fail" }
+      ],
+      "Next": "PersistAndAudit"
+    },
+    "PersistAndAudit": {
+      "Type": "Parallel",
+      "Branches": [
+        {
+          "StartAt": "WriteFeed",
+          "States": {
+            "WriteFeed": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::dynamodb:putItem",
+              "Parameters": {
+                "TableName": "TribuZenFeed",
+                "Item": {
+                  "pk":        { "S.$": "$.familyId" },
+                  "sk":        { "S.$": "$.uploadId" },
+                  "type":      { "S": "AVATAR_UPDATED" },
+                  "createdAt": { "S.$": "$$.State.EnteredTime" }
+                },
+                "ConditionExpression": "attribute_not_exists(sk)"
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "AuditLog",
+          "States": {
+            "AuditLog": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": { "TopicArn": "arn:aws:sns:eu-west-1:123456789012:tribuzen-audit", "Message.$": "$.uploadId" },
+              "End": true
+            }
+          }
+        }
+      ],
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "Next": "DeleteThumbnail" }
+      ],
+      "Next": "NotifyFamily"
+    },
+    "DeleteThumbnail": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:eu-west-1:123456789012:function:tribuzen-delete-thumbnail",
+      "Comment": "Compensation : la miniature existe mais l'écriture a échoué -> on nettoie",
+      "Next": "Fail"
+    },
+    "NotifyFamily": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": { "TopicArn": "arn:aws:sns:eu-west-1:123456789012:tribuzen-notify", "Message.$": "$.familyId" },
+      "Next": "Success"
+    },
+    "RejectUpload": { "Type": "Fail", "Error": "ValidationError", "Cause": "Fichier refuse (type ou taille)" },
+    "Fail":         { "Type": "Fail", "Error": "AvatarWorkflowFailed" },
+    "Success":      { "Type": "Succeed" }
+  }
+}
+```
+
+Ce qui a changé vs la Lambda monolithique, et pourquoi :
+
+- **Chaque étape est isolée** : dans la console Step Functions, tu vois *exactement* où ça casse.
+- **`Retry` ciblé sur la miniature** : seule l'étape 2 rejoue, pas la validation déjà réussie.
+- **`Parallel`** : feed et audit s'écrivent en même temps → plus rapide.
+- **`Catch` → `DeleteThumbnail`** : la saga en action, la miniature orpheline est supprimée avant l'échec.
+- **`ConditionExpression`** sur le `putItem` : idempotent, un rejeu du workflow ne double pas le feed.
+
+### Exemple 2 — Orchestration ou chorégraphie ? Deux besoins, deux choix
+
+**Besoin A — le workflow ci-dessus (upload avatar).** Étapes **ordonnées**, avec **état** (l'`uploadId` circule), erreurs à **compenser**, besoin d'**audit**. → **Orchestration Step Functions**. Type **Standard** : durable, auditable 90 jours, et l'action « notifier » n'est pas critique à dédoublonner mais la lisibilité prime.
+
+**Besoin B — « quand un message est posté dans le feed, mettre à jour le compteur de badges non-lus de chaque membre ».** Réaction **indépendante**, découplée, pas d'ordre à garantir, chaque consommateur fait son affaire. → **Chorégraphie** : DynamoDB Stream sur `TribuZenFeed` → EventBridge → Lambda `updateBadges`. Aucun chef d'orchestre : si demain on ajoute « envoyer un push mobile », on **ajoute un abonné** sans toucher au producteur.
+
+Le piège serait de tout mettre en Step Functions (couplage inutile) **ou** tout en events (aucune visibilité sur un process métier ordonné). Le critère : **flux ordonné à état → orchestration ; réactions découplées → chorégraphie.**
+
+---
+
+## 4. Pièges & misconceptions
+
+### PIÈGE #1 — La Lambda « orchestrateur » qui appelle les autres à la chaîne
+
+Écrire une Lambda qui `invoke` séquentiellement d'autres Lambdas reproduit tous les défauts du cas concret : pas de visibilité par étape, retry global (rejoue tout), timeout de 15 min max, état à gérer soi-même. C'est exactement le trou que **Step Functions** comble. Une Lambda coordonne du code ; une state machine coordonne des **étapes**.
+
+### PIÈGE #2 — Croire qu'Express est « juste un Standard moins cher »
+
+Non : Express est **at-least-once** (async) et **ne persiste pas l'état** entre transitions. Un workflow Express peut **rejouer entièrement**. L'utiliser pour une action **non-idempotente** (débiter un paiement) peut débiter deux fois. Express = haut volume + court + **idempotent**. Standard = long, durable, exactly-once, actions non-idempotentes.
+
+### PIÈGE #3 — Confondre `Parallel` et `Map`
+
+`Parallel` lance des **branches différentes** simultanément (feed ET audit). `Map` lance les **mêmes étapes** sur chaque élément d'un **tableau** (traiter chaque photo). Utiliser `Parallel` pour itérer une liste de taille variable est impossible : le nombre de branches d'un `Parallel` est **fixe** dans l'ASL.
+
+### PIÈGE #4 — « L'event-driven garantit une livraison unique »
+
+Faux, et dangereux. SQS, SNS, Lambda async, Express : tous **au moins une fois**. Le même event **peut** arriver deux fois. Sans **idempotence** (clé + écriture conditionnelle), tu crées des doublons. L'idempotence n'est pas optionnelle en serverless — c'est le prix d'entrée.
+
+### PIÈGE #5 — Oublier la branche d'échec (pas de Catch, pas de DLQ)
+
+Un `Task` sans `Catch` qui échoue après ses retries fait **échouer tout le workflow** brutalement, sans compensation. Un event async sans **DLQ** disparaît après les retries. Résultat : miniatures orphelines, données perdues silencieusement. Règle : **chaque étape critique a un `Catch`**, **chaque branche async a une DLQ**.
+
+### PIÈGE #6 — Type de workflow modifiable
+
+Le type Standard/Express est **immuable** : on ne le change pas après création. Se tromper oblige à **recréer** la state machine (nouveau ARN, mettre à jour les triggers). Choisis le type **avant** de déployer, sur les faits du tableau 2.8.
+
+### PIÈGE #7 — Tout orchestrer (ou tout chorégraphier)
+
+Mettre un fan-out de notifications découplées dans une state machine = couplage inutile et coût par transition. Mettre un process métier ordonné à état en pur event = zéro visibilité, débogage cauchemar. Le bon réflexe : **orchestration pour l'ordre et l'état, chorégraphie pour le découplage**, et on **mixe**.
+
+---
+
+## 5. Ancrage TribuZen
+
+L'infra TribuZen combine les deux styles selon le besoin.
+
+| Processus TribuZen | Style | Implémentation |
+|--------------------|-------|----------------|
+| **Traitement d'un upload d'avatar** | Orchestration | Step Functions **Standard** : valider → miniature (Retry) → feed + audit (`Parallel`) → notifier, `Catch` → compensation (supprimer miniature) |
+| **Compteur de badges non-lus** | Chorégraphie | DynamoDB Stream sur `TribuZenFeed` → EventBridge → Lambda `updateBadges` |
+| **Digest quotidien par famille** | Orchestration légère | EventBridge cron → Step Functions **Express** (idempotent, haut volume, court) → agrège et envoie |
+| **Modération d'un message signalé** | Orchestration | Step Functions : `Choice` (auto vs revue humaine via `.waitForTaskToken`) → action |
+
+Principes appliqués :
+
+- **API Gateway + Lambda + DynamoDB** (modules 07/06/09) = le CRUD de base du feed ; Step Functions n'intervient **que** pour les process multi-étapes.
+- **Idempotence partout** : chaque écriture feed porte une `ConditionExpression` sur `uploadId`/`messageId`. Un rejeu ne double jamais une entrée.
+- **DLQ systématique** (module 10) sur les invocations async et les souscriptions SNS.
+- **Rôle IAM de moindre privilège** (module 01) par état et par Lambda : la state machine n'a que `states:StartExecution` et les permissions des Task qu'elle invoque.
+- **Standard pour l'auditable**, **Express pour le volume idempotent** — choisi avant déploiement.
+
+> Déployer cette state machine par CI/CD (CodePipeline, GitHub Actions → AWS via OIDC) = **module 17**. Concevoir l'archi cloud complète de TribuZen = capstone **module 18**.
+
+---
+
+## 6. Points clés
+
+1. Une architecture serverless **assemble** des services managés (Lambda, API Gateway, DynamoDB, messaging) event-driven ; ce module coordonne, il n'introduit que **Step Functions**.
+2. Pattern de base : **API Gateway → Lambda → DynamoDB**. Dès qu'une opération fait plusieurs étapes, on **coordonne** plutôt que d'empiler dans une Lambda.
+3. **Orchestration** (chef central, flux explicite, Step Functions) vs **chorégraphie** (events, flux implicite, couplage faible) : ordre+état → orchestration, découplage → chorégraphie, et on mixe.
+4. **Step Functions** décrit un workflow en **ASL** (JSON). États : **Task** (travail) + Flow states **Choice/Parallel/Map/Wait/Pass/Succeed/Fail**. `Parallel` = branches différentes, `Map` = mêmes étapes sur un tableau.
+5. **Retry** (backoff) et **Catch** (route d'erreur) rendent la robustesse **déclarative**, sans code de retry. **Intégrations directes** (`arn:aws:states:::dynamodb:putItem`) suppriment les Lambdas intermédiaires.
+6. **Standard** = 1 an, **exactly-once**, état persisté, audit 90 j, prix par transition, actions **non-idempotentes**. **Express** = 5 min, **at-least-once/at-most-once**, prix par exécution+durée, actions **idempotentes**. Type **immuable**.
+7. L'event-driven **rejoue** : sans **idempotence** (clé + écriture conditionnelle) → doublons. Non négociable.
+8. **Saga** = pour chaque action une **compensation**, déclenchée par un `Catch`. **DLQ** = dernier filet pour les échecs asynchrones.
+
+---
+
+## 7. Seeds Anki
+
+```
+Orchestration vs chorégraphie en serverless ?|Orchestration : un chef central (Step Functions) connaît toutes les étapes, flux explicite, gère erreurs/retry/compensation, couplage plus fort. Chorégraphie : pas de chef, chaque service émet des events, les autres réagissent, flux implicite, couplage faible mais aucune vue d'ensemble.
+Quels sont les 7 Flow states de Step Functions (en plus de Task) ?|Choice (branche conditionnelle), Parallel (branches simultanées), Map (mêmes étapes sur chaque élément d'un tableau), Wait (pause), Pass (passe/transforme l'entrée), Succeed (fin succès), Fail (fin échec).
+Différence entre l'état Parallel et l'état Map ?|Parallel lance des branches DIFFÉRENTES en même temps (nombre fixe). Map lance les MÊMES étapes sur chaque élément d'un tableau (nombre variable selon l'entrée).
+À quoi servent Retry et Catch dans un Task ASL ?|Retry réessaie l'étape en cas d'erreur avec backoff (IntervalSeconds, MaxAttempts, BackoffRate). Catch route vers un autre état si l'erreur persiste (ErrorEquals, Next). La robustesse est déclarative, pas codée dans la Lambda.
+Step Functions Standard vs Express : durée, sémantique, prix ?|Standard : jusqu'à 1 an, exactly-once, état persisté, prix par transition d'état, audit 90 jours, pour actions non-idempotentes. Express : jusqu'à 5 min, at-least-once (async) / at-most-once (sync), prix par exécutions+durée+mémoire, logs via CloudWatch, pour actions idempotentes haut volume.
+Pourquoi l'idempotence est-elle obligatoire en event-driven ?|Parce que la livraison est "au moins une fois" (SQS, Lambda async, Express) : le même event peut arriver deux fois. Un handler idempotent produit le même état final quel que soit le nombre de traitements. Technique : clé d'idempotence + écriture conditionnelle (attribute_not_exists).
+Qu'est-ce qu'une intégration directe (SDK integration) Step Functions ?|Un Task qui appelle directement une API AWS sans Lambda intermédiaire, via un ARN de service comme arn:aws:states:::dynamodb:putItem ou arn:aws:states:::sns:publish. Moins de code, moins de coût, moins de latence.
+Qu'est-ce que le pattern saga et comment l'implémenter avec Step Functions ?|Une saga gère la cohérence d'un process multi-étapes sans transaction ACID distribuée : si une étape échoue, on compense (annule) les étapes déjà réussies en ordre inverse. Avec Step Functions : chaque Task a un Catch qui route vers son état de compensation.
+Le type de workflow Step Functions est-il modifiable après création ?|Non, il est immuable. Choisir Standard ou Express avant de déployer ; se tromper oblige à recréer la state machine (nouvel ARN) et à mettre à jour les triggers.
+```
+
+---
+
+## Pont vers le lab
+
+> Lab associé : `labs/lab-16-serverless-architecture/README.md`. Tu déploies une **vraie** state machine Step Functions dans ton compte AWS (Console Workflow Studio ou AWS CLI + ASL JSON), tu l'**invoques** réellement (`start-execution`), tu observes le graphe d'exécution étape par étape, tu forces un échec pour voir `Retry` et `Catch` agir — puis tu **détruis** tout (teardown). Corrigé ASL complet, feedback coach, variante J+30.

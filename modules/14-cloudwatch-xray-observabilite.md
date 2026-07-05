@@ -1,632 +1,459 @@
-# 14 — CloudWatch & X-Ray — Observabilite
+---
+titre: CloudWatch & X-Ray — observer l'infra AWS de TribuZen
+cours: 12-aws-cloud
+notions: [CloudWatch Logs, log event, log stream, log group, "convention /aws/lambda/<fn>", rétention de logs, metric filter, logs structurés JSON, CloudWatch Metrics, "namespace AWS/<service>", dimension, métrique custom, "PutMetricData", résolution standard vs haute, "StorageResolution à 1", période, statistiques, percentiles p99, rétention des métriques, CloudWatch Alarms, "états OK / ALARM / INSUFFICIENT_DATA", alarme à seuil, alarme d'anomalie, alarme composite, action SNS, Dashboards, Logs Insights, X-Ray, segment, subsegment, trace, service map, annotations vs metadata, sampling, "header X-Amzn-Trace-Id", corrélation logs/traces]
+outcomes:
+  - sait structurer les logs Lambda en JSON et les requêter avec Logs Insights (filter, stats, bin)
+  - sait publier une métrique custom via PutMetricData et poser une alarme à seuil qui notifie via SNS
+  - sait activer le tracing X-Ray, lire un service map et distinguer segment, subsegment, annotation et metadata
+  - sait corréler un log et une trace via le request id / trace id pour localiser un goulot
+prerequis: [Modules 00-13 du cours 12-aws-cloud — compte/IAM/CLI, Lambda (06), API Gateway (07), DynamoDB (09), messaging SNS (10), ECS/Fargate (12), CloudFront (13)]
+next: 15-securite-aws-avancee
+libs: []
+tribuzen: "infra cloud TribuZen — observabilité de l'API feed (Lambda + API Gateway + DynamoDB) ; logs structurés, métrique custom, alarme SNS, trace X-Ray de bout en bout"
+last-reviewed: 2026-07
+---
 
-> **Duree estimee** : 5h00
-> **Difficulte** : 3/5
-> **Prerequis** : Module 05 (Lambda), Module 11 (ECS), notions de logging
-> **Objectifs** :
-> - Comprendre les **metriques CloudWatch** (standard, custom, haute resolution)
-> - Creer des **alarmes** (seuil, anomalie, composite)
-> - Analyser les **logs** avec CloudWatch Logs et **Logs Insights**
-> - Construire des **dashboards** de monitoring
-> - Tracer les requetes distribuees avec **X-Ray**
-> - Mettre en place des **Synthetics canaries** pour le monitoring proactif
+# CloudWatch & X-Ray — observer l'infra AWS de TribuZen
+
+> **Outcomes — tu sauras FAIRE :** structurer les logs Lambda en JSON et les requêter avec Logs Insights, publier une métrique custom et poser une alarme SNS, activer X-Ray et lire un service map, corréler un log et une trace pour localiser un goulot.
+> **Difficulté :** :star::star::star:
+>
+> **Portée :** ce module couvre **deux outils AWS** — **CloudWatch** (Logs, Metrics, Alarms, Dashboards, Logs Insights) et **X-Ray** (tracing distribué). C'est le **volet AWS** de l'observabilité : quelles ressources activer, quelles API appeler, comment lire les consoles. La **théorie générale** de l'observabilité et du SRE (SLI/SLO/SLA, budgets d'erreur, on-call, les « trois piliers » comme discipline) est le sujet du **cours 16 (observability-sre)**. Ici on répond à une seule question : *comment instrumenter et observer l'infra TribuZen déployée sur AWS, avec les outils AWS ?*
+
+## 1. Cas concret d'abord
+
+Tu es d'astreinte sur TribuZen. Dimanche 20h, un parent écrit au support : « le fil de la famille rame, parfois ça poste, parfois non ». Tu ouvres la console AWS. La Lambda `postFeedMessage` (derrière API Gateway, qui écrit dans DynamoDB `TribuZenFeed`) est **verte** : ni erreur, ni throttle visible dans les métriques standard. Et pourtant ça rame.
+
+Tu ouvres les logs de la fonction. Voici ce que le handler écrit aujourd'hui :
+
+```javascript
+export const handler = async (event) => {
+  console.log('start');                         // (1) aucun contexte
+  const body = JSON.parse(event.body);
+  await ddb.send(new PutItemCommand({ /* ... */ }));
+  console.log('done');                          // (2) pas de durée, pas d'id
+  return { statusCode: 201 };
+};
+```
+
+Face à la panne, tu es **aveugle**, pour quatre raisons concrètes :
+
+1. Les logs sont du **texte libre** (`start`, `done`) : impossible de les agréger, de filtrer les lents, de compter les échecs. Logs Insights ne peut rien en tirer.
+2. Aucune **métrique métier** : tu vois `Invocations` et `Duration` d'AWS, mais pas « combien de messages postés », ni « combien ont dépassé 1 s ».
+3. Aucune **alarme** : personne n'a été prévenu. Tu apprends la panne par un utilisateur, 40 minutes après le début.
+4. Aucune **trace** : quand une requête est lente, tu ne sais pas *où* — dans la Lambda ? dans l'appel DynamoDB ? dans un cold start ? Les logs de chaque service sont séparés.
+
+À la fin de ce module, tu sais transformer cette fonction aveugle en fonction **observable** : logs structurés JSON requêtables, une métrique custom `MessagesPostes` + une alarme SNS qui te réveille *avant* l'utilisateur, et une trace X-Ray qui te montre en un coup d'œil que les 800 ms « perdues » sont l'appel DynamoDB — chiffres et API du service à l'appui.
 
 ---
 
-## Pourquoi l'observabilite ?
+## 2. Théorie complète, concise
 
-### Les trois piliers
+### 2.1 CloudWatch Logs — event, stream, group
 
-L'observabilite repose sur trois piliers complementaires :
+**CloudWatch Logs** ingère et stocke les logs. Trois niveaux :
 
-| Pilier | Question | Outil AWS |
-|--------|----------|-----------|
-| **Metriques** | "Combien ?" (CPU, requetes/s, erreurs) | CloudWatch Metrics |
-| **Logs** | "Que s'est-il passe ?" (details des evenements) | CloudWatch Logs |
-| **Traces** | "Ou est le probleme ?" (parcours d'une requete) | X-Ray |
+| Concept | Définition | Exemple TribuZen |
+|---------|-----------|------------------|
+| **Log event** | une entrée : un timestamp + un message | `{"level":"info","msg":"feed posted"}` |
+| **Log stream** | une séquence d'events d'**une même source** | une instance d'exécution Lambda |
+| **Log group** | une collection de streams du **même type**, où se règlent rétention et permissions | `/aws/lambda/tribuzen-post-feed` |
 
-Imaginez un restaurant :
-- **Metriques** : "En moyenne, un plat est servi en 12 minutes" (indicateurs)
-- **Logs** : "A 19h32, la commande #45 a ete preparee par le chef Paul" (details)
-- **Traces** : "La commande #45 a pris 3 min en cuisine, 2 min en attente, 1 min de service" (parcours)
+Chaque service pose ses logs dans un groupe à convention fixe : Lambda écrit dans **`/aws/lambda/<nom-fonction>`** ; API Gateway et ECS ont leurs propres groupes. `console.log` dans une Lambda part automatiquement dans son log group (le role d'exécution a la permission par défaut).
 
----
+### 2.2 Rétention — à configurer, toujours
 
-## CloudWatch Metrics
+Par défaut, un log group conserve ses events **indéfiniment** (**Never expire**) — et tu paies le stockage à vie. Il faut **fixer une rétention** sur chaque groupe :
 
-### Qu'est-ce qu'une metrique ?
-
-Une **metrique** est une serie temporelle de points de donnees. Chaque point a :
-- Un **timestamp** (quand)
-- Une **valeur** (combien)
-- Une **unite** (octets, secondes, nombre...)
-
-### Metriques standard
-
-AWS envoie automatiquement des metriques pour ses services. Voici les plus importantes :
-
-#### EC2
-| Metrique | Description | Granularite |
-|----------|-------------|-------------|
-| `CPUUtilization` | % de CPU utilise | 5 min (basic) / 1 min (detailed) |
-| `NetworkIn/Out` | Octets reseau | 5 min |
-| `StatusCheckFailed` | Probleme de l'instance | 1 min |
-
-**Attention** : EC2 ne reporte **pas** l'utilisation memoire ni l'espace disque. Pour cela, il faut installer le **CloudWatch Agent**.
-
-#### Lambda
-| Metrique | Description |
-|----------|-------------|
-| `Invocations` | Nombre d'appels |
-| `Duration` | Temps d'execution (ms) |
-| `Errors` | Nombre d'erreurs |
-| `Throttles` | Requetes limitees |
-| `ConcurrentExecutions` | Executions simultanees |
-
-#### ALB
-| Metrique | Description |
-|----------|-------------|
-| `RequestCount` | Nombre de requetes |
-| `TargetResponseTime` | Latence moyenne |
-| `HTTPCode_Target_5XX_Count` | Erreurs serveur |
-| `HealthyHostCount` | Instances saines |
-
-### Namespaces et dimensions
-
-Les metriques sont organisees en **namespaces** (ex : `AWS/Lambda`, `AWS/EC2`) et filtrees par **dimensions** :
-
-```
-Namespace: AWS/Lambda
-  Metrique: Duration
-  Dimensions:
-    FunctionName = "process-order"
-    Resource = "process-order:PROD"
+```bash
+aws logs put-retention-policy \
+  --log-group-name /aws/lambda/tribuzen-post-feed \
+  --retention-in-days 30
 ```
 
-Les dimensions permettent de filtrer — par exemple, voir la duree uniquement pour une fonction Lambda specifique.
+Valeurs valides : 1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653 jours (entre autres). Repère : **dev 7 j**, **prod applicatif 30 j**, **audit/compliance 365 j+**.
 
-### Metriques custom
+### 2.3 Logs structurés JSON — le prérequis de tout le reste
 
-Vous pouvez envoyer vos propres metriques a CloudWatch :
+Un log en **texte libre** (`console.log('done')`) n'est pas exploitable. Un log **structuré JSON** l'est : chaque champ devient requêtable et agrégeable.
 
-```typescript
-import { CloudWatch } from '@aws-sdk/client-cloudwatch';
+```javascript
+// ❌ texte libre — Logs Insights ne peut pas filtrer sur "durée"
+console.log('done in', ms, 'ms');
 
-const cw = new CloudWatch({});
-
-await cw.putMetricData({
-  Namespace: 'MonApp/Commandes',
-  MetricData: [
-    {
-      MetricName: 'CommandesTraitees',
-      Value: 1,
-      Unit: 'Count',
-      Dimensions: [
-        { Name: 'Environnement', Value: 'production' },
-        { Name: 'Region', Value: 'eu-west-1' }
-      ]
-    }
-  ]
-});
+// ✅ JSON structuré — chaque clé est un champ requêtable
+console.log(JSON.stringify({
+  level: 'info',
+  msg: 'feed_posted',
+  requestId: context.awsRequestId,   // relie ce log à l'invocation
+  familyId,
+  durationMs: ms,
+}));
 ```
 
-### Metriques haute resolution
+Logs Insights **découvre automatiquement** les champs d'un event JSON (`familyId`, `durationMs`…). C'est ce qui rend possible les requêtes de la section 2.8.
 
-Par defaut, les metriques custom ont une granularite de **1 minute**. Pour des cas critiques, vous pouvez envoyer des metriques **haute resolution** avec une granularite de **1 seconde** :
+### 2.4 Metric filters — transformer un pattern de log en métrique
 
-```typescript
-{
-  MetricName: 'LatenceAPI',
-  Value: 42.5,
-  Unit: 'Milliseconds',
-  StorageResolution: 1  // 1 seconde au lieu de 60
-}
-```
-
-**Attention** : les metriques haute resolution coutent plus cher. Reservez-les aux cas ou la seconde compte (trading, gaming temps reel).
-
-### Periodes et statistiques
-
-Quand vous consultez une metrique, vous choisissez :
-- **Periode** : l'intervalle de temps pour chaque point (60s, 300s, 3600s...)
-- **Statistique** : comment agreger les valeurs
-
-| Statistique | Description | Cas d'usage |
-|-------------|-------------|-------------|
-| `Average` | Moyenne | CPU, latence typique |
-| `Sum` | Somme | Nombre de requetes, erreurs |
-| `Minimum` | Valeur min | Meilleur temps de reponse |
-| `Maximum` | Valeur max | Pic de latence |
-| `p50, p90, p99` | Percentiles | Latence : "99% des requetes < X ms" |
-| `SampleCount` | Nombre de points | Volume de donnees |
-
-**Bonne pratique** : pour la latence, utilisez **p99** plutot que la moyenne. La moyenne masque les pics qui affectent les utilisateurs.
-
----
-
-## CloudWatch Alarms
-
-### Types d'alarmes
-
-#### 1. Alarme a seuil (Threshold)
-
-La plus simple : declenche quand une metrique depasse un seuil pendant N periodes.
+Un **metric filter** attaché à un log group incrémente une métrique CloudWatch à chaque event qui matche un pattern. Utile pour compter des erreurs sans toucher au code :
 
 ```
-Alarme : "CPU Eleve"
-  Metrique : CPUUtilization
-  Condition : > 80%
-  Periodes : 3 periodes consecutives de 5 minutes
-  Action : Envoyer SNS → email
+Log group : /aws/lambda/tribuzen-post-feed
+Pattern    : { $.level = "error" }        # event JSON dont level = error
+Métrique   : TribuZen/FeedErrors  (+1 par match)
 ```
 
-**Etats d'une alarme** :
-- `OK` : la metrique est sous le seuil
-- `ALARM` : la metrique depasse le seuil
-- `INSUFFICIENT_DATA` : pas assez de donnees pour evaluer
+Patterns courants : `"ERROR"` (le mot brut), `{ $.level = "error" }` (champ JSON), `{ $.durationMs > 1000 }` (numérique). Le metric filter est une alternative *sans code* à `PutMetricData` (2.6) quand la donnée est déjà dans le log.
 
-#### 2. Alarme anomalie (Anomaly Detection)
+### 2.5 CloudWatch Metrics — namespace, dimensions, résolution
 
-CloudWatch apprend le **comportement normal** de votre metrique et alerte quand la valeur sort de la bande attendue.
+Une **métrique** est une série temporelle de points (timestamp + valeur + unité). Elle est identifiée par :
 
-```
-Bande normale de CPUUtilization (apprise sur 2 semaines) :
-  Lundi 9h : 40-60% (heure de pointe attendue)
-  Dimanche 3h : 5-15% (creux attendu)
+- un **namespace** (conteneur) : les services AWS utilisent la convention **`AWS/<service>`** (`AWS/Lambda`, `AWS/ApiGateway`…) ; tes métriques custom prennent un namespace à toi (`TribuZen/Feed`) ;
+- un **nom** (`Duration`, `MessagesPostes`) ;
+- **0 à 30 dimensions** — des paires nom/valeur (`FunctionName=tribuzen-post-feed`, `Env=prod`). Chaque combinaison unique de dimensions est une métrique distincte.
 
-→ Si CPU = 70% le dimanche a 3h → ALARME (anormal)
-→ Si CPU = 55% le lundi a 9h → OK (normal)
-```
+**Résolution** (vérifié doc) :
 
-**Cas d'usage** : metriques avec des patterns saisonniers (jour/nuit, semaine/weekend).
+- **standard** = granularité **1 minute** (toutes les métriques AWS, par défaut) ;
+- **haute résolution** = granularité **1 seconde**, via `StorageResolution` à 1 sur le point publié. Lisible à 1, 5, 10, 30 s ou multiple de 60. Plus cher (chaque `PutMetricData` est facturé) — à réserver aux cas sub-minute réels.
 
-#### 3. Alarme composite
+Un timestamp de point peut être jusqu'à **2 semaines dans le passé** et **2 heures dans le futur**.
 
-Combine **plusieurs alarmes** avec des operateurs logiques (AND, OR, NOT) :
+### 2.6 Publier une métrique custom — `PutMetricData`
 
-```
-Alarme composite : "Probleme Critique"
-  = AlarmeCPU AND AlarmeErreurs5xx AND NOT AlarmeMaintenance
-```
+Les métriques AWS ne connaissent pas ton métier. Pour « nombre de messages postés », tu publies toi-même via l'API `PutMetricData` :
 
-Cela evite les faux positifs — par exemple, ne pas alerter pendant une maintenance planifiee.
+```javascript
+import { CloudWatchClient, PutMetricDataCommand } from '@aws-sdk/client-cloudwatch';
+const cw = new CloudWatchClient({});          // hors handler (réutilisé)
 
-### Actions d'alarme
-
-Quand une alarme se declenche, elle peut :
-- Envoyer une **notification SNS** (email, SMS, Slack via Lambda)
-- Executer une **action Auto Scaling** (ajouter/retirer des instances)
-- Executer une **action EC2** (stop, terminate, reboot)
-- Creer un **incident** dans Systems Manager
-
----
-
-## CloudWatch Logs
-
-### Architecture des logs
-
-```
-Application → Log Stream → Log Group → CloudWatch Logs
+await cw.send(new PutMetricDataCommand({
+  Namespace: 'TribuZen/Feed',
+  MetricData: [{
+    MetricName: 'MessagesPostes',
+    Value: 1,
+    Unit: 'Count',
+    Dimensions: [{ Name: 'Env', Value: 'prod' }],
+    // StorageResolution: 1,                   // décommenter pour de la haute résolution
+  }],
+}));
 ```
 
-| Concept | Description | Exemple |
-|---------|-------------|---------|
-| **Log Event** | Une seule entree de log | `2024-01-15 ERROR: Connection refused` |
-| **Log Stream** | Sequence d'events d'une meme source | Logs d'une instance EC2 specifique |
-| **Log Group** | Collection de streams du meme type | `/aws/lambda/process-order` |
+Alternative recommandée à fort volume : le format **EMF** (Embedded Metric Format) — tu écris un JSON spécial dans les logs et CloudWatch en extrait la métrique, sans appel API synchrone. Le role de la fonction doit porter `cloudwatch:PutMetricData` pour l'appel direct.
 
-### Retention
+### 2.7 Périodes, statistiques, percentiles, rétention
 
-Par defaut, les logs sont conserves **indefiniment** (et coutent de l'espace). Configurez toujours une retention :
+Quand tu **lis** une métrique, tu choisis une **période** (durée d'agrégation d'un point) et une **statistique** :
 
-| Retention | Cas d'usage |
-|-----------|-------------|
-| 1 jour | Developpement |
-| 7 jours | Staging |
-| 30 jours | Production (logs applicatifs) |
-| 90 jours | Audit |
-| 1 an+ | Compliance reglementaire |
+- **Périodes valides** : 1, 5, 10, 30, ou tout **multiple de 60** secondes. Défaut **60 s**. Sous-minute réservé aux métriques haute résolution.
+- **Statistiques** : `Average` (latence typique), `Sum` (nb de requêtes/erreurs), `Minimum`/`Maximum`, `SampleCount`, et surtout les **percentiles** `p50`, `p90`, **`p99`** (jusqu'à 10 décimales, ex. `p95.5`).
 
-### Metric Filters
+> **Latence : lis le p99, pas la moyenne.** La moyenne noie les pics ; « p99 = 1,2 s » dit que 1 % des parents attendent plus de 1,2 s — c'est *eux* qui écrivent au support.
 
-Les **metric filters** transforment des patterns de logs en metriques CloudWatch :
+**Rétention des métriques** (agrégation automatique, vérifié doc) : points < 60 s → **3 h** ; 60 s → **15 jours** ; 300 s (5 min) → **63 jours** ; 3600 s (1 h) → **455 jours (15 mois)**. Une métrique sans nouveau point **expire au bout de 15 mois** ; les métriques ne se suppriment pas manuellement.
+
+### 2.8 CloudWatch Logs Insights — requêter les logs
+
+**Logs Insights** est un langage de requête sur un ou plusieurs log groups. Pipeline de commandes séparées par `|` : `fields`, `filter`, `parse`, `stats … by`, `sort`, `limit`, `bin()`.
 
 ```
-Log Group : /aws/lambda/process-order
-Filter Pattern : "ERROR"
-Metrique : MonApp/Erreurs (increment de 1 a chaque match)
-```
-
-Patterns de filtre courants :
-
-```
-"ERROR"                          → contient le mot ERROR
-[ip, user, timestamp, request, status_code = 5*, bytes]  → status 5xx
-{ $.level = "error" }            → JSON avec champ level = error
-{ $.duration > 3000 }            → JSON avec duration > 3 secondes
-```
-
-### CloudWatch Logs Insights
-
-**Logs Insights** est un langage de requete puissant pour analyser les logs. Il permet de chercher, filtrer et agreger les logs en quelques secondes.
-
-#### Syntaxe de base
-
-```sql
--- Les 20 derniers logs d'erreur
+# Les 20 dernières erreurs (logs JSON)
 fields @timestamp, @message
-| filter @message like /ERROR/
+| filter level = "error"
 | sort @timestamp desc
 | limit 20
 ```
 
-#### Requetes avancees
+```
+# p99 de la durée métier par tranche de 5 min
+fields durationMs
+| filter ispresent(durationMs)
+| stats pct(durationMs, 99) as p99, avg(durationMs) as moy, count(*) as n by bin(5m)
+| sort bin(5m) desc
+```
 
-```sql
--- Top 10 des erreurs les plus frequentes
-fields @message
-| filter @message like /ERROR/
-| stats count(*) as nb by @message
-| sort nb desc
+```
+# Top des familles les plus actives sur la fenêtre
+fields familyId
+| filter msg = "feed_posted"
+| stats count(*) as posts by familyId
+| sort posts desc
 | limit 10
 ```
 
-```sql
--- Latence moyenne par endpoint (logs JSON)
-fields @timestamp, endpoint, duration
-| filter ispresent(endpoint)
-| stats avg(duration) as latence_moy,
-        max(duration) as latence_max,
-        count(*) as nb_requetes
-  by endpoint
-| sort latence_moy desc
-```
+`@timestamp` et `@message` sont des champs intégrés ; les autres (`durationMs`, `familyId`) viennent de tes logs JSON. Un résultat Logs Insights s'**épingle sur un dashboard**.
 
-```sql
--- Percentile 99 de la duree Lambda par heure
-fields @timestamp, @duration
-| stats pct(@duration, 99) as p99 by bin(1h)
-| sort @timestamp
-```
+### 2.9 CloudWatch Alarms — seuil, anomalie, composite
 
-#### Visualisation
+Une **alarme** surveille **une** métrique sur une fenêtre et **change d'état** selon un seuil. Trois **états** : **`OK`**, **`ALARM`**, **`INSUFFICIENT_DATA`** (pas assez de points). L'alarme n'agit que sur un **changement d'état soutenu** (N périodes d'évaluation), pas à chaque point.
 
-Les resultats de Logs Insights peuvent etre affiches sous forme de :
-- Tableau
-- Graphique en courbes (time series)
-- Graphique en barres
+Trois types :
 
-Et peuvent etre ajoutes directement a un **dashboard CloudWatch**.
+1. **À seuil (threshold)** — « métrique > X pendant N périodes ». Le plus courant.
 
----
+   ```bash
+   aws cloudwatch put-metric-alarm \
+     --alarm-name tribuzen-feed-errors \
+     --namespace TribuZen/Feed --metric-name FeedErrors \
+     --statistic Sum --period 300 \
+     --threshold 5 --comparison-operator GreaterThanThreshold \
+     --evaluation-periods 1 \
+     --alarm-actions arn:aws:sns:eu-west-1:123456789012:tribuzen-oncall
+   ```
 
-## CloudWatch Dashboards
+2. **Anomalie (anomaly detection)** — CloudWatch apprend une bande « normale » (patterns jour/nuit, semaine/week-end) et alerte hors bande. Utile pour un trafic saisonnier comme le feed (pics le dimanche soir).
+3. **Composite** — combine plusieurs alarmes en logique booléenne (`AND`/`OR`/`NOT`), ex. `AlarmeErreurs AND NOT AlarmeMaintenance`, pour réduire les faux positifs.
 
-### Creer un dashboard
+**Actions** : une transition déclenche une **notification SNS** (email/SMS/Slack via Lambda), une **action Auto Scaling**, une **action EC2**, ou un incident Systems Manager. Sur une métrique **haute résolution**, l'alarme peut avoir une période de **10 s ou 30 s** (surcoût).
 
-Un dashboard est un ensemble de **widgets** affichant des metriques, logs et alarmes sur une seule page.
+### 2.10 CloudWatch Dashboards
 
-### Types de widgets
+Un **dashboard** rassemble des **widgets** (courbe, nombre, jauge, barres, état d'alarmes, résultat Logs Insights) sur une page. Coût : les **3 premiers dashboards** (≤ 50 métriques chacun) sont **gratuits**, puis ~3 $/mois par dashboard. Un dashboard TribuZen type : requêtes/min, p99 de latence, taux d'erreur, état des alarmes, 10 dernières erreurs (widget Logs Insights).
 
-| Widget | Description | Cas d'usage |
-|--------|-------------|-------------|
-| **Line** | Courbe temporelle | CPU, latence au fil du temps |
-| **Stacked area** | Aires empilees | Repartition des erreurs par type |
-| **Number** | Valeur unique | Nombre total de requetes |
-| **Gauge** | Jauge | Pourcentage d'utilisation |
-| **Bar** | Barres | Comparaison entre services |
-| **Text** | Texte Markdown | Titres, descriptions, liens |
-| **Alarm** | Etat des alarmes | Vue d'ensemble rouge/vert |
-| **Logs** | Requete Logs Insights | Derniers logs d'erreur |
+### 2.11 X-Ray — le problème du tracing distribué
 
-### Dashboard operationnel type
+Une requête TribuZen traverse plusieurs services : API Gateway → Lambda `postFeedMessage` → DynamoDB (et parfois → SNS). Si elle est lente, **où** est le temps ? Les logs de chaque service sont **séparés** ; les métriques disent *combien*, pas *où*. **X-Ray** reconstitue le **parcours de bout en bout** d'une requête.
 
-```
-┌─────────────────────────────────────────────┐
-│ 🟢 Mon Application - Dashboard Production    │
-├──────────────┬──────────────┬───────────────┤
-│ Requetes/min │  Latence p99 │  Taux erreur  │
-│    1,247     │    142ms     │    0.3%       │
-├──────────────┴──────────────┴───────────────┤
-│ [Graphe] Requetes et erreurs (derniere heure) │
-├─────────────────────┬───────────────────────┤
-│ [Graphe] CPU Lambda │ [Graphe] DynamoDB RCU │
-├─────────────────────┴───────────────────────┤
-│ [Alarmes] Etat de toutes les alarmes        │
-├─────────────────────────────────────────────┤
-│ [Logs] 10 dernieres erreurs                 │
-└─────────────────────────────────────────────┘
-```
+| Concept | Définition |
+|---------|-----------|
+| **Trace** | le parcours complet d'**une** requête ; identifiée par un **trace ID** propagé entre services (données conservées **30 jours**) |
+| **Segment** | le travail d'**un** service (ex. la Lambda) ; document ≤ 64 ko |
+| **Subsegment** | un détail dans un segment (ex. l'appel DynamoDB à l'intérieur de la Lambda) ; sert à générer des **segments inférés** pour les services non instrumentés (DynamoDB) |
+| **Service map** | le graphe auto-généré des services (nœuds) et de leurs appels (arêtes), avec latence, taux d'erreur, volume par nœud |
 
-### Cout
+### 2.12 X-Ray — activation, sampling, header, annotations
 
-- Les **3 premiers dashboards** (max 50 metriques chacun) sont **gratuits**
-- Au-dela : $3.00/mois par dashboard
+- **Activation** (par service) : Lambda → cocher **Active tracing** dans la config ; API Gateway → activer sur le **stage** ; ECS → **sidecar** X-Ray daemon ; EC2 → daemon installé. Le role doit porter les permissions X-Ray (`xray:PutTraceSegments`, `xray:PutTelemetryRecords`).
+- **Sampling** : par défaut, le SDK trace la **première requête de chaque seconde** + **5 %** des suivantes — conservateur pour maîtriser le coût. Règles personnalisables (tout tracer pour les écritures, échantillonner bas les health-checks).
+- **Header de propagation** : `X-Amzn-Trace-Id: Root=1-...;Parent=...;Sampled=1`. Le premier service X-Ray l'ajoute et le propage ; c'est lui qui relie les segments d'une même trace.
+- **Annotations vs metadata** : les **annotations** sont des paires clé/valeur **indexées** et filtrables (`annotation.familyId = "fam-42"`), **jusqu'à 50 par trace** ; les **metadata** ne sont **pas indexées** (payloads, objets), non filtrables.
+- **Erreurs** classées : **Error** (4xx), **Fault** (5xx), **Throttle** (429).
 
----
+Instrumentation Node.js typique :
 
-## AWS X-Ray
-
-### Le probleme du tracing distribue
-
-Dans une architecture microservices, une seule requete utilisateur peut traverser de nombreux services :
-
-```
-Client → API Gateway → Lambda A → DynamoDB
-                          ↓
-                      SQS Queue → Lambda B → SNS
-                                     ↓
-                                  DynamoDB
-```
-
-Si cette requete est lente ou echoue, **ou est le probleme ?** Les logs seuls ne suffisent pas car chaque service a ses propres logs. X-Ray permet de voir le **parcours complet** d'une requete.
-
-### Concepts X-Ray
-
-| Concept | Description |
-|---------|-------------|
-| **Trace** | Le parcours complet d'une requete, de bout en bout |
-| **Segment** | Le travail effectue par un service (ex : Lambda A) |
-| **Subsegment** | Un detail dans un segment (ex : appel DynamoDB dans Lambda A) |
-| **Trace ID** | Identifiant unique de la trace (propage entre services) |
-| **Annotations** | Paires cle/valeur indexees (pour filtrer) |
-| **Metadata** | Donnees supplementaires non indexees |
-
-### Comment ca fonctionne
-
-```
-1. Le premier service genere un Trace ID
-2. Chaque service ajoute un segment avec ses informations
-3. Le Trace ID est propage via le header X-Amzn-Trace-Id
-4. X-Ray rassemble tous les segments pour reconstituer la trace
-```
-
-### X-Ray SDK avec Node.js
-
-```typescript
+```javascript
 import AWSXRay from 'aws-xray-sdk-core';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 
-// Instrumenter le client AWS pour tracer les appels
-const dynamodb = AWSXRay.captureAWSv3Client(
-  new DynamoDBClient({})
-);
+// enveloppe le client → chaque appel DynamoDB devient un subsegment tracé
+const ddb = AWSXRay.captureAWSv3Client(new DynamoDBClient({}));
 
-// Creer un subsegment custom
-const segment = AWSXRay.getSegment();
-const subsegment = segment!.addNewSubsegment('process-payment');
-
+const seg = AWSXRay.getSegment();
+const sub = seg.addNewSubsegment('write-feed');
 try {
-  // Logique metier
-  await processPayment(order);
-
-  // Ajouter des annotations (indexees, cherchables)
-  subsegment.addAnnotation('orderId', order.id);
-  subsegment.addAnnotation('amount', order.total);
-
-  // Ajouter des metadata (non indexees)
-  subsegment.addMetadata('orderDetails', order);
-
-  subsegment.close();
-} catch (err) {
-  subsegment.addError(err as Error);
-  subsegment.close();
-  throw err;
+  await writeFeed(msg);
+  sub.addAnnotation('familyId', msg.familyId); // indexé → filtrable dans la console
+  sub.addMetadata('payload', msg);             // non indexé → contexte seulement
+} catch (e) {
+  sub.addError(e);
+  throw e;
+} finally {
+  sub.close();
 }
 ```
 
-### Annotations vs Metadata
+### 2.13 Corréler logs et traces
 
-| Critere | Annotations | Metadata |
-|---------|------------|----------|
-| Indexees | Oui (cherchables) | Non |
-| Limite | 50 par trace | Pas de limite stricte |
-| Filtrage | `annotation.orderId = "123"` | Non filtrable |
-| Cas d'usage | IDs, statuts, types | Payloads, details |
+C'est le point qui transforme le debug. La console CloudWatch affiche désormais logs, métriques **et** traces X-Ray au même endroit. Le pont concret :
 
-### Activation X-Ray sur les services
+- log ↔ invocation : tu **logges le `context.awsRequestId`** dans ton JSON → Logs Insights retrouve tous les events d'une invocation ;
+- trace ↔ log : tu **poses le trace ID en annotation** (ou tu le logges) → depuis une trace lente du service map, tu sautes aux logs correspondants, et inversement.
 
-| Service | Activation |
-|---------|-----------|
-| **Lambda** | Cocher "Active tracing" dans la config |
-| **API Gateway** | Activer dans les settings du stage |
-| **ECS** | Ajouter un sidecar X-Ray daemon |
-| **EC2** | Installer le X-Ray daemon |
-| **App Runner** | Active par defaut |
+Résultat : une trace montre *« 800 ms dans le subsegment DynamoDB »*, l'annotation `familyId` te donne la famille, et Logs Insights sur ce `requestId` te donne le détail applicatif. Tu passes de « ça rame » à la ligne exacte.
+
+> **Hors périmètre de ce module** (outils CloudWatch adjacents, cités pour situer) : **Synthetics canaries** (parcours simulés proactifs), **Container Insights** (métriques ECS/EKS détaillées), **RUM** (monitoring navigateur réel). Mêmes principes, pas nécessaires pour instrumenter l'API feed.
 
 ---
 
-## Service Map
+## 3. Worked examples
 
-### Visualiser l'architecture
+### Exemple 1 — Rendre `postFeedMessage` observable (logs + métrique + trace)
 
-Le **Service Map** de X-Ray genere automatiquement un diagramme de votre architecture en temps reel :
-
-```
-    [API Gateway]
-         |
-    response: 200ms
-    errors: 0.1%
-         |
-    [Lambda: process-order]
-       /        \
-      /          \
-[DynamoDB]    [SQS Queue]
- 45ms OK       12ms OK
-                  |
-            [Lambda: notify]
-                  |
-              [SNS Topic]
-               8ms OK
-```
-
-Chaque noeud affiche :
-- Le **nom du service**
-- La **latence moyenne**
-- Le **taux d'erreur** (colore en vert/jaune/rouge)
-- Le **volume de requetes**
-
-Le Service Map permet d'identifier rapidement les goulots d'etranglement et les services defaillants.
-
----
-
-## Synthetics Canaries
-
-### Monitoring proactif
-
-Les **Synthetics canaries** sont des scripts automatises qui simulent des **parcours utilisateur** a intervalles reguliers. Ils detectent les problemes **avant** les vrais utilisateurs.
-
-### Fonctionnement
-
-```
-CloudWatch Synthetics
-       |
-       v
-Canary (Lambda + Puppeteer/Selenium)
-       |
-       v
-Execute un script toutes les X minutes
-       |
-       ├── Verifie que la page d'accueil charge en < 3s
-       ├── Verifie que le login fonctionne
-       ├── Verifie que l'API retourne 200
-       └── Prend des captures d'ecran
-       |
-       v
-Resultat → Metrique CloudWatch → Alarme si echec
-```
-
-### Types de canaries
-
-| Type | Description |
-|------|-------------|
-| **Heartbeat** | Verifie qu'une URL repond (simple ping) |
-| **API** | Teste un endpoint API (status, body, latence) |
-| **Broken Link Checker** | Verifie que tous les liens d'une page fonctionnent |
-| **Visual** | Compare des captures d'ecran pour detecter les regressions visuelles |
-| **Custom** | Script Node.js/Python personnalise |
-
-### Exemple de canary API
+On reprend le handler aveugle du §1 et on l'instrumente entièrement.
 
 ```javascript
-const synthetics = require('Synthetics');
-const log = require('SyntheticsLogger');
+// index.mjs — postFeedMessage instrumenté
+import AWSXRay from 'aws-xray-sdk-core';
+import { DynamoDBClient, PutItemCommand } from '@aws-sdk/client-dynamodb';
+import { CloudWatchClient, PutMetricDataCommand } from '@aws-sdk/client-cloudwatch';
 
-const apiCanaryBlueprint = async function () {
-  const response = await synthetics.executeHttpStep(
-    'Verify API Health',
-    {
-      hostname: 'api.mon-site.com',
-      method: 'GET',
-      path: '/health',
-      port: 443,
-      protocol: 'https:'
-    }
-  );
+// ── INIT (hors handler) : clients réutilisés, DynamoDB enveloppé par X-Ray ──
+const ddb = AWSXRay.captureAWSv3Client(new DynamoDBClient({}));
+const cw  = new CloudWatchClient({});
+const TABLE = process.env.FEED_TABLE;
 
-  // Verifier le status code
-  if (response.statusCode !== 200) {
-    throw new Error(`Expected 200, got ${response.statusCode}`);
+export const handler = async (event, context) => {
+  const t0 = Date.now();
+  const { familyId, text } = JSON.parse(event.body);
+
+  try {
+    // l'appel DynamoDB devient un subsegment X-Ray automatiquement
+    await ddb.send(new PutItemCommand({
+      TableName: TABLE,
+      Item: {
+        pk: { S: `FAM#${familyId}` },
+        sk: { S: `MSG#${Date.now()}` },
+        text: { S: text },
+      },
+    }));
+
+    const durationMs = Date.now() - t0;
+
+    // log structuré JSON : requestId (corrélation) + durée + famille
+    console.log(JSON.stringify({
+      level: 'info', msg: 'feed_posted',
+      requestId: context.awsRequestId, familyId, durationMs,
+    }));
+
+    // métrique métier : 1 message posté
+    await cw.send(new PutMetricDataCommand({
+      Namespace: 'TribuZen/Feed',
+      MetricData: [{ MetricName: 'MessagesPostes', Value: 1, Unit: 'Count',
+        Dimensions: [{ Name: 'Env', Value: 'prod' }] }],
+    }));
+
+    return { statusCode: 201, body: JSON.stringify({ ok: true }) };
+  } catch (e) {
+    // log d'erreur structuré → captable par un metric filter { $.level = "error" }
+    console.log(JSON.stringify({
+      level: 'error', msg: 'feed_post_failed',
+      requestId: context.awsRequestId, familyId, error: e.message,
+    }));
+    throw e; // relève → X-Ray marque un Fault, la métrique Errors AWS s'incrémente
   }
-
-  // Verifier le temps de reponse
-  log.info(`Response time: ${response.timing.duration}ms`);
-};
-
-exports.handler = async () => {
-  return await apiCanaryBlueprint();
 };
 ```
 
-### Frequence et cout
+Ce qui a changé, et pourquoi :
 
-- Frequence minimale : **1 minute**
-- Cout : ~$0.0012 par execution
-- Un canary toutes les 5 minutes = ~$0.35/mois
+- **Logs JSON** avec `requestId` : chaque event est requêtable et relié à son invocation.
+- **`captureAWSv3Client`** : l'appel DynamoDB apparaît comme **subsegment** → le service map montre la latence DynamoDB isolément.
+- **Métrique `MessagesPostes`** : indicateur métier, base d'un dashboard et d'une alarme.
+- **`throw` conservé** : X-Ray enregistre un **Fault**, et la métrique AWS `Errors` s'incrémente → l'alarme peut s'appuyer dessus.
+
+Config à activer : **Active tracing** sur la Lambda, et role portant `dynamodb:PutItem`, `cloudwatch:PutMetricData`, `xray:PutTraceSegments`, `xray:PutTelemetryRecords`.
+
+### Exemple 2 — De l'alarme à la cause en 3 requêtes
+
+Scénario : l'alarme à seuil `tribuzen-feed-errors` (2.9) passe **ALARM** dimanche 20h04 et notifie l'astreinte par SNS. Déroulé du diagnostic :
+
+**1) Confirmer l'ampleur** (Logs Insights, log group `/aws/lambda/tribuzen-post-feed`) :
+
+```
+fields @timestamp, error, familyId
+| filter level = "error"
+| stats count(*) as erreurs by bin(5m)
+| sort bin(5m) desc
+```
+
+→ 37 erreurs sur la dernière tranche de 5 min, en hausse. Ce n'est pas un point isolé.
+
+**2) Localiser où** (X-Ray → service map, filtre `fault = true`) : le nœud **DynamoDB** est **rouge**, subsegment `write-feed` à **820 ms** avec des `ProvisionedThroughputExceeded`. La Lambda et API Gateway sont verts. Le goulot est l'écriture DynamoDB, pas le code.
+
+**3) Relier au métier** : sur une trace en faute, l'annotation `familyId` pointe une poignée de grosses familles ; Logs Insights sur leur `requestId` confirme des écritures en rafale. Cause : capacité DynamoDB sous-dimensionnée pour le pic du dimanche soir (→ on-demand ou autoscaling, module 09).
+
+Sans instrumentation : 40 min d'aveuglement. Avec : **alarme en < 5 min**, cause localisée en 3 requêtes. La chaîne **métrique → alarme → logs → trace** a fait tout le travail.
 
 ---
 
-## Container Insights
+## 4. Pièges & misconceptions
 
-### Monitoring des containers
+### PIÈGE #1 — « C'est vert, donc tout va bien »
 
-**Container Insights** est une fonctionnalite de CloudWatch specialisee pour les workloads conteneurisees (ECS, EKS, Kubernetes).
+Les métriques **standard AWS** (`Errors`, `Throttles`) ne voient que ce qu'AWS sait. Une requête *lente mais réussie*, une donnée métier fausse, un timeout côté client : invisibles. Il faut des **métriques custom** (`MessagesPostes`, latence métier) et des **logs structurés**. Le vert AWS ≠ l'utilisateur content.
 
-### Metriques collectees
+### PIÈGE #2 — Logs en texte libre
 
-| Niveau | Metriques |
-|--------|-----------|
-| **Cluster** | CPU, memoire, nombre de taches/pods |
-| **Service** | CPU, memoire, nombre de taches par service |
-| **Task/Pod** | CPU, memoire, reseau par tache/pod |
-| **Container** | CPU, memoire par container individuel |
+`console.log('done')` est inexploitable : Logs Insights ne peut ni filtrer, ni agréger, ni tracer. **Toujours logger du JSON** (`JSON.stringify({ level, msg, requestId, ... })`) — c'est le prérequis de Logs Insights, des metric filters et de la corrélation.
 
-### Activation
+### PIÈGE #3 — Rétention « Never expire » oubliée
 
-Pour ECS Fargate, activez Container Insights au niveau du cluster :
+Un log group sans **`put-retention-policy`** garde tout **à vie** et facture le stockage sans fin. Fixe une rétention sur **chaque** groupe (dev 7 j, prod 30 j, audit 365 j+). C'est l'oubli de coût n°1 de l'observabilité.
 
-```bash
-aws ecs update-cluster-settings \
-  --cluster mon-cluster \
-  --settings name=containerInsights,value=enabled
-```
+### PIÈGE #4 — Alarmer sur la moyenne de latence
 
-### Metriques cles
+La moyenne masque les pics : « moyenne 120 ms » peut cacher un p99 à 2 s. Sur la latence, alarme sur le **p99** (ou p95). La moyenne est utile pour le CPU, pas pour la douleur utilisateur.
 
-```
-CPU Utilization par service :
-  - service-api: 45%
-  - service-worker: 78%  ← potentiel probleme
-  - service-web: 12%
+### PIÈGE #5 — Confondre annotation et metadata (X-Ray)
 
-Memoire par tache :
-  - task-abc123: 256 Mo / 512 Mo (50%)
-  - task-def456: 490 Mo / 512 Mo (96%)  ← risque OOM
-```
+- **Annotation** = clé/valeur **indexée**, **filtrable** (`annotation.familyId = "x"`), **≤ 50 par trace**. Pour les identifiants (familyId, userId, orderId).
+- **Metadata** = **non indexée**, non filtrable, sans limite stricte. Pour les payloads/objets de contexte.
 
-Container Insights genere automatiquement des dashboards avec ces metriques.
+Mettre un payload volumineux en annotation sature l'index et ne sert à rien ; mettre un identifiant en metadata le rend introuvable par filtre.
+
+### PIÈGE #6 — Croire que X-Ray trace 100 % des requêtes
+
+Par défaut, le SDK échantillonne : **1 requête/seconde + 5 %** du reste. Une requête précise peut n'avoir **aucune trace** (`Sampled=0`). C'est voulu (coût). Pour un debug ciblé ou les écritures critiques, ajuste les **règles de sampling** — ne conclus pas « pas de trace = pas passé ».
+
+### PIÈGE #7 — Métrique haute résolution par défaut
+
+Publier tout en `StorageResolution: 1` (1 s) multiplie les appels `PutMetricData` facturés et n'a d'intérêt que pour du sub-minute réel (trading, temps réel). Pour le feed TribuZen, la **résolution standard (1 min)** suffit largement.
+
+### PIÈGE #8 — Confondre metric filter et PutMetricData
+
+Le **metric filter** dérive une métrique d'un **pattern de log** déjà présent (sans code, rétroactif possible). **`PutMetricData`** publie une métrique **depuis le code** (contrôle total, mais appel API facturé). Pour compter les erreurs déjà loggées → metric filter. Pour une valeur métier précise → PutMetricData (ou EMF).
 
 ---
 
-## Bonnes pratiques
+## 5. Ancrage TribuZen
 
-### Metriques
-- Definissez des **metriques business** (commandes/min, revenus) en plus des metriques techniques
-- Utilisez les **percentiles** (p99) plutot que les moyennes pour la latence
-- Envoyez des metriques custom pour les indicateurs cles de votre application
-- Gardez une granularite de **1 minute** sauf besoin reel de haute resolution
+L'observabilité TribuZen se pose sur l'infra déjà déployée dans les modules précédents :
 
-### Alarmes
-- Configurez des alarmes sur les **metriques critiques** (erreurs 5xx, latence p99, DLQ)
-- Utilisez les **alarmes composites** pour reduire les faux positifs
-- Definissez des **runbooks** (procedures) pour chaque alarme
-- Ne creez pas trop d'alarmes — la fatigue d'alerte mene a l'ignorance des alertes
+| Ressource TribuZen | Ce qu'on observe | Outil |
+|--------------------|------------------|-------|
+| Lambda `post-feed`, `generate-thumbnail` | logs JSON (`requestId`, `durationMs`), `Duration`, `Errors` | Logs + Metrics |
+| API Gateway (stage prod) | `4XXError`, `5XXError`, `Latency`, trace du stage | Metrics + X-Ray |
+| DynamoDB `TribuZenFeed` | `ThrottledRequests`, latence via subsegment X-Ray | Metrics + X-Ray |
+| Métier | `MessagesPostes`, `AvatarsGeneres` (custom) | PutMetricData |
+| Bout en bout | parcours API GW → Lambda → DynamoDB | X-Ray service map |
 
-### Logs
-- Structurez vos logs en **JSON** pour faciliter l'analyse
-- Configurez une **retention** adaptee (ne gardez pas les logs indefiniment)
-- Utilisez les **metric filters** pour transformer les patterns importants en metriques
-- Maitrisez **Logs Insights** pour le troubleshooting rapide
+Mise en place TribuZen :
 
-### Tracing
-- Activez X-Ray sur **tous les services** de votre architecture
-- Ajoutez des **annotations** pour les identifiants metier (orderId, userId)
-- Consultez le **Service Map** regulierement pour comprendre les dependances
-- Utilisez les traces pour identifier les **goulots d'etranglement**
+- **Logs structurés partout** : chaque handler logge `{ level, msg, requestId, familyId, durationMs }`. Rétention 30 j en prod, 7 j en staging.
+- **Métriques custom** : `TribuZen/Feed:MessagesPostes`, `TribuZen/Media:AvatarsGeneres`, résolution standard.
+- **Alarmes → SNS `tribuzen-oncall`** : `5XXError` API Gateway, `ThrottledRequests` DynamoDB, `Errors` Lambda, latence **p99** > 1 s. Alarme **composite** pour ne pas notifier pendant un déploiement.
+- **X-Ray activé** sur API Gateway (stage) + Lambdas, `captureAWSv3Client` sur les clients DynamoDB/S3, annotation `familyId` sur chaque trace.
+- **Dashboard `tribuzen-prod`** : requêtes/min, p99 latence, taux d'erreur, état des alarmes, 10 dernières erreurs (Logs Insights).
+- **IaC** : tout est défini en **CDK** (module 05) — log groups + rétention, alarmes, tracing activé — jamais cliqué à la main.
+
+> Les **secrets** de l'alerting (webhook Slack) vont dans Secrets Manager (module 15). La **discipline SLO/on-call/budget d'erreur** autour de ces alarmes = **cours 16**. Ici, on a posé les *outils AWS* qui produisent le signal.
 
 ---
 
-## Recapitulatif
+## 6. Points clés
 
-| Concept | A retenir |
-|---------|-----------|
-| **CloudWatch Metrics** | Series temporelles (standard + custom + haute resolution) |
-| **Alarmes** | Seuil, anomalie, composite → actions (SNS, Auto Scaling) |
-| **CloudWatch Logs** | Log Events → Streams → Groups, retention configurable |
-| **Logs Insights** | Requetes SQL-like sur les logs (filtre, stats, visualisation) |
-| **Metric Filters** | Transforment des patterns de logs en metriques |
-| **Dashboards** | Vue unifiee des metriques, logs et alarmes |
-| **X-Ray** | Tracing distribue (traces, segments, subsegments) |
-| **Service Map** | Visualisation automatique de l'architecture et des latences |
-| **Synthetics** | Tests automatises simulant les parcours utilisateur |
-| **Container Insights** | Metriques detaillees pour ECS/EKS |
+1. **CloudWatch Logs** : event → stream → **log group** (`/aws/lambda/<fn>`) ; la **rétention** se règle par groupe (jamais « Never expire » en prod).
+2. **Logs structurés JSON** obligatoires : c'est ce qui rend Logs Insights, les metric filters et la corrélation possibles.
+3. **Metrics** : namespace (`AWS/<service>` ou custom), **≤ 30 dimensions** ; résolution **standard 1 min** vs **haute 1 s** (`StorageResolution: 1`, plus cher).
+4. **Métrique custom** via **`PutMetricData`** (ou EMF à fort volume) ; permission `cloudwatch:PutMetricData` requise.
+5. **Périodes** 1/5/10/30 s ou multiple de 60 (défaut 60) ; alarme/lecture latence sur **p99**, pas la moyenne. Rétention des métriques : 3 h / 15 j / 63 j / 455 j selon la période, expiration à 15 mois.
+6. **Logs Insights** : pipeline `fields | filter | stats … by bin() | sort | limit` ; épinglable sur dashboard.
+7. **Alarmes** : états **OK / ALARM / INSUFFICIENT_DATA** ; types **seuil / anomalie / composite** ; actions **SNS**, Auto Scaling, EC2.
+8. **X-Ray** : **trace** (30 j) = segments (≤ 64 ko) + subsegments ; **service map** = nœuds + arêtes avec latence/erreurs ; **sampling** 1/s + 5 % par défaut ; header **`X-Amzn-Trace-Id`**.
+9. **Annotations** (indexées, filtrables, ≤ 50/trace) ≠ **metadata** (non indexées).
+10. **Corrélation** : `awsRequestId` loggé + trace ID en annotation → de « ça rame » à la ligne exacte via métrique → alarme → logs → trace.
+
+---
+
+## 7. Seeds Anki
+
+```
+Quels sont les trois niveaux de CloudWatch Logs, et la convention de nom d'un log group Lambda ?|Log event (une entrée : timestamp + message) → log stream (events d'une même source) → log group (collection de streams, où se règlent rétention et permissions). Lambda écrit dans /aws/lambda/<nom-fonction>.
+Pourquoi logger en JSON structuré plutôt qu'en texte libre dans une Lambda ?|Logs Insights découvre automatiquement les champs d'un event JSON (durationMs, familyId...) et peut alors filtrer, agréger et corréler. Un log texte libre (console.log('done')) n'est ni requêtable ni agrégeable.
+Résolution standard vs haute résolution d'une métrique CloudWatch ?|Standard = granularité 1 minute (toutes les métriques AWS par défaut). Haute = 1 seconde via StorageResolution à 1 sur le point publié ; lisible à 1/5/10/30 s. Plus chère (chaque PutMetricData est facturé) — à réserver au sub-minute réel.
+Comment publier une métrique métier custom à CloudWatch, et quelle permission faut-il ?|Via l'API PutMetricData (@aws-sdk/client-cloudwatch) : Namespace custom, MetricName, Value, Unit, Dimensions. Le role doit porter cloudwatch:PutMetricData. Alternative à fort volume : EMF (JSON spécial dans les logs).
+Pour la latence, quelle statistique surveiller et pourquoi ?|Le p99 (ou p95), pas la moyenne. La moyenne masque les pics : p99 = 1,2 s signifie que 1 % des utilisateurs attendent plus de 1,2 s — ce sont eux qui se plaignent.
+Quels sont les trois états d'une alarme CloudWatch et les trois types ?|États : OK, ALARM, INSUFFICIENT_DATA. Types : à seuil (métrique > X pendant N périodes), anomalie (bande normale apprise), composite (combinaison booléenne AND/OR/NOT d'alarmes). Actions : SNS, Auto Scaling, EC2.
+Segment vs subsegment vs service map en X-Ray ?|Segment = travail d'un service (≤ 64 ko). Subsegment = détail dans un segment (ex. appel DynamoDB), sert à inférer les services non instrumentés. Service map = graphe auto-généré des services (nœuds) et appels (arêtes) avec latence/erreurs/volume. Traces conservées 30 jours.
+Annotations vs metadata X-Ray ?|Annotations = paires clé/valeur INDEXÉES et filtrables (annotation.familyId = "x"), max 50 par trace, pour les identifiants. Metadata = NON indexées, non filtrables, sans limite stricte, pour les payloads/objets de contexte.
+Comment X-Ray échantillonne-t-il par défaut, et pourquoi une requête peut n'avoir aucune trace ?|Par défaut : première requête de chaque seconde + 5 % des suivantes (conservateur pour le coût). Une requête non échantillonnée (Sampled=0) n'a aucune trace — c'est voulu, pas un bug. Ajustable via les règles de sampling.
+Comment corréler un log et une trace pour localiser un goulot ?|Logger context.awsRequestId dans le JSON (retrouve tous les events d'une invocation) et poser le trace ID / des identifiants en annotation X-Ray. Depuis une trace lente du service map, on saute aux logs par requestId, et inversement — de « ça rame » à la ligne exacte.
+```
+
+---
+
+## Pont vers le lab
+
+> Lab associé : `labs/lab-14-cloudwatch-observability/README.md`. Tu déploies une **vraie** Lambda instrumentée dans ton compte AWS : logs JSON, métrique custom `PutMetricData`, alarme à seuil branchée sur SNS, **tracing X-Ray actif**. Tu l'invoques réellement, tu écris une requête **Logs Insights**, tu lis le **service map**, tu déclenches l'alarme — puis tu **détruis** tout (teardown, Free Tier). Corrigé complet, feedback coach, variante J+30.

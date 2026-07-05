@@ -1,685 +1,372 @@
-# Module 12 — ECS & Fargate — Conteneurs sur AWS
+---
+titre: ECS & Fargate — conteneurs longue durée sur AWS
+cours: 12-aws-cloud
+notions: [conteneur vs Lambda, orchestration de conteneurs, cluster ECS, "task definition (blueprint)", "family (versionnée)", containerDefinitions, "networkMode: awsvpc", "requiresCompatibilities: [FARGATE]", executionRoleArn vs taskRoleArn, "combinaisons CPU/mémoire Fargate", task, service, desired count, "launch type Fargate vs EC2", "ALB (Application Load Balancer)", "target group (target-type ip)", listener, health check, ECR, "URI de registre privé", get-login-password, lifecycle policy, rolling update, "minimumHealthyPercent / maximumPercent", service auto scaling, "target tracking (ECSServiceAverageCPUUtilization)"]
+outcomes:
+  - sait décider entre une Lambda et un conteneur ECS/Fargate à partir de la nature de la charge (durée, état, connexions persistantes)
+  - sait lire et écrire une task definition Fargate valide (family, CPU/mémoire compatibles, networkMode awsvpc, execution role vs task role)
+  - sait câbler un service ECS derrière un ALB avec target group target-type ip et health check
+  - sait pousser une image vers ECR et configurer un service auto scaling en target tracking
+prerequis: [Module 00 — compte, régions, CLI, Module 01 — IAM roles, Module 02 — VPC et subnets, Module 03 — EC2, Module 04 — S3, Module 05 — CDK, Module 06 — Lambda]
+next: 13-cloudfront-cdn
+libs: []
+tribuzen: infra cloud TribuZen — service temps réel de présence familiale (WebSocket longue durée) déployé en conteneur Fargate derrière un ALB, complément de l'API Lambda
+last-reviewed: 2026-07
+---
 
-> **Objectif** : Comprendre les concepts fondamentaux d'ECS (Cluster, Service, Task Definition), déployer des conteneurs Docker avec Fargate, configurer le load balancing, l'auto scaling, le logging, et comparer ECS avec EKS.
+# ECS & Fargate — conteneurs longue durée sur AWS
+
+> **Outcomes — tu sauras FAIRE :** décider Lambda vs conteneur selon la charge, écrire une task definition Fargate valide, câbler un service ECS derrière un ALB, pousser une image vers ECR et configurer l'auto scaling en target tracking.
+> **Difficulté :** :star::star::star:
 >
-> **Difficulté** : ⭐⭐⭐ (avancé)
->
-> **Prérequis** : Module 01 (IAM), notions Docker de base, Module 10 (CDK recommandé)
->
-> **Durée estimée** : 4h
+> **Portée :** ce module couvre **ECS et Fargate seuls** — l'orchestration de conteneurs longue durée. Il se **compare** à deux briques déjà vues : **Lambda** (module 06, calcul serverless par requête, 15 min max, stateless) et **EC2** (module 03, la VM brute que tu gères). Ici on répond à : *quand un conteneur qui tourne en permanence bat une Lambda, et comment le déployer sur AWS sans gérer de serveur ?* Le CDN devant l'ALB est le **module 13** ; l'observabilité (logs, X-Ray) le **module 14** ; Kubernetes/EKS est **hors périmètre** de ce parcours.
+
+## 1. Cas concret d'abord
+
+Tu montes l'infra AWS de TribuZen. L'API métier (poster un message, générer une miniature) tourne déjà en **Lambda + API Gateway** — parfait pour des requêtes courtes et sans état (module 06). Nouveau besoin : une **présence temps réel**. Quand une famille est connectée, chaque membre doit voir en direct qui est en ligne et recevoir les messages instantanément. Techniquement : un serveur **WebSocket** qui maintient des **connexions ouvertes en permanence** et pousse des events.
+
+Un collègue propose : « on met ça en Lambda comme le reste ». Tu vois trois murs immédiats :
+
+1. Une Lambda a un **timeout de 900 s (15 min) maximum** (module 06, §2.8). Une connexion WebSocket de présence reste ouverte **des heures**. Le modèle « une invocation = une requête qui finit » ne colle pas à une connexion longue durée.
+2. Lambda est **stateless** : l'environnement est gelé/recyclé entre invocations. Maintenir en mémoire la liste des sockets connectés d'une famille, y pousser un message, ça suppose un **process qui vit** — pas une fonction qui s'éteint.
+3. Le serveur WebSocket, c'est du code Node.js déjà écrit (`ws`, Socket.IO) qu'on veut **empaqueter tel quel** dans une image Docker et faire tourner, pas réécrire en handler événementiel.
+
+L'autre extrême serait de louer une **EC2** (module 03), y installer Node, `git pull`, lancer le process avec pm2… et se retrouver à patcher l'OS, gérer le redémarrage, le scaling à la main. Trop d'ops.
+
+Le bon outil au milieu : **ECS sur Fargate**. Tu construis une **image Docker** de ton serveur WebSocket, tu la pousses dans **ECR** (le Docker Hub privé d'AWS), tu décris une **task definition** (image + CPU + mémoire + rôle), et un **service** ECS maintient en permanence N copies (**tasks**) derrière un **ALB**. **Fargate** exécute ces conteneurs **sans que tu gères la moindre machine** : pas d'OS à patcher, pas de SSH. À la fin de ce module, tu sais faire exactement ça, et surtout **choisir** entre Lambda, Fargate et EC2 sur des critères, pas au feeling.
 
 ---
 
-## Table des matières
+## 2. Théorie complète, concise
 
-1. [Pourquoi des conteneurs sur AWS](#1-pourquoi-des-conteneurs-sur-aws)
-2. [Docker : rappels essentiels](#2-docker--rappels-essentiels)
-3. [ECS — Concepts fondamentaux](#3-ecs--concepts-fondamentaux)
-4. [Launch Types : EC2 vs Fargate](#4-launch-types--ec2-vs-fargate)
-5. [ECR — Elastic Container Registry](#5-ecr--elastic-container-registry)
-6. [Créer et déployer un service](#6-créer-et-déployer-un-service)
-7. [Load Balancing avec ALB](#7-load-balancing-avec-alb)
-8. [Service Discovery](#8-service-discovery)
-9. [Auto Scaling](#9-auto-scaling)
-10. [Logging avec CloudWatch](#10-logging-avec-cloudwatch)
-11. [ECS vs EKS](#11-ecs-vs-eks)
-12. [CDK pour ECS Fargate](#12-cdk-pour-ecs-fargate)
-13. [Bonnes pratiques](#13-bonnes-pratiques)
-14. [Récapitulatif](#14-récapitulatif)
+### 2.1 Conteneur vs Lambda vs EC2 — le bon niveau d'abstraction
 
----
+Trois façons d'exécuter du code sur AWS, du plus « géré » au plus « brut » :
 
-## 1. Pourquoi des conteneurs sur AWS
+| Brique | Tu fournis | AWS gère | Modèle |
+|--------|------------|----------|--------|
+| **Lambda** (mod. 06) | un handler | tout (OS, runtime, scaling) | 1 invocation = 1 requête, ≤ 15 min, stateless |
+| **ECS + Fargate** | une **image Docker** | l'OS et l'hôte (serverless) | un **process qui tourne en continu** |
+| **ECS + EC2** / EC2 brut (mod. 03) | image (ou tout) + **les instances** | rien de l'hôte | tu gères les VM |
 
-### 1.1 Le problème des déploiements traditionnels
+Règle de décision : **charge courte, événementielle, sans état → Lambda**. **Process longue durée, connexions persistantes, image existante, framework qui veut un serveur (NestJS, WebSocket, worker) → conteneur**. **Besoin de GPU, d'accès SSH, de charges très stables optimisées en Reserved Instances → EC2**.
 
-Déployer des applications sur des machines virtuelles (EC2) pose des défis :
+### 2.2 ECS — le vocabulaire (vérifié doc « What is Amazon ECS »)
 
-- **"Ça marche sur ma machine"** : différences entre les environnements
-- **Densité faible** : une VM par application gaspille des ressources
-- **Déploiements lents** : provisionner une VM prend des minutes
-- **Dépendances conflictuelles** : deux apps sur la même VM peuvent avoir besoin de versions différentes de Node.js
+**Amazon ECS** (Elastic Container Service) est le service d'**orchestration de conteneurs** natif d'AWS : il place, démarre, surveille et remplace tes conteneurs. Quatre objets, du contenant au contenu :
 
-Les conteneurs résolvent ces problèmes en **empaquetant l'application avec toutes ses dépendances** dans une image portable.
+| Objet | Définition (doc AWS) | Analogie |
+|-------|----------------------|----------|
+| **Cluster** | l'infrastructure sur laquelle tourne l'application (regroupement logique) | l'atelier |
+| **Task definition** | le **blueprint** de l'application (image, CPU, mémoire, ports, rôles) | le plan de fabrication |
+| **Task** | une **instance en cours** d'une task definition (1+ conteneurs) | un exemplaire produit |
+| **Service** | une **application longue durée** qui maintient N tasks saines | le contremaître qui garantit N exemplaires |
 
-> **Analogie** : Un conteneur Docker, c'est comme un container maritime standardisé. Peu importe ce qu'il contient (meubles, voitures, nourriture), il se charge et se décharge de la même manière sur n'importe quel navire, camion ou train. Le conteneur Docker fait la même chose pour les applications.
+Une **task** peut être ponctuelle (un batch qui fait un travail puis s'arrête). Un **service** est fait pour le **long-running** : il relance une task qui meurt, tient le **desired count**, s'intègre à l'ALB et à l'auto scaling. Pour la présence TribuZen, c'est un **service**.
 
-### 1.2 Les options de conteneurs sur AWS
+### 2.3 La task definition — le blueprint
 
-| Service | Description | Gestion des serveurs |
-|---|---|---|
-| **ECS + Fargate** | Orchestration AWS-native, serverless | Aucune (AWS gère) |
-| **ECS + EC2** | Orchestration AWS-native sur vos instances | Vous gérez les EC2 |
-| **EKS** | Kubernetes managé | Partielle (control plane géré) |
-| **EKS + Fargate** | Kubernetes managé, serverless | Aucune |
-| **App Runner** | PaaS conteneurs (le plus simple) | Aucune |
-
----
-
-## 2. Docker : rappels essentiels
-
-### 2.1 Dockerfile typique pour une app Node.js
-
-```dockerfile
-# Étape 1 : Build
-FROM node:20-alpine AS builder
-WORKDIR /app
-COPY package.json pnpm-lock.yaml ./
-RUN corepack enable && pnpm install --frozen-lockfile
-COPY . .
-RUN pnpm build
-
-# Étape 2 : Production
-FROM node:20-alpine AS production
-WORKDIR /app
-RUN addgroup -g 1001 appgroup && adduser -u 1001 -G appgroup -s /bin/sh -D appuser
-COPY --from=builder /app/dist ./dist
-COPY --from=builder /app/node_modules ./node_modules
-COPY --from=builder /app/package.json ./
-USER appuser
-EXPOSE 3000
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD wget --no-verbose --tries=1 --spider http://localhost:3000/health || exit 1
-CMD ["node", "dist/main.js"]
-```
-
-### 2.2 Commandes Docker essentielles
-
-```bash
-# Construire l'image
-docker build -t my-app:latest .
-
-# Lancer localement
-docker run -p 3000:3000 -e NODE_ENV=production my-app:latest
-
-# Vérifier que le conteneur fonctionne
-docker ps
-docker logs <container-id>
-```
-
-### 2.3 Bonnes pratiques Docker
-
-| Pratique | Raison |
-|---|---|
-| **Multi-stage build** | Image finale plus petite (pas de devDependencies) |
-| **Image Alpine** | ~50 Mo au lieu de ~900 Mo (Debian) |
-| **Utilisateur non-root** | Sécurité (ne pas exécuter en root) |
-| **HEALTHCHECK** | ECS/Fargate l'utilise pour vérifier la santé du conteneur |
-| **`.dockerignore`** | Exclure `node_modules`, `.git`, etc. du contexte de build |
-
----
-
-## 3. ECS — Concepts fondamentaux
-
-### 3.1 Architecture
-
-```
-ECS Cluster
-  └── Service (maintient N tâches en cours d'exécution)
-        └── Task (instance d'une Task Definition)
-              └── Container(s) (un ou plusieurs conteneurs)
-```
-
-### 3.2 Les quatre composants clés
-
-| Composant | Description | Analogie |
-|---|---|---|
-| **Cluster** | Regroupement logique de services | Un entrepôt qui contient des chaînes de production |
-| **Task Definition** | Blueprint d'une tâche (image, CPU, mémoire, ports, env vars) | Le plan de fabrication d'un produit |
-| **Task** | Instance en cours d'exécution d'une Task Definition | Un produit en cours de fabrication |
-| **Service** | Maintient un nombre désiré de Tasks en cours d'exécution | Le contremaître qui s'assure que N produits sont toujours en production |
-
-### 3.3 Task Definition — Le blueprint
-
-Une Task Definition décrit **comment** exécuter un conteneur :
+C'est un document JSON versionné. Chaque enregistrement crée une nouvelle **révision** d'une **family** (`my-api:1`, `my-api:2`…). Champs structurants pour Fargate :
 
 ```json
 {
-  "family": "my-api",
+  "family": "tribuzen-presence",
   "networkMode": "awsvpc",
   "requiresCompatibilities": ["FARGATE"],
-  "cpu": "256",
-  "memory": "512",
-  "executionRoleArn": "arn:aws:iam::123456789:role/ecsTaskExecutionRole",
-  "taskRoleArn": "arn:aws:iam::123456789:role/ecsTaskRole",
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "arn:aws:iam::123456789012:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::123456789012:role/tribuzenPresenceTaskRole",
   "containerDefinitions": [
     {
-      "name": "api",
-      "image": "123456789.dkr.ecr.eu-west-1.amazonaws.com/my-api:latest",
+      "name": "presence",
+      "image": "123456789012.dkr.ecr.eu-west-1.amazonaws.com/tribuzen-presence:latest",
       "portMappings": [{ "containerPort": 3000, "protocol": "tcp" }],
-      "environment": [
-        { "name": "NODE_ENV", "value": "production" }
-      ],
-      "secrets": [
-        { "name": "DB_PASSWORD", "valueFrom": "arn:aws:ssm:eu-west-1:123456789:parameter/prod/db-password" }
-      ],
+      "environment": [{ "name": "NODE_ENV", "value": "production" }],
       "logConfiguration": {
         "logDriver": "awslogs",
         "options": {
-          "awslogs-group": "/ecs/my-api",
+          "awslogs-group": "/ecs/tribuzen-presence",
           "awslogs-region": "eu-west-1",
-          "awslogs-stream-prefix": "api"
+          "awslogs-stream-prefix": "presence"
         }
-      },
-      "healthCheck": {
-        "command": ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/health || exit 1"],
-        "interval": 30,
-        "timeout": 5,
-        "retries": 3,
-        "startPeriod": 60
       }
     }
   ]
 }
 ```
 
-### 3.4 Deux rôles IAM distincts
+- **`family`** : le nom logique ; chaque `register-task-definition` incrémente la révision.
+- **`networkMode: awsvpc`** : chaque task reçoit sa **propre interface réseau (ENI)** et sa propre IP dans le VPC. C'est **obligatoire pour Fargate**.
+- **`requiresCompatibilities`** : `["FARGATE"]` et/ou `["EC2"]` — le(s) launch type(s) visé(s).
+- **`cpu` / `memory`** : au **niveau task** ; en Fargate ils doivent former une **combinaison valide** (voir 2.4).
+- **`containerDefinitions`** : un ou plusieurs conteneurs (image ECR, ports, env, logs).
 
-| Rôle | Utilisé par | Permissions typiques |
-|---|---|---|
-| **Execution Role** | L'agent ECS (pull image, écrire logs) | ECR pull, CloudWatch Logs, SSM/Secrets Manager |
-| **Task Role** | L'application dans le conteneur | DynamoDB, S3, SQS — selon les besoins métier |
+### 2.4 Combinaisons CPU / mémoire Fargate (valeurs exactes — vérifiées doc)
 
-> **Règle** : L'Execution Role est pour l'infrastructure (ECS a besoin de récupérer l'image). Le Task Role est pour votre code applicatif.
+En Fargate, on ne choisit pas n'importe quel couple : le `cpu` détermine une **plage de mémoire** autorisée (doc « Invalid CPU or memory »). Mémoire exprimée en MiB.
 
----
+| CPU (task) | Valeurs mémoire autorisées |
+|------------|-----------------------------|
+| **256** (.25 vCPU) | 512 MiB, 1 Go, 2 Go |
+| **512** (.5 vCPU) | 1 à 4 Go (pas de 1 Go) — 1, 2, 3, 4 Go |
+| **1024** (1 vCPU) | 2 à 8 Go (par 1 Go) |
+| **2048** (2 vCPU) | 4 à 16 Go (par 1 Go) |
+| **4096** (4 vCPU) | 8 à 30 Go (par 1 Go) |
+| **8192** (8 vCPU) | 16 à 60 Go (par 4 Go) |
+| **16384** (16 vCPU) | 32 à 120 Go (par 8 Go) |
 
-## 4. Launch Types : EC2 vs Fargate
+Un couple hors table → l'API renvoie `ClientException: Invalid 'cpu' setting`. Pour la présence TribuZen (peu gourmande, surtout des sockets I/O), **512 CPU / 1024 MiB** suffit.
 
-| Critère | EC2 | Fargate |
-|---|---|---|
-| **Gestion des serveurs** | Vous gérez les instances EC2 | AWS gère tout |
-| **Scaling** | Vous scalez les instances + les tâches | Vous scalez les tâches uniquement |
-| **Coût** | Moins cher à forte charge (Reserved Instances) | Pay-per-task, plus cher par unité |
-| **Accès SSH** | Oui | Non |
-| **GPU** | Supporté | Non supporté |
-| **Placement** | Contrôle fin (AZ, instance type) | Automatique |
-| **Configuration réseau** | `bridge`, `host`, ou `awsvpc` | `awsvpc` uniquement |
-| **Idéal pour** | Charges stables, besoin de GPU, coûts optimisés | Charges variables, équipes petites, pas d'ops |
+### 2.5 Deux rôles IAM distincts (piège classique)
 
-> **Recommandation** : Commencez avec **Fargate**. Passez à EC2 uniquement si vous avez besoin de GPU, de charges très stables justifiant des Reserved Instances, ou d'un accès SSH pour le debugging.
+| Rôle | Endossé par | Sert à |
+|------|-------------|--------|
+| **Execution role** (`executionRoleArn`) | l'**agent ECS / Fargate** | **pull** l'image depuis ECR, écrire les logs CloudWatch, lire les secrets |
+| **Task role** (`taskRoleArn`) | **ton code** dans le conteneur | appeler DynamoDB, S3, SQS… selon le besoin métier |
 
----
+L'execution role est de l'**infrastructure** (récupérer l'image, sinon la task ne démarre pas). Le task role suit le **moindre privilège** (module 01) pour l'appli. Les confondre est l'erreur n°1 des débutants ECS.
 
-## 5. ECR — Elastic Container Registry
+### 2.6 Launch type : Fargate vs EC2
 
-### 5.1 Concept
+Deux façons de fournir la **capacité** (où tournent les conteneurs) pour la même task definition :
 
-ECR est le **registre d'images Docker privé** d'AWS. C'est comme Docker Hub, mais intégré à votre compte AWS avec le contrôle d'accès IAM.
+| Critère | **Fargate** | **EC2 launch type** |
+|---------|-------------|----------------------|
+| Serveurs | AWS gère tout (serverless) | tu gères les instances EC2 du cluster |
+| Scaling | tu scales les **tasks** | tu scales **tasks + instances** |
+| Accès SSH / GPU | non | oui |
+| networkMode | `awsvpc` imposé | `awsvpc`, `bridge`, `host` |
+| Coût | pay-per-task, plus cher/unité | moins cher à forte charge stable (Reserved) |
+| Idéal | petites équipes, zéro ops, charge variable | GPU, très gros volume stable |
 
-### 5.2 Commandes essentielles
+**Recommandation** : démarre en **Fargate**. Passe à EC2 seulement si un besoin précis (GPU, coût à l'échelle) le justifie. TribuZen = Fargate.
+
+### 2.7 ECR — le registre d'images privé (vérifié doc)
+
+**Amazon ECR** (Elastic Container Registry) est le **registre Docker privé** d'AWS, avec contrôle d'accès **IAM** et **scan de vulnérabilités**. C'est de là que Fargate **pull** l'image au démarrage d'une task.
+
+Cycle de vie d'une image (commandes exactes doc) :
 
 ```bash
-# Créer un repository
-aws ecr create-repository \
-  --repository-name my-api \
-  --image-scanning-configuration scanOnPush=true \
-  --encryption-configuration encryptionType=AES256
+# 1. Créer un dépôt
+aws ecr create-repository --repository-name tribuzen-presence --region eu-west-1
 
-# S'authentifier auprès d'ECR
-aws ecr get-login-password --region eu-west-1 | \
-  docker login --username AWS --password-stdin 123456789.dkr.ecr.eu-west-1.amazonaws.com
+# 2. Authentifier Docker auprès du registre (token via get-login-password)
+aws ecr get-login-password --region eu-west-1 \
+  | docker login --username AWS --password-stdin 123456789012.dkr.ecr.eu-west-1.amazonaws.com
 
-# Tagger et pousser l'image
-docker tag my-api:latest 123456789.dkr.ecr.eu-west-1.amazonaws.com/my-api:latest
-docker push 123456789.dkr.ecr.eu-west-1.amazonaws.com/my-api:latest
+# 3. Taguer l'image locale avec l'URI du registre
+docker tag tribuzen-presence:latest \
+  123456789012.dkr.ecr.eu-west-1.amazonaws.com/tribuzen-presence:latest
 
-# Lister les images
-aws ecr list-images --repository-name my-api
+# 4. Pousser
+docker push 123456789012.dkr.ecr.eu-west-1.amazonaws.com/tribuzen-presence:latest
 ```
 
-### 5.3 Lifecycle Policies
+- **URI de registre** : `AWS_ACCOUNT_ID.dkr.ecr.RÉGION.amazonaws.com`, suivi de `/dépôt:tag`.
+- **`get-login-password`** : demande `ecr:GetAuthorizationToken` ; le username Docker est littéralement `AWS`.
+- **Lifecycle policy** : règles de nettoyage automatique (ex. « ne garder que les 10 dernières images ») pour ne pas payer du stockage mort.
+- **Scan on push** : active `scanOnPush` pour détecter les CVE à chaque poussée.
 
-Pour éviter l'accumulation d'images inutilisées (et les coûts de stockage) :
+### 2.8 Exposer le service : ALB, target group, listener (vérifié doc ELB)
 
-```bash
-aws ecr put-lifecycle-policy \
-  --repository-name my-api \
-  --lifecycle-policy-text '{
-    "rules": [
-      {
-        "rulePriority": 1,
-        "description": "Garder les 10 dernières images",
-        "selection": {
-          "tagStatus": "any",
-          "countType": "imageCountMoreThan",
-          "countNumber": 10
-        },
-        "action": { "type": "expire" }
-      }
-    ]
-  }'
+Un **Application Load Balancer** (ALB, couche 7 HTTP/HTTPS) distribue le trafic entrant entre les tasks et fait des **health checks** pour retirer une task défaillante.
+
+```
+Internet → ALB (listener :443)
+              └── règle → Target Group (target-type: ip, port 3000)
+                              ├── task A (IP privée, AZ a)
+                              └── task B (IP privée, AZ b)
 ```
 
----
+- **Listener** : écoute un port/protocole (ex. HTTPS 443) et route selon des règles.
+- **Target group** : le groupe de cibles. En Fargate `awsvpc`, chaque task a **sa propre IP** → le target group doit être **`target-type: ip`** (pas `instance`).
+- **Health check** : chemin (`/health`), intervalle, seuils sain/malsain. Une task qui échoue est sortie de la rotation ; le service en relance une.
+- On lie le service à l'ALB via `--load-balancers` (targetGroupArn + containerName + containerPort). Derrière un ALB, les tasks sont en **subnets privés** → `assignPublicIp: DISABLED`.
 
-## 6. Créer et déployer un service
-
-### 6.1 Créer un cluster
-
-```bash
-aws ecs create-cluster --cluster-name my-app-cluster
-```
-
-### 6.2 Enregistrer une Task Definition
+### 2.9 Créer et déployer un service
 
 ```bash
-aws ecs register-task-definition \
-  --cli-input-json file://task-definition.json
-```
+aws ecs create-cluster --cluster-name tribuzen-cluster
 
-### 6.3 Créer un service Fargate
+aws ecs register-task-definition --cli-input-json file://task-definition.json
 
-```bash
 aws ecs create-service \
-  --cluster my-app-cluster \
-  --service-name my-api-service \
-  --task-definition my-api:1 \
+  --cluster tribuzen-cluster \
+  --service-name tribuzen-presence \
+  --task-definition tribuzen-presence:1 \
   --desired-count 2 \
   --launch-type FARGATE \
-  --network-configuration '{
-    "awsvpcConfiguration": {
-      "subnets": ["subnet-aaaaa", "subnet-bbbbb"],
-      "securityGroups": ["sg-12345"],
-      "assignPublicIp": "ENABLED"
-    }
-  }'
+  --load-balancers targetGroupArn=arn:...:targetgroup/tz-presence-tg/abc,containerName=presence,containerPort=3000 \
+  --network-configuration 'awsvpcConfiguration={subnets=[subnet-a,subnet-b],securityGroups=[sg-123],assignPublicIp=DISABLED}'
 ```
 
-### 6.4 Mettre à jour un service (nouveau déploiement)
+- **`desired-count`** : nombre de tasks que le service maintient (≥ 2 en prod, réparties sur plusieurs AZ = haute dispo).
+- **Rolling update** : à chaque nouvelle révision (`update-service --task-definition ...:2` ou `--force-new-deployment`), ECS remplace les tasks **progressivement**, encadré par `minimumHealthyPercent` (défaut 100 % — jamais moins de N saines) et `maximumPercent` (défaut 200 % — peut doubler temporairement). Zéro downtime.
+
+### 2.10 Service auto scaling (target tracking — vérifié doc)
+
+ECS **augmente ou diminue le desired count** automatiquement via Application Auto Scaling. Le plus simple : **target tracking** — vise une métrique cible, ECS ajuste seul.
 
 ```bash
-# Forcer un nouveau déploiement avec la dernière image
-aws ecs update-service \
-  --cluster my-app-cluster \
-  --service my-api-service \
-  --force-new-deployment
-```
-
-### 6.5 Rolling Update (stratégie de déploiement)
-
-ECS déploie les nouvelles tâches progressivement :
-
-```
-Avant : [Task v1] [Task v1]
-Étape 1 : [Task v1] [Task v1] [Task v2]  ← nouvelle tâche lancée
-Étape 2 : [Task v1] [Task v2] [Task v2]  ← ancienne tâche arrêtée
-Étape 3 : [Task v2] [Task v2]            ← déploiement terminé
-```
-
-Configuration :
-- `minimumHealthyPercent: 100` — toujours au moins N tâches saines
-- `maximumPercent: 200` — peut temporairement doubler le nombre de tâches
-
----
-
-## 7. Load Balancing avec ALB
-
-### 7.1 Architecture
-
-```
-Internet → ALB (Application Load Balancer)
-              ├── Target Group → Task 1 (AZ a)
-              └── Target Group → Task 2 (AZ b)
-```
-
-L'ALB distribue le trafic entre les tâches ECS et effectue des **health checks** pour retirer les tâches défaillantes.
-
-### 7.2 Configuration via CLI
-
-```bash
-# Créer un Target Group
-aws elbv2 create-target-group \
-  --name my-api-tg \
-  --protocol HTTP \
-  --port 3000 \
-  --vpc-id vpc-12345 \
-  --target-type ip \
-  --health-check-path /health \
-  --health-check-interval-seconds 30 \
-  --healthy-threshold-count 2 \
-  --unhealthy-threshold-count 3
-
-# Créer le service avec le load balancer
-aws ecs create-service \
-  --cluster my-app-cluster \
-  --service-name my-api-service \
-  --task-definition my-api:1 \
-  --desired-count 2 \
-  --launch-type FARGATE \
-  --load-balancers '[{
-    "targetGroupArn": "arn:aws:elasticloadbalancing:eu-west-1:123456789:targetgroup/my-api-tg/abc123",
-    "containerName": "api",
-    "containerPort": 3000
-  }]' \
-  --network-configuration '{
-    "awsvpcConfiguration": {
-      "subnets": ["subnet-aaaaa", "subnet-bbbbb"],
-      "securityGroups": ["sg-12345"],
-      "assignPublicIp": "DISABLED"
-    }
-  }'
-```
-
-> Quand les tâches sont derrière un ALB, `assignPublicIp` devrait être `DISABLED`. Le trafic passe par l'ALB.
-
----
-
-## 8. Service Discovery
-
-### 8.1 Concept
-
-Le **Service Discovery** permet à vos services ECS de se trouver mutuellement par nom DNS, sans passer par un load balancer. C'est essentiel pour la communication inter-services.
-
-```
-Service A → orders.my-app.local (DNS) → Service B (tâches ECS)
-```
-
-### 8.2 AWS Cloud Map
-
-ECS utilise **AWS Cloud Map** pour le service discovery :
-
-```bash
-# Créer un namespace privé (zone DNS interne au VPC)
-aws servicediscovery create-private-dns-namespace \
-  --name my-app.local \
-  --vpc vpc-12345
-
-# Créer un service dans le namespace
-aws servicediscovery create-service \
-  --name orders \
-  --namespace-id ns-12345 \
-  --dns-config '{
-    "DnsRecords": [{"Type": "A", "TTL": 10}]
-  }'
-```
-
-Le service est alors accessible à l'adresse `orders.my-app.local` depuis n'importe quel conteneur dans le VPC.
-
----
-
-## 9. Auto Scaling
-
-### 9.1 Types de scaling
-
-| Type | Déclencheur | Exemple |
-|---|---|---|
-| **Target Tracking** | Maintenir une métrique à une valeur cible | CPU moyen à 60 % |
-| **Step Scaling** | Seuils avec paliers | CPU > 70 % → +2 tâches, CPU > 90 % → +4 tâches |
-| **Scheduled Scaling** | Horaire prédéfini | 10 tâches de 8h à 20h, 2 tâches la nuit |
-
-### 9.2 Target Tracking (recommandé)
-
-```bash
-# Enregistrer le service comme cible scalable
 aws application-autoscaling register-scalable-target \
   --service-namespace ecs \
-  --resource-id service/my-app-cluster/my-api-service \
+  --resource-id service/tribuzen-cluster/tribuzen-presence \
   --scalable-dimension ecs:service:DesiredCount \
-  --min-capacity 2 \
-  --max-capacity 20
+  --min-capacity 2 --max-capacity 10
 
-# Politique de scaling basée sur le CPU
 aws application-autoscaling put-scaling-policy \
-  --service-namespace ecs \
-  --resource-id service/my-app-cluster/my-api-service \
+  --service-namespace ecs --policy-name cpu60 \
+  --resource-id service/tribuzen-cluster/tribuzen-presence \
   --scalable-dimension ecs:service:DesiredCount \
-  --policy-name cpu-tracking \
   --policy-type TargetTrackingScaling \
-  --target-tracking-scaling-policy-configuration '{
-    "TargetValue": 60.0,
-    "PredefinedMetricSpecification": {
-      "PredefinedMetricType": "ECSServiceAverageCPUUtilization"
-    },
-    "ScaleInCooldown": 300,
-    "ScaleOutCooldown": 60
-  }'
+  --target-tracking-scaling-policy-configuration \
+    '{"TargetValue":60.0,"PredefinedMetricSpecification":{"PredefinedMetricType":"ECSServiceAverageCPUUtilization"},"ScaleInCooldown":300,"ScaleOutCooldown":60}'
 ```
 
-### 9.3 Métriques disponibles pour le scaling
+Métriques prédéfinies : **`ECSServiceAverageCPUUtilization`**, `ECSServiceAverageMemoryUtilization`, `ALBRequestCountPerTarget`. Cooldowns : monter vite (60 s), redescendre prudemment (300 s) pour ne pas osciller.
 
-| Métrique | Description |
-|---|---|
-| `ECSServiceAverageCPUUtilization` | Utilisation CPU moyenne des tâches |
-| `ECSServiceAverageMemoryUtilization` | Utilisation mémoire moyenne |
-| `ALBRequestCountPerTarget` | Nombre de requêtes par tâche via l'ALB |
-| Métriques CloudWatch custom | N'importe quelle métrique personnalisée |
+### 2.11 Où va le calcul serverless — comparaison finale
+
+| Question | Réponse |
+|----------|---------|
+| Requête courte, sans état, ≤ 15 min ? | **Lambda** (mod. 06) |
+| Process qui vit, connexions ouvertes, image existante ? | **ECS / Fargate** |
+| GPU, SSH, charge stable optimisée ? | **EC2** (mod. 03) |
+| Zéro serveur à gérer ? | **Lambda** ou **Fargate** (les deux serverless) |
 
 ---
 
-## 10. Logging avec CloudWatch
+## 3. Worked examples
 
-### 10.1 Configuration du log driver
+### Exemple 1 — Décider Lambda vs Fargate pour deux besoins TribuZen
 
-Dans la Task Definition, chaque conteneur peut envoyer ses logs stdout/stderr vers CloudWatch Logs :
+Deux charges à placer. On décide **par critères**, pas au feeling.
 
-```json
-{
-  "logConfiguration": {
-    "logDriver": "awslogs",
-    "options": {
-      "awslogs-group": "/ecs/my-api",
-      "awslogs-region": "eu-west-1",
-      "awslogs-stream-prefix": "api",
-      "awslogs-create-group": "true"
-    }
-  }
-}
-```
+**A. `generateThumbnail`** (miniature d'avatar, module 06) : déclenchée par un upload S3, tourne ~300 ms, sans état, s'arrête. → Événementiel, court, stateless : **Lambda**. La mettre en Fargate obligerait à tenir un process 24/7 pour un travail qui dure une fraction de seconde → gaspillage.
 
-### 10.2 Consulter les logs
+**B. `presence`** (qui est en ligne) : maintient des **WebSockets ouverts des heures**, garde en mémoire les sockets d'une famille, pousse des events. → Longue durée, avec état en mémoire, dépasse largement 15 min : **Fargate**. La mettre en Lambda casserait sur le timeout et le modèle stateless.
+
+Raisonnement traçable :
+
+| Critère | `generateThumbnail` | `presence` |
+|---------|---------------------|------------|
+| Durée d'exécution | ~300 ms | heures |
+| État en mémoire entre requêtes | non | oui (sockets) |
+| Déclenchement | événement S3 | connexion cliente permanente |
+| **Verdict** | **Lambda** | **Fargate** |
+
+Les deux **coexistent** dans l'infra TribuZen : Lambda pour l'événementiel court, Fargate pour le temps réel long.
+
+### Exemple 2 — Task definition Fargate valide + service derrière ALB
+
+Objectif : déployer `presence` en 512 CPU / 1024 MiB, 2 tasks, derrière un ALB.
+
+1. **Choisir CPU/mémoire** dans la table 2.4 : 512 CPU autorise 1, 2, 3, 4 Go → **512 / 1024 MiB** valide. (Écrire 512 / 768 échouerait : hors table.)
+2. **Écrire la task definition** (celle du §2.3), avec `networkMode: awsvpc` et `requiresCompatibilities: ["FARGATE"]`. Deux rôles : `ecsTaskExecutionRole` (pull ECR + logs) et `tribuzenPresenceTaskRole` (accès DynamoDB pour lire l'état des familles).
+3. **Pousser l'image** vers ECR (les 4 commandes du §2.7).
+4. **Créer le target group** en `target-type ip` (obligatoire en awsvpc) :
 
 ```bash
-# Créer le log group (si awslogs-create-group n'est pas activé)
-aws logs create-log-group --log-group-name /ecs/my-api
-
-# Consulter les logs récents
-aws logs tail /ecs/my-api --follow --since 1h
-
-# Filtrer les logs (erreurs uniquement)
-aws logs filter-log-events \
-  --log-group-name /ecs/my-api \
-  --filter-pattern "ERROR" \
-  --start-time $(date -d '1 hour ago' +%s000)
+aws elbv2 create-target-group \
+  --name tz-presence-tg --protocol HTTP --port 3000 \
+  --vpc-id vpc-123 --target-type ip \
+  --health-check-path /health --healthy-threshold-count 2 --unhealthy-threshold-count 3
 ```
 
-### 10.3 Structured logging
+5. **Créer le service** lié au target group (commande §2.9), `desired-count 2`, subnets dans **deux AZ**, `assignPublicIp DISABLED` (tasks privées, l'ALB est le seul point d'entrée public).
+6. **Vérifier** : `aws ecs describe-services --cluster tribuzen-cluster --services tribuzen-presence` → `runningCount: 2`, puis `curl https://<ALB-DNS>/health` → `200`.
 
-Pour exploiter efficacement les logs CloudWatch, utilisez le **logging structuré** (JSON) :
+Chaque choix découle d'une contrainte : CPU/mémoire de la table, `target-type ip` du mode réseau, 2 AZ pour la haute dispo. Rien au hasard.
 
-```typescript
-// Dans votre application Node.js
-console.log(JSON.stringify({
-  level: 'info',
-  message: 'Commande traitée',
-  orderId: 'ord-001',
-  duration: 145,
-  timestamp: new Date().toISOString(),
-}))
+---
+
+## 4. Pièges & misconceptions
+
+### PIÈGE #1 — Mettre un process longue durée en Lambda « pour rester serverless »
+
+Fargate est **aussi serverless** (aucun serveur à gérer). « Serverless » ne veut pas dire « Lambda ». Une connexion WebSocket de plusieurs heures cognera le **timeout de 900 s** de Lambda et se heurtera à son modèle stateless. Le bon serverless pour du long-running, c'est **Fargate**, pas un contorsionnement en Lambda.
+
+### PIÈGE #2 — Confondre execution role et task role
+
+L'**execution role** sert à **ECS/Fargate** (pull l'image ECR, écrire les logs) ; sans lui, la task ne **démarre pas**. Le **task role** sert à **ton code** (DynamoDB, S3…). Mettre les permissions applicatives dans l'execution role, ou l'inverse, casse soit le démarrage soit l'appli. Ce sont **deux rôles distincts**, deux responsabilités.
+
+### PIÈGE #3 — Choisir un couple CPU/mémoire hors table Fargate
+
+`cpu: 512` **n'autorise pas** 512 MiB de mémoire (la première ligne valide à 512 CPU est 1 Go). Un couple hors table renvoie `ClientException: Invalid 'cpu' setting`. On **vérifie la table** (2.4) avant d'inventer un couple « logique ». Fargate n'accepte que des combinaisons prédéfinies.
+
+### PIÈGE #4 — Target group en `target-type instance` avec Fargate
+
+En Fargate, `networkMode awsvpc` donne à **chaque task sa propre IP**. Le target group doit donc être **`target-type: ip`**. Le défaut `instance` (adapté à EC2) ne trouvera aucune cible et le health check échouera en boucle. Toujours `ip` avec awsvpc/Fargate.
+
+### PIÈGE #5 — Une seule task, un seul AZ
+
+`desired-count: 1` = **zéro haute dispo** : la task meurt (déploiement, panne AZ) → service indisponible le temps du redémarrage. En prod, **au moins 2 tasks** réparties sur **≥ 2 subnets dans 2 AZ**, derrière l'ALB. C'est la base de la résilience, pas une option.
+
+### PIÈGE #6 — Croire qu'ECS ≈ Kubernetes/EKS obligatoire
+
+ECS est l'orchestrateur **propriétaire AWS**, **simple**, sans control plane à payer. On n'a **pas besoin de Kubernetes (EKS)** pour faire tourner des conteneurs sur AWS. EKS n'a de sens que pour la **portabilité multi-cloud** ou un écosystème K8s existant — hors périmètre TribuZen. Ne pas surdimensionner.
+
+### PIÈGE #7 — Oublier que Fargate + ALB sont facturés en continu
+
+Contrairement à une Lambda (zéro coût à l'arrêt), un **service Fargate** facture **tant que des tasks tournent**, et un **ALB** facture **à l'heure** dès qu'il existe. Laisser un lab tourner un week-end coûte réellement de l'argent. **Teardown systématique** après manip (voir lab).
+
+---
+
+## 5. Ancrage TribuZen
+
+Dans l'infra TribuZen, ECS/Fargate est la brique **« process qui vit »**, en complément de Lambda (« événement court »).
+
+| Charge TribuZen | Où | Pourquoi |
+|-----------------|-----|----------|
+| `presence` (WebSocket temps réel) | **Fargate service** derrière ALB | connexions longues, état en mémoire, > 15 min |
+| API métier (poster message, feed) | **Lambda + API Gateway** (mod. 06/07) | requêtes courtes, sans état |
+| `generateThumbnail` (miniature avatar) | **Lambda** (mod. 06) | événement S3, ~300 ms |
+| worker de modération (batch nocturne long) | **Fargate task** ponctuelle | traitement lourd > 15 min |
+
+Principes appliqués :
+
+- **Image dans ECR** avec `scanOnPush` + lifecycle policy (garder 10 images) ; Fargate pull via l'**execution role**.
+- **Task role de moindre privilège** (module 01) : `presence` n'a que `dynamodb:Query` sur la table des familles, rien d'autre.
+- **CPU/mémoire dimensionnés** par la table Fargate : 512 / 1024 MiB pour un service I/O-bound.
+- **ALB `target-type ip`**, health check `/health`, 2 tasks sur 2 AZ, `assignPublicIp DISABLED` (tasks privées, module 02).
+- **Auto scaling target tracking** sur `ECSServiceAverageCPUUtilization` à 60 %, min 2 / max 10.
+- **Provisionné par le CDK** (module 05) : le construct L3 `ApplicationLoadBalancedFargateService` crée cluster + service + task def + ALB + target group + security group en une déclaration. L'ALB sera plus tard **derrière CloudFront** (module 13), les logs partiront en CloudWatch (module 14).
+
+> L'API Lambda et le service Fargate **cohabitent** : ce n'est pas « l'un ou l'autre » mais « le bon outil par charge ».
+
+---
+
+## 6. Points clés
+
+1. **Conteneur vs Lambda** : Lambda = requête courte, sans état, ≤ 15 min ; **ECS/Fargate** = process **longue durée**, connexions persistantes, image Docker existante ; EC2 = VM brute (GPU, SSH, coût stable).
+2. **Vocabulaire ECS** : **cluster** (infra) → **service** (maintient N tasks longue durée) → **task** (instance en cours) → **task definition** (le blueprint versionné en `family`).
+3. **Task definition Fargate** : `networkMode: awsvpc` **imposé**, `requiresCompatibilities: ["FARGATE"]`, **execution role** (pull ECR + logs) ≠ **task role** (accès applicatif).
+4. **CPU/mémoire Fargate** = combinaisons **prédéfinies** (256 → 512 MiB–2 Go ; 512 → 1–4 Go ; 1024 → 2–8 Go…). Hors table = `Invalid 'cpu' setting`.
+5. **Launch type** : **Fargate** (serverless, zéro serveur, à privilégier) vs **EC2** (tu gères les instances, pour GPU/SSH/coût stable).
+6. **ECR** : registre Docker privé ; URI `ACCOUNT.dkr.ecr.RÉGION.amazonaws.com/dépôt:tag` ; auth via `get-login-password` (username `AWS`) ; lifecycle policy + scan on push.
+7. **ALB** : listener → **target group `target-type ip`** (obligatoire en awsvpc) → tasks ; health check retire les tasks malsaines ; tasks en subnets privés (`assignPublicIp DISABLED`).
+8. **Service** : `desired-count` ≥ 2 sur ≥ 2 AZ ; **rolling update** encadré par `minimumHealthyPercent`/`maximumPercent` ; **auto scaling target tracking** sur `ECSServiceAverageCPUUtilization`. **Fargate + ALB sont payants en continu → teardown.**
+
+---
+
+## 7. Seeds Anki
+
 ```
-
-CloudWatch Logs Insights peut ensuite requêter ces logs structurés :
-
-```
-fields @timestamp, orderId, duration
-| filter level = "error"
-| sort @timestamp desc
-| limit 50
+Quand préférer un conteneur ECS/Fargate à une Lambda ?|Quand la charge est un process longue durée, garde de l'état en mémoire, maintient des connexions persistantes (WebSocket), dépasse le timeout Lambda de 15 min, ou empaquette une image/framework existant. Lambda reste meilleur pour les requêtes courtes, événementielles et sans état.
+Différence entre task, service et task definition dans ECS ?|Task definition = le blueprint versionné (family) : image, CPU, mémoire, ports, rôles. Task = une instance en cours d'exécution de ce blueprint. Service = une application longue durée qui maintient N tasks saines (desired count), gère l'ALB et l'auto scaling.
+Quel networkMode est obligatoire pour Fargate, et quelle conséquence sur l'ALB ?|networkMode awsvpc : chaque task reçoit sa propre interface réseau et sa propre IP. Conséquence : le target group de l'ALB doit être target-type ip (pas instance).
+Execution role vs task role sur une task ECS ?|Execution role : endossé par l'agent ECS/Fargate pour pull l'image ECR et écrire les logs (infrastructure ; sans lui la task ne démarre pas). Task role : endossé par ton code applicatif pour appeler DynamoDB, S3, etc. (moindre privilège).
+Que se passe-t-il si on met cpu=512 et memory=512 en Fargate ?|Erreur ClientException: Invalid 'cpu' setting. À 512 CPU (.5 vCPU) la mémoire valide commence à 1 Go (1, 2, 3 ou 4 Go). Les couples CPU/mémoire Fargate sont prédéfinis par une table.
+Fargate vs EC2 launch type ?|Fargate : serverless, AWS gère l'hôte, tu scales seulement les tasks, awsvpc imposé, pas de SSH/GPU, pay-per-task. EC2 : tu gères les instances du cluster, tu scales tasks + instances, SSH/GPU possibles, moins cher à forte charge stable. Démarrer en Fargate.
+Comment pousser une image vers ECR ?|1) aws ecr create-repository ; 2) aws ecr get-login-password | docker login --username AWS --password-stdin ACCOUNT.dkr.ecr.RÉGION.amazonaws.com ; 3) docker tag image ACCOUNT.dkr.ecr.RÉGION.amazonaws.com/dépôt:tag ; 4) docker push ...:tag.
+Comment configurer l'auto scaling d'un service ECS en target tracking ?|register-scalable-target (dimension ecs:service:DesiredCount, min/max), puis put-scaling-policy de type TargetTrackingScaling avec la métrique prédéfinie ECSServiceAverageCPUUtilization et une valeur cible (ex. 60 %), avec cooldowns scale-in/scale-out.
+Pourquoi un service Fargate doit-il être détruit après un lab, contrairement à une Lambda ?|Une Lambda ne coûte rien à l'arrêt. Un service Fargate facture tant que des tasks tournent, et l'ALB facture à l'heure dès qu'il existe : les laisser tourner coûte réellement de l'argent. D'où le teardown systématique.
 ```
 
 ---
 
-## 11. ECS vs EKS
+## Pont vers le lab
 
-| Critère | ECS | EKS |
-|---|---|---|
-| **Orchestrateur** | Propriétaire AWS | Kubernetes (open source) |
-| **Complexité** | Simple | Complexe |
-| **Courbe d'apprentissage** | Faible (concepts AWS) | Élevée (écosystème K8s) |
-| **Portabilité** | AWS uniquement | Multi-cloud (K8s standard) |
-| **Coût control plane** | Gratuit | ~75 $/mois par cluster |
-| **Écosystème** | Limité (AWS natif) | Vaste (Helm, Istio, ArgoCD, etc.) |
-| **Networking** | Task-level (awsvpc) | Pod-level (CNI, Service Mesh) |
-| **Scaling** | ECS Auto Scaling | HPA, VPA, Karpenter |
-| **CI/CD** | CodePipeline, GitHub Actions | ArgoCD, Flux, Spinnaker |
-| **Idéal pour** | Équipes AWS-native, applications simples | Multi-cloud, microservices complexes, équipes K8s |
-
-### Arbre de décision
-
-```
-Avez-vous besoin de portabilité multi-cloud ?
-  ├── Oui → EKS
-  └── Non → Votre équipe connaît Kubernetes ?
-              ├── Oui → EKS (pour l'écosystème)
-              └── Non → Combien de services ?
-                          ├── < 10 → ECS Fargate (simplicité)
-                          └── > 10 avec service mesh → EKS
-```
-
----
-
-## 12. CDK pour ECS Fargate
-
-Le CDK fournit un Construct L3 (`ApplicationLoadBalancedFargateService`) qui crée en une seule déclaration : le cluster, le service, la task definition, l'ALB, le target group et le security group.
-
-```typescript
-import * as cdk from 'aws-cdk-lib'
-import * as ecs from 'aws-cdk-lib/aws-ecs'
-import * as ecsPatterns from 'aws-cdk-lib/aws-ecs-patterns'
-import * as ec2 from 'aws-cdk-lib/aws-ec2'
-import type { Construct } from 'constructs'
-
-export class ContainerStack extends cdk.Stack {
-  constructor(scope: Construct, id: string, props?: cdk.StackProps) {
-    super(scope, id, props)
-
-    // VPC (ou utiliser un existant)
-    const vpc = new ec2.Vpc(this, 'AppVpc', {
-      maxAzs: 2,
-      natGateways: 1,
-    })
-
-    // Cluster ECS
-    const cluster = new ecs.Cluster(this, 'AppCluster', {
-      vpc,
-      containerInsights: true, // métriques détaillées
-    })
-
-    // Service Fargate avec ALB (L3 Pattern)
-    const service = new ecsPatterns.ApplicationLoadBalancedFargateService(
-      this,
-      'ApiService',
-      {
-        cluster,
-        cpu: 256,
-        memoryLimitMiB: 512,
-        desiredCount: 2,
-        taskImageOptions: {
-          image: ecs.ContainerImage.fromAsset('./docker'), // build local
-          containerPort: 3000,
-          environment: {
-            NODE_ENV: 'production',
-          },
-        },
-        publicLoadBalancer: true,
-        healthCheck: {
-          command: [
-            'CMD-SHELL',
-            'wget --no-verbose --tries=1 --spider http://localhost:3000/health || exit 1',
-          ],
-          interval: cdk.Duration.seconds(30),
-          timeout: cdk.Duration.seconds(5),
-          retries: 3,
-          startPeriod: cdk.Duration.seconds(60),
-        },
-      },
-    )
-
-    // Auto Scaling
-    const scaling = service.service.autoScaleTaskCount({
-      minCapacity: 2,
-      maxCapacity: 20,
-    })
-
-    scaling.scaleOnCpuUtilization('CpuScaling', {
-      targetUtilizationPercent: 60,
-      scaleInCooldown: cdk.Duration.seconds(300),
-      scaleOutCooldown: cdk.Duration.seconds(60),
-    })
-
-    scaling.scaleOnRequestCount('RequestScaling', {
-      requestsPerTarget: 1000,
-      targetGroup: service.targetGroup,
-    })
-
-    // Health check du target group
-    service.targetGroup.configureHealthCheck({
-      path: '/health',
-      healthyThresholdCount: 2,
-      unhealthyThresholdCount: 3,
-      interval: cdk.Duration.seconds(30),
-    })
-
-    // Output
-    new cdk.CfnOutput(this, 'LoadBalancerDNS', {
-      value: service.loadBalancer.loadBalancerDnsName,
-    })
-  }
-}
-```
-
-> Ce Construct L3 crée environ **15 ressources CloudFormation** en une trentaine de lignes de code. C'est la puissance des abstractions CDK.
-
----
-
-## 13. Bonnes pratiques
-
-### 13.1 Images Docker
-
-1. **Multi-stage builds** pour des images minimales
-2. **Image de base Alpine** ou distroless pour la sécurité
-3. **Ne pas exécuter en root** (`USER appuser`)
-4. **Scanner les vulnérabilités** (ECR image scanning activé)
-5. **Tagger les images** avec le commit SHA, pas juste `latest`
-
-### 13.2 Task Definitions
-
-1. **Séparez Execution Role et Task Role** — principe du moindre privilège
-2. **Utilisez Secrets Manager ou SSM** pour les secrets, pas les variables d'environnement en clair
-3. **Définissez un HEALTHCHECK** pour permettre les rolling updates sans downtime
-4. **Limitez CPU et mémoire** pour éviter qu'un conteneur consomme toutes les ressources
-
-### 13.3 Services
-
-1. **Minimum 2 tâches** en production (haute disponibilité)
-2. **Répartissez sur plusieurs AZ** (subnets dans différentes AZ)
-3. **Configurez l'auto scaling** basé sur CPU ou requêtes ALB
-4. **Utilisez les rolling updates** avec `minimumHealthyPercent: 100`
-5. **Surveillez les déploiements** avec `aws ecs describe-services`
-
-### 13.4 Logging et monitoring
-
-1. **Logging structuré** (JSON) pour CloudWatch Logs Insights
-2. **Container Insights** pour les métriques détaillées du cluster
-3. **Alarmes CloudWatch** sur CPU, mémoire, et nombre de tâches saines
-4. **Rétention des logs** configurée (pas infinie — coûts de stockage)
-
----
-
-## 14. Récapitulatif
-
-| Concept | Description |
-|---|---|
-| **ECS** | Service d'orchestration de conteneurs natif AWS |
-| **Fargate** | Launch type serverless (pas de serveurs à gérer) |
-| **Cluster** | Regroupement logique de services |
-| **Task Definition** | Blueprint : image, CPU, mémoire, ports, env vars |
-| **Task** | Instance en cours d'exécution d'une Task Definition |
-| **Service** | Maintient N tâches saines en permanence |
-| **ECR** | Registre d'images Docker privé AWS |
-| **ALB** | Load balancer qui distribue le trafic entre les tâches |
-| **Service Discovery** | DNS interne pour la communication inter-services |
-| **Auto Scaling** | Ajuste le nombre de tâches selon la charge |
-| **Execution Role** | Permissions pour ECS (pull image, écrire logs) |
-| **Task Role** | Permissions pour le code applicatif (DynamoDB, S3, etc.) |
-| **EKS** | Alternative Kubernetes, plus complexe mais portable |
+> Lab associé : `labs/lab-12-ecs-containers/README.md`. Tu construis une **vraie** image Docker d'un mini-service HTTP, tu la pousses dans **ECR**, tu la déploies en **service Fargate derrière un ALB** (via CDK ou CLI), tu **`curl` l'ALB** pour voir la réponse, puis tu **détruis tout** (Fargate + ALB = payants). Corrigé complet, feedback coach, variante J+30.

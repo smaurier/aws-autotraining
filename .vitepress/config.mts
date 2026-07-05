@@ -6,6 +6,19 @@ export default defineConfig({
   lang: 'fr-FR',
   srcDir: '.',
 
+  // Docs statiques : neutralise l'interpolation Vue `{{ }}` en prose (et les `${{ }}`
+  // GitHub Actions dans les labs CI/CD) pour ne pas casser le build SSR.
+  vue: {
+    template: {
+      compilerOptions: {
+        delimiters: ['(%(', ')%)'],
+      },
+    },
+  },
+
+  // Refonte v1 : le cours vit dans modules/ + labs/. Anciens quizzes/screencasts = archive.
+  srcExclude: ['quizzes/**', 'screencasts/**'],
+
   ignoreDeadLinks: true,
 
   themeConfig: {

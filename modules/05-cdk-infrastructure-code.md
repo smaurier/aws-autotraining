@@ -1,727 +1,390 @@
-# Module 05 — CDK — Infrastructure as Code avec TypeScript
+---
+titre: CDK — Infrastructure as Code en TypeScript
+cours: 12-aws-cloud
+notions: [Infrastructure as Code, ClickOps, AWS CDK v2, "paquet unique aws-cdk-lib", "constructs L1 (Cfn)", "constructs L2 (curated)", "constructs L3 (patterns)", "App / Stack / Construct", "scope / id / props", CloudFormation synthétisé, "cdk init", "cdk bootstrap", "cdk synth", "cdk diff", "cdk deploy", "cdk destroy", RemovalPolicy, "grant*() IAM"]
+outcomes:
+  - sait expliquer pourquoi l'IaC remplace le ClickOps et ce que CDK génère sous le capot
+  - sait distinguer un construct L1, L2 et L3 et choisir le bon niveau
+  - sait structurer une App / Stack / Construct et déployer un bucket S3 versionné avec cdk deploy
+  - connaît le cycle cdk init / bootstrap / synth / diff / deploy / destroy et sait détruire ses ressources
+prerequis: [modules 00-04 du cours 12-aws-cloud — compte AWS et CLI configurés (module 00), IAM users/roles/policies et moindre privilège (module 01), S3 buckets/versioning/blocage accès public (module 04), TypeScript fondamentaux]
+next: 06-lambda-serverless
+libs: [{ name: aws-cdk-lib, version: "2" }]
+tribuzen: infrastructure cloud de TribuZen décrite en CDK — première stack versionnée (bucket S3 des avatars) qui servira de socle aux stacks Lambda/API/DynamoDB des modules suivants
+last-reviewed: 2026-07
+---
 
-> **Objectif** : Comprendre les principes de l'Infrastructure as Code, maîtriser les concepts CDK (App, Stack, Construct), déployer des ressources AWS avec du code TypeScript, tester les stacks avec des assertions, et appliquer les bonnes pratiques de structuration.
+# CDK — Infrastructure as Code en TypeScript
+
+> **Outcomes — tu sauras FAIRE :** expliquer l'IaC vs le ClickOps, distinguer les constructs L1/L2/L3, structurer une App/Stack/Construct, et dérouler le cycle `cdk init → bootstrap → synth → diff → deploy → destroy`.
+> **Difficulté :** :star::star::star:
 >
-> **Difficulté** : ⭐⭐⭐ (avancé)
->
-> **Prérequis** : Module 01 (IAM), Module 05 (Lambda), TypeScript de base
->
-> **Durée estimée** : 4h
+> **Portée :** ce module couvre les **fondamentaux CDK** en déployant des ressources déjà vues (un bucket S3 du module 04, un rôle IAM du module 01). Lambda, API Gateway, DynamoDB, SQS/SNS arrivent aux **modules 06+** : ici on apprend l'outil, pas de nouveaux services. Les tests de stack (`aws-cdk-lib/assertions`), les Aspects et les frameworks au-dessus du CDK (SST) sont hors périmètre.
+
+## 1. Cas concret d'abord
+
+Tu as créé pour TribuZen, à la main dans la console AWS, le bucket S3 qui stocke les avatars des familles : versioning activé, accès public bloqué, chiffrement `S3_MANAGED`. Ça marche. Puis on te demande **le même bucket en environnement de staging**, dans une autre région.
+
+Tu rouvres la console. Tu cliques. Tu oublies de cocher « Block all public access ». Trois semaines plus tard, un avatar fuite publiquement. Personne ne peut dire **quand** ni **pourquoi** la case a changé : aucun historique, aucune revue, aucun moyen de recréer à l'identique.
+
+C'est le problème du **ClickOps** (piloter l'infra à la souris) :
+
+- **Non reproductible** : impossible de recréer exactement le même environnement.
+- **Non versionné** : pas d'historique Git, pas de code review sur un changement d'infra.
+- **Sujet aux erreurs** : une case oubliée = une faille en prod.
+- **Non testable** : rien ne valide la config avant qu'elle soit en ligne.
+
+Ce que tu veux à la place : **décrire** le bucket une fois, en TypeScript, versionné dans Git, et le déployer à l'identique en dev, staging et prod. C'est l'**Infrastructure as Code (IaC)**, et l'outil AWS pour le faire en TypeScript est le **CDK**. À la fin de ce module, le bucket avatars de TribuZen sera dans `lib/storage-stack.ts`, revu en pull request, déployable en une commande — et **détruisible** en une autre.
 
 ---
 
-## Table des matières
+## 2. Théorie complète, concise
 
-1. [Pourquoi l'Infrastructure as Code](#1-pourquoi-linfrastructure-as-code)
-2. [CloudFormation vs CDK vs Terraform](#2-cloudformation-vs-cdk-vs-terraform)
-3. [Concepts CDK](#3-concepts-cdk)
-4. [Démarrer un projet CDK](#4-démarrer-un-projet-cdk)
-5. [Premiers Constructs](#5-premiers-constructs)
-6. [Commandes CLI essentielles](#6-commandes-cli-essentielles)
-7. [Exemples pratiques](#7-exemples-pratiques)
-8. [Aspects, Context et Parameters](#8-aspects-context-et-parameters)
-9. [Tester les Stacks CDK](#9-tester-les-stacks-cdk)
-10. [Bonnes pratiques](#10-bonnes-pratiques)
-11. [Récapitulatif](#11-récapitulatif)
+### 2.1 IaC : décrire l'infra, ne pas la cliquer
 
----
+L'IaC consiste à écrire la définition de l'infrastructure dans des fichiers versionnés, puis à laisser un outil créer/mettre à jour les ressources pour qu'elles correspondent au code. Le code **est** la source de vérité et la documentation.
 
-## 1. Pourquoi l'Infrastructure as Code
-
-### 1.1 Le problème du "ClickOps"
-
-Créer des ressources AWS via la console (ClickOps) pose des problèmes majeurs :
-
-- **Non reproductible** : impossible de recréer exactement le même environnement
-- **Non versionné** : pas d'historique des changements, pas de code review
-- **Sujette aux erreurs** : un clic de travers peut casser la production
-- **Non testable** : impossible de valider la configuration avant de l'appliquer
-- **Lente** : chaque environnement (dev, staging, prod) doit être configuré manuellement
-
-> **Analogie** : Le ClickOps, c'est comme cuisiner sans recette. Vous pouvez faire un bon plat une fois, mais impossible de le reproduire exactement. L'IaC, c'est la recette détaillée — reproductible, partageable, améliorable.
-
-### 1.2 Avantages de l'IaC
-
-| Avantage | Description |
+| ClickOps (console) | IaC (CDK) |
 |---|---|
-| **Reproductibilité** | Même code = même infrastructure, à chaque fois |
-| **Versioning** | Historique Git de tous les changements d'infra |
-| **Code review** | Revue des changements d'infra comme du code applicatif |
-| **Tests** | Valider la configuration avant le déploiement |
-| **Automatisation** | CI/CD pour l'infrastructure |
-| **Documentation** | Le code EST la documentation de l'infrastructure |
+| Reproductibilité manuelle, faillible | Même code = même infra, à chaque fois |
+| Pas d'historique | Historique Git + code review |
+| Config invisible | Le code décrit l'état attendu |
+| Un clic casse la prod | Un `cdk diff` montre le changement avant `deploy` |
 
----
+### 2.2 Ce qu'est le CDK v2 (et ce qu'il génère)
 
-## 2. CloudFormation vs CDK vs Terraform
+L'**AWS Cloud Development Kit (CDK)** est un framework IaC : tu écris ton infra dans un vrai langage (ici TypeScript), le CDK la **synthétise** en un template **CloudFormation** (JSON/YAML), et c'est CloudFormation qui provisionne réellement les ressources AWS et gère leur état.
 
-| Critère | CloudFormation | CDK | Terraform |
-|---|---|---|---|
-| **Langage** | YAML/JSON | TypeScript, Python, Java, Go, C# | HCL (HashiCorp) |
-| **Fournisseur** | AWS uniquement | AWS uniquement (via CloudFormation) | Multi-cloud |
-| **Abstraction** | Bas niveau (chaque propriété) | Haut niveau (Constructs L2/L3) | Moyen (modules) |
-| **State** | Géré par AWS | Géré par AWS (via CFN) | Fichier local ou remote |
-| **Boucles/conditions** | Limité (`Fn::If`, `Conditions`) | Natif (TypeScript) | `count`, `for_each` |
-| **IDE support** | Limité | Excellent (TypeScript) | Bon |
-| **Courbe d'apprentissage** | YAML verbeux | Facile si vous connaissez TypeScript | Nouveau langage (HCL) |
+```
+Ton code TypeScript  →  cdk synth  →  template CloudFormation  →  déploiement AWS
+```
 
-> **Recommandation** : Si vous êtes 100 % AWS et développeur TypeScript, CDK est le meilleur choix. Il génère du CloudFormation sous le capot, mais avec la puissance d'un vrai langage de programmation.
+Tu gardes donc la fiabilité de CloudFormation (état géré côté AWS, rollback automatique) avec la puissance d'un langage (variables, boucles, fonctions, types, autocomplétion IDE).
 
----
+> **CDK v2 = un seul paquet npm.** Toute la bibliothèque de constructs stables tient dans **`aws-cdk-lib`** (+ le paquet `constructs` pour la classe de base). En CDK **v1**, il fallait installer des dizaines de paquets `@aws-cdk/aws-s3`, `@aws-cdk/aws-lambda`, etc. — **v1 est en fin de support, ne l'utilise pas.** En v2 on importe des sous-chemins du paquet unique : `import * as s3 from 'aws-cdk-lib/aws-s3'`.
 
-## 3. Concepts CDK
+La CLI `aws-cdk` (aussi appelée CDK Toolkit) est un paquet séparé, installé globalement, qui pilote `init`, `synth`, `deploy`, etc.
 
-### 3.1 Architecture CDK
+### 2.3 La hiérarchie : App → Stack → Construct
+
+Un projet CDK est un **arbre de constructs**. Un *construct* est un composant qui représente une ou plusieurs ressources AWS.
+
+- **App** (`cdk.App`) — la racine de l'arbre. Un projet CDK = une App.
+- **Stack** (`cdk.Stack`) — une unité de déploiement. Chaque Stack devient **une** stack CloudFormation. On regroupe par domaine (une stack stockage, une stack API…).
+- **Construct** — tout le reste : un bucket, un rôle, ou un composant réutilisable que tu écris toi-même.
 
 ```
 App (cdk.App)
-  └── Stack 1 (cdk.Stack) → CloudFormation Stack
-  │     ├── Construct A (ex: s3.Bucket)
-  │     ├── Construct B (ex: lambda.Function)
-  │     └── Construct C (ex: apigateway.RestApi)
-  └── Stack 2 (cdk.Stack) → CloudFormation Stack
-        └── ...
+ └── StorageStack (cdk.Stack)   → 1 stack CloudFormation
+      ├── Bucket  (s3.Bucket)   → AWS::S3::Bucket
+      └── Role    (iam.Role)    → AWS::IAM::Role
 ```
 
-### 3.2 Les trois niveaux de Constructs
+Tout construct s'instancie avec **trois arguments** :
 
-| Niveau | Nom | Description | Exemple |
+```ts
+new s3.Bucket(this, 'AvatarsBucket', { versioned: true })
+//            ↑scope  ↑id            ↑props
+```
+
+- **scope** : le parent dans l'arbre — presque toujours `this` (la Stack courante).
+- **id** : un identifiant **unique dans ce scope** ; il sert à générer l'ID logique CloudFormation. Ce n'est **pas** le nom physique de la ressource.
+- **props** : la configuration. Si toutes les props sont optionnelles, l'argument peut être omis.
+
+### 2.4 Les trois niveaux de constructs (L1 / L2 / L3)
+
+C'est le concept central du CDK : plus le niveau est haut, plus c'est abstrait et rapide à écrire ; plus il est bas, plus tu contrôles.
+
+| Niveau | Nom officiel | Ce que c'est | Exemple |
 |---|---|---|---|
-| **L1** | CFN Resources | Mapping 1:1 avec CloudFormation. Préfixe `Cfn`. | `CfnBucket` |
-| **L2** | Curated Constructs | Abstractions AWS avec des valeurs par défaut sensées. | `Bucket` |
-| **L3** | Patterns | Combinaisons de plusieurs ressources. | `LambdaRestApi` |
+| **L1** | *CFN resources* | Mapping **1:1** avec une ressource CloudFormation, aucune abstraction. Préfixe `Cfn`. Toutes les props sont obligatoires comme dans CFN. | `s3.CfnBucket` |
+| **L2** | *curated constructs* | Abstraction intent-based, **valeurs par défaut sûres**, sécurité par défaut, méthodes utilitaires (`grant*()`, `addEventNotification`…). Le niveau le plus utilisé. | `s3.Bucket` |
+| **L3** | *patterns* | Combinent **plusieurs ressources** configurées pour un cas d'usage complet. | `aws_ecs_patterns.ApplicationLoadBalancedFargateService` |
 
-```typescript
-// L1 — Bas niveau, verbeux, contrôle total
-new s3.CfnBucket(this, 'MyBucket', {
-  bucketName: 'my-bucket',
+```ts
+// L1 — verbeux, contrôle total, aucune valeur par défaut
+new s3.CfnBucket(this, 'Raw', {
   versioningConfiguration: { status: 'Enabled' },
 })
 
-// L2 — Haut niveau, valeurs par défaut, méthodes utilitaires
-new s3.Bucket(this, 'MyBucket', {
+// L2 — intent-based, défauts sûrs, méthodes utilitaires (à privilégier)
+new s3.Bucket(this, 'Avatars', {
   versioned: true,
-  removalPolicy: cdk.RemovalPolicy.DESTROY,
-})
-
-// L3 — Pattern complet (API Gateway + Lambda en une ligne)
-new apigateway.LambdaRestApi(this, 'MyApi', {
-  handler: myLambda,
+  encryption: s3.BucketEncryption.S3_MANAGED,
+  blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
 })
 ```
 
-> **Règle** : Utilisez les Constructs L2 par défaut. Descendez en L1 uniquement si une propriété n'est pas exposée par le L2.
+> **Règle :** utilise **L2 par défaut**. Descends en L1 seulement si une propriété n'est pas exposée par le L2. Monte en L3 quand un pattern tout fait couvre exactement ton besoin.
 
----
+### 2.5 `grant*()` — les permissions IAM sans écrire de policy
 
-## 4. Démarrer un projet CDK
+La magie des L2 : au lieu d'écrire une policy IAM à la main (module 01), tu appelles une méthode `grant*()` et le CDK génère la policy **au moindre privilège**.
 
-### 4.1 Installation
+```ts
+const bucket = new s3.Bucket(this, 'Avatars')
+const role = new iam.Role(this, 'UploaderRole', {
+  assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
+})
 
-```bash
-# Installer le CLI CDK globalement
-npm install -g aws-cdk
-
-# Vérifier la version
-cdk --version
+bucket.grantReadWrite(role) // ← CDK écrit la policy IAM exacte (s3:GetObject, s3:PutObject…)
 ```
 
-### 4.2 Initialiser un projet
+### 2.6 `RemovalPolicy` — que devient la ressource au `destroy`
 
-```bash
-mkdir my-infra && cd my-infra
-cdk init app --language typescript
+Par défaut, certaines ressources porteuses de données (bucket, table) sont **conservées** (`RETAIN`) quand on détruit la stack, pour éviter une perte accidentelle. En dev/apprentissage on veut l'inverse — que tout parte au `cdk destroy` :
+
+```ts
+new s3.Bucket(this, 'Avatars', {
+  removalPolicy: cdk.RemovalPolicy.DESTROY, // supprime le bucket au cdk destroy
+  autoDeleteObjects: true,                  // vide le bucket d'abord (sinon destroy échoue)
+})
 ```
 
-Structure générée :
+> En **prod**, garde `RemovalPolicy.RETAIN` sur les données. En **apprentissage**, mets `DESTROY` + `autoDeleteObjects: true` pour ne rien laisser traîner (et ne rien payer).
+
+### 2.7 Le cycle CLI : init → bootstrap → synth → diff → deploy → destroy
+
+| Commande | Rôle |
+|---|---|
+| `cdk init app --language typescript` | Crée un projet CDK depuis un template |
+| `cdk bootstrap` | Prépare le compte/région : déploie la stack **`CDKToolkit`** (bucket d'assets + rôles). **Une fois par compte+région.** |
+| `cdk synth` | Synthétise le template CloudFormation (sans déployer) |
+| `cdk diff` | Compare le code au déployé : `[+]` ajout, `[-]` suppression, `[~]` modif |
+| `cdk deploy` | Déploie / met à jour la ou les stacks sur AWS |
+| `cdk destroy` | **Supprime** la ou les stacks et leurs ressources |
+| `cdk ls` | Liste les stacks de l'App |
+
+> **`cdk bootstrap` est un prérequis unique.** Sans lui, le premier `cdk deploy` échoue : le CDK a besoin d'un bucket S3 (pour uploader les assets) et de rôles IAM, regroupés dans la stack `CDKToolkit`. Tu ne le lances qu'**une fois par couple compte+région**, pas à chaque déploiement.
+
+### 2.8 Anatomie d'un projet `cdk init`
 
 ```
 my-infra/
-├── bin/
-│   └── my-infra.ts          ← Point d'entrée (App)
-├── lib/
-│   └── my-infra-stack.ts    ← Définition de la Stack
-├── test/
-│   └── my-infra.test.ts     ← Tests
-├── cdk.json                  ← Configuration CDK
-├── tsconfig.json
-└── package.json
-```
-
-### 4.3 Bootstrap
-
-Avant le premier déploiement, il faut **bootstrapper** le compte AWS (crée un bucket S3 et des rôles IAM pour CDK) :
-
-```bash
-cdk bootstrap aws://123456789012/eu-west-1
+├── bin/my-infra.ts        ← point d'entrée : instancie l'App et les Stacks
+├── lib/my-infra-stack.ts  ← définition de la Stack (tes ressources)
+├── cdk.json               ← config CDK (commande de run, feature flags)
+├── package.json           ← dépend de aws-cdk-lib et constructs
+└── tsconfig.json
 ```
 
 ---
 
-## 5. Premiers Constructs
+## 3. Worked examples
 
-### 5.1 Le fichier App (`bin/my-infra.ts`)
+### Exemple 1 — La stack stockage de TribuZen (bucket avatars), de zéro au déploiement
 
-```typescript
+**But :** décrire en CDK le bucket S3 des avatars du cas concret, puis le déployer et le détruire.
+
+```bash
+# 1. CLI CDK en global + nouveau projet
+npm install -g aws-cdk
+mkdir tribuzen-infra && cd tribuzen-infra
+cdk init app --language typescript
+
+# 2. Bootstrap du compte+région (UNE seule fois par compte+région)
+cdk bootstrap aws://123456789012/eu-west-3
+```
+
+Le point d'entrée `bin/tribuzen-infra.ts` instancie l'App et la Stack :
+
+```ts
+// bin/tribuzen-infra.ts
 import * as cdk from 'aws-cdk-lib'
-import { MyInfraStack } from '../lib/my-infra-stack'
+import { StorageStack } from '../lib/storage-stack'
 
 const app = new cdk.App()
 
-new MyInfraStack(app, 'MyInfraStack', {
+new StorageStack(app, 'TribuzenStorageStack', {
   env: {
-    account: process.env.CDK_DEFAULT_ACCOUNT,
-    region: 'eu-west-1',
+    account: process.env.CDK_DEFAULT_ACCOUNT, // injecté par la CLI
+    region: 'eu-west-3',                       // Paris
   },
 })
 ```
 
-### 5.2 Le fichier Stack (`lib/my-infra-stack.ts`)
+La Stack décrit le bucket avec les mêmes réglages que le module 04 :
 
-```typescript
+```ts
+// lib/storage-stack.ts
 import * as cdk from 'aws-cdk-lib'
 import * as s3 from 'aws-cdk-lib/aws-s3'
 import type { Construct } from 'constructs'
 
-export class MyInfraStack extends cdk.Stack {
+export class StorageStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props)
 
-    // Créer un bucket S3
-    const bucket = new s3.Bucket(this, 'MyBucket', {
-      versioned: true,
-      encryption: s3.BucketEncryption.S3_MANAGED,
-      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
-      removalPolicy: cdk.RemovalPolicy.DESTROY,
-      autoDeleteObjects: true, // supprime les objets quand le bucket est détruit
+    // L2 s3.Bucket : sécurité par défaut + réglages explicites
+    const avatars = new s3.Bucket(this, 'AvatarsBucket', {
+      versioned: true,                                  // module 04 : versioning
+      encryption: s3.BucketEncryption.S3_MANAGED,       // chiffrement au repos
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL, // la case jamais oubliée
+      removalPolicy: cdk.RemovalPolicy.DESTROY,         // dev : part au destroy
+      autoDeleteObjects: true,                          // vide le bucket avant suppression
     })
 
-    // Exporter l'ARN du bucket
-    new cdk.CfnOutput(this, 'BucketArn', {
-      value: bucket.bucketArn,
-      description: 'ARN du bucket S3',
+    // Exporte le nom généré pour le lire après déploiement
+    new cdk.CfnOutput(this, 'AvatarsBucketName', {
+      value: avatars.bucketName,
+      description: 'Nom du bucket des avatars TribuZen',
     })
   }
 }
 ```
 
----
-
-## 6. Commandes CLI essentielles
-
-| Commande | Description |
-|---|---|
-| `cdk init` | Initialise un nouveau projet CDK |
-| `cdk synth` | Génère le template CloudFormation (sans déployer) |
-| `cdk diff` | Affiche les différences entre le code et ce qui est déployé |
-| `cdk deploy` | Déploie la stack sur AWS |
-| `cdk destroy` | Supprime la stack et toutes ses ressources |
-| `cdk ls` | Liste toutes les stacks de l'application |
-| `cdk doctor` | Vérifie la configuration CDK |
-
-### 6.1 Workflow typique
+Déploiement et vérification :
 
 ```bash
-# 1. Écrire/modifier le code TypeScript
-# 2. Synthétiser pour voir le CloudFormation généré
-cdk synth
+cdk synth                 # affiche le CloudFormation généré — rien n'est déployé
+cdk diff                  # première fois : tout en [+] (création)
+cdk deploy                # crée réellement le bucket ; affiche AvatarsBucketName en sortie
 
-# 3. Voir ce qui va changer
-cdk diff
-
-# 4. Déployer
-cdk deploy
-
-# 5. Déployer avec approbation automatique (CI/CD)
-cdk deploy --require-approval never
-
-# 6. Déployer une stack spécifique
-cdk deploy MyInfraStack
-
-# 7. Déployer toutes les stacks
-cdk deploy --all
+# ... quand tu as fini, NE LAISSE RIEN TRAÎNER :
+cdk destroy               # supprime la stack et le bucket (autoDeleteObjects le vide d'abord)
 ```
 
-### 6.2 Sortie de `cdk diff`
+**Ce qui vient d'être exercé :** App → Stack → construct L2, les trois arguments `(scope, id, props)`, `RemovalPolicy.DESTROY`, `CfnOutput`, et le cycle complet `bootstrap → synth → diff → deploy → destroy`.
 
-```
-Stack MyInfraStack
-Resources
-[+] AWS::S3::Bucket MyBucket MyBucket560B80BC
-[~] AWS::Lambda::Function MyFunction
- └── [~] Runtime
-     ├── [-] nodejs18.x   ← Node.js 18 EOL depuis avril 2024
-     └── [+] nodejs20.x   ← migrer vers nodejs20.x ou nodejs22.x
-```
+### Exemple 2 — Lire un `cdk diff` avant de casser la prod
 
-- `[+]` = nouvelle ressource
-- `[-]` = ressource supprimée
-- `[~]` = ressource modifiée
+Tu ajoutes une règle de cycle de vie au bucket existant. Avant de déployer, `cdk diff` montre **exactement** l'impact :
 
----
-
-## 7. Exemples pratiques
-
-### 7.1 Lambda + API Gateway
-
-```typescript
-import * as cdk from 'aws-cdk-lib'
-import * as lambda from 'aws-cdk-lib/aws-lambda'
-import * as apigateway from 'aws-cdk-lib/aws-apigateway'
-import * as path from 'path'
-import type { Construct } from 'constructs'
-
-export class ApiStack extends cdk.Stack {
-  constructor(scope: Construct, id: string, props?: cdk.StackProps) {
-    super(scope, id, props)
-
-    // Fonction Lambda
-    const handler = new lambda.Function(this, 'ApiHandler', {
-      runtime: lambda.Runtime.NODEJS_20_X,
-      handler: 'index.handler',
-      code: lambda.Code.fromAsset(path.join(__dirname, '../lambda')),
-      timeout: cdk.Duration.seconds(30),
-      memorySize: 256,
-      environment: {
-        TABLE_NAME: 'MyTable',
-        NODE_ENV: 'production',
-      },
-    })
-
-    // API Gateway (L3 Pattern — crée automatiquement le proxy)
-    const api = new apigateway.LambdaRestApi(this, 'MyApi', {
-      handler,
-      proxy: false, // désactiver le proxy pour définir les routes manuellement
-    })
-
-    // Définir les routes
-    const users = api.root.addResource('users')
-    users.addMethod('GET', new apigateway.LambdaIntegration(handler))
-    users.addMethod('POST', new apigateway.LambdaIntegration(handler))
-
-    const singleUser = users.addResource('{userId}')
-    singleUser.addMethod('GET', new apigateway.LambdaIntegration(handler))
-    singleUser.addMethod('PUT', new apigateway.LambdaIntegration(handler))
-    singleUser.addMethod('DELETE', new apigateway.LambdaIntegration(handler))
-  }
-}
-```
-
-### 7.2 DynamoDB + Lambda avec permissions
-
-```typescript
-import * as dynamodb from 'aws-cdk-lib/aws-dynamodb'
-
-// Dans le constructeur de la Stack :
-
-const table = new dynamodb.Table(this, 'OrdersTable', {
-  partitionKey: { name: 'PK', type: dynamodb.AttributeType.STRING },
-  sortKey: { name: 'SK', type: dynamodb.AttributeType.STRING },
-  billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+```ts
+const avatars = new s3.Bucket(this, 'AvatarsBucket', {
+  versioned: true,
+  encryption: s3.BucketEncryption.S3_MANAGED,
+  blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
   removalPolicy: cdk.RemovalPolicy.DESTROY,
-  pointInTimeRecovery: true,
-  stream: dynamodb.StreamViewType.NEW_AND_OLD_IMAGES,
+  autoDeleteObjects: true,
+  lifecycleRules: [
+    { // supprime les anciennes versions après 30 jours
+      noncurrentVersionExpiration: cdk.Duration.days(30),
+    },
+  ],
 })
-
-// GSI
-table.addGlobalSecondaryIndex({
-  indexName: 'GSI1',
-  partitionKey: { name: 'GSI1PK', type: dynamodb.AttributeType.STRING },
-  sortKey: { name: 'GSI1SK', type: dynamodb.AttributeType.STRING },
-  projectionType: dynamodb.ProjectionType.ALL,
-})
-
-// Lambda avec accès à la table
-const orderHandler = new lambda.Function(this, 'OrderHandler', {
-  runtime: lambda.Runtime.NODEJS_20_X,
-  handler: 'index.handler',
-  code: lambda.Code.fromAsset(path.join(__dirname, '../lambda/orders')),
-  environment: {
-    TABLE_NAME: table.tableName,
-  },
-})
-
-// CDK génère automatiquement la politique IAM minimale
-table.grantReadWriteData(orderHandler)
 ```
 
-> La méthode `table.grantReadWriteData(handler)` est la magie du CDK L2 : elle crée automatiquement la politique IAM avec le principe du moindre privilège.
-
-### 7.3 SQS + SNS + Lambda (Fan-out)
-
-```typescript
-import * as sqs from 'aws-cdk-lib/aws-sqs'
-import * as sns from 'aws-cdk-lib/aws-sns'
-import * as subscriptions from 'aws-cdk-lib/aws-sns-subscriptions'
-import * as lambdaEvents from 'aws-cdk-lib/aws-lambda-event-sources'
-
-// Topic SNS
-const orderTopic = new sns.Topic(this, 'OrderTopic', {
-  topicName: 'order-events',
-})
-
-// Queue SQS pour l'envoi d'emails
-const emailQueue = new sqs.Queue(this, 'EmailQueue', {
-  visibilityTimeout: cdk.Duration.seconds(60),
-  deadLetterQueue: {
-    queue: new sqs.Queue(this, 'EmailDLQ'),
-    maxReceiveCount: 3,
-  },
-})
-
-// Queue SQS pour la mise à jour du stock
-const stockQueue = new sqs.Queue(this, 'StockQueue', {
-  visibilityTimeout: cdk.Duration.seconds(30),
-})
-
-// Abonner les queues au topic
-orderTopic.addSubscription(new subscriptions.SqsSubscription(emailQueue))
-orderTopic.addSubscription(new subscriptions.SqsSubscription(stockQueue))
-
-// Lambda worker pour les emails
-const emailWorker = new lambda.Function(this, 'EmailWorker', {
-  runtime: lambda.Runtime.NODEJS_20_X,
-  handler: 'index.handler',
-  code: lambda.Code.fromAsset(path.join(__dirname, '../lambda/email')),
-})
-
-// Connecter la queue à la Lambda
-emailWorker.addEventSource(new lambdaEvents.SqsEventSource(emailQueue, {
-  batchSize: 10,
-  reportBatchItemFailures: true,
-}))
 ```
+$ cdk diff
+Stack TribuzenStorageStack
+Resources
+[~] AWS::S3::Bucket AvatarsBucket AvatarsBucket8B4E...
+ └── [+] LifecycleConfiguration
+     └── Rules: [ { NoncurrentVersionExpiration: { NoncurrentDays: 30 } } ]
+```
+
+- `[~]` : la ressource est **modifiée** (pas recréée).
+- `[+]` sous la ressource : une propriété est **ajoutée**.
+
+Tu vois que le bucket n'est pas détruit/recréé (ce qui perdrait les avatars) avant de taper `cdk deploy`. C'est la revue d'infra que le ClickOps ne permet jamais.
 
 ---
 
-## 8. Aspects, Context et Parameters
+## 4. Pièges & misconceptions
 
-### 8.1 Aspects
+### PIÈGE #1 — Croire que CDK v2 s'installe comme v1 (paquets `@aws-cdk/*`)
 
-Les **Aspects** permettent d'appliquer des règles ou des modifications à **toutes les ressources** d'une stack. Cas d'usage typique : ajouter des tags, vérifier la conformité.
+```ts
+// ❌ CDK v1 — dépréciée, fin de support. Ne l'utilise pas.
+import * as s3 from '@aws-cdk/aws-s3'
+import * as cdk from '@aws-cdk/core'
 
-```typescript
+// ✅ CDK v2 — un seul paquet, sous-chemins
 import * as cdk from 'aws-cdk-lib'
-import type { IConstruct } from 'constructs'
-
-class TaggingAspect implements cdk.IAspect {
-  visit(node: IConstruct): void {
-    if (cdk.Tags.of(node)) {
-      cdk.Tags.of(node).add('Environment', 'production')
-      cdk.Tags.of(node).add('Team', 'backend')
-      cdk.Tags.of(node).add('ManagedBy', 'CDK')
-    }
-  }
-}
-
-// Appliquer l'aspect à toute l'application
-cdk.Aspects.of(app).add(new TaggingAspect())
+import * as s3 from 'aws-cdk-lib/aws-s3'
+import type { Construct } from 'constructs'
 ```
 
-### 8.2 Context
+Un tuto qui te fait `npm install @aws-cdk/aws-s3` est du **v1 périmé**. En v2, `aws-cdk-lib` + `constructs` suffisent.
 
-Le **context** permet de passer des valeurs de configuration au moment du déploiement :
+### PIÈGE #2 — Confondre l'`id` du construct et le nom physique de la ressource
 
-```json
-// cdk.json
-{
-  "context": {
-    "environment": "production",
-    "vpcId": "vpc-12345"
-  }
-}
+```ts
+new s3.Bucket(this, 'AvatarsBucket') // 'AvatarsBucket' = id CDK, PAS le nom du bucket
 ```
 
-```typescript
-// Dans la stack
-const environment = this.node.tryGetContext('environment') // 'production'
-const vpcId = this.node.tryGetContext('vpcId')
-```
+L'`id` sert à générer l'**ID logique CloudFormation**. Le nom réel du bucket est **auto-généré** (`tribuzenstorage-avatarsbucket8b4e...`). C'est voulu : laisser CDK nommer évite les collisions et les conflits entre environnements. Ne mets un `bucketName` explicite que si c'est indispensable.
 
-```bash
-# Ou via la ligne de commande
-cdk deploy -c environment=staging -c vpcId=vpc-67890
-```
+### PIÈGE #3 — Oublier `cdk bootstrap` et lire l'erreur de travers
 
-### 8.3 Parameters (CloudFormation)
+Au premier `cdk deploy` sur un compte+région neuf sans bootstrap, tu obtiens une erreur du type « *This stack uses assets, so the toolkit stack must be deployed… Run `cdk bootstrap`* ». Ce n'est **pas** un bug de ton code : c'est le bucket d'assets `CDKToolkit` qui manque. `cdk bootstrap aws://<account>/<region>` une fois, puis redeploie.
 
-Bien que CDK supporte les `CfnParameter`, il est **déconseillé** de les utiliser. Préférez le context ou les variables d'environnement.
+### PIÈGE #4 — `cdk synth` / `cdk diff` ne déploient rien (et c'est le but)
 
-```typescript
-// Déconseillé (mais possible)
-const envParam = new cdk.CfnParameter(this, 'Environment', {
-  type: 'String',
-  default: 'dev',
-  allowedValues: ['dev', 'staging', 'prod'],
+`synth` génère le template, `diff` le compare au déployé. **Aucun** des deux ne touche à AWS. Beaucoup de débutants croient avoir « déployé » après un `synth` réussi. Seul **`cdk deploy`** provisionne réellement. À l'inverse, ne jamais `deploy` sans avoir lu le `diff`.
+
+### PIÈGE #5 — Détruire une stack avec un bucket non vide
+
+```ts
+// ❌ removalPolicy DESTROY seul : le cdk destroy ÉCHOUE si le bucket contient des objets
+new s3.Bucket(this, 'Avatars', { removalPolicy: cdk.RemovalPolicy.DESTROY })
+
+// ✅ ajoute autoDeleteObjects pour vider le bucket avant suppression
+new s3.Bucket(this, 'Avatars', {
+  removalPolicy: cdk.RemovalPolicy.DESTROY,
+  autoDeleteObjects: true,
 })
 ```
 
----
+CloudFormation refuse de supprimer un bucket non vide. `autoDeleteObjects: true` ajoute une Lambda custom qui le vide d'abord. Sans les deux, ton `cdk destroy` reste bloqué et **tu continues à payer** le stockage.
 
-## 9. Tester les Stacks CDK
+### PIÈGE #6 — Descendre en L1 « pour comprendre » alors que le L2 suffit
 
-### 9.1 Pourquoi tester l'infrastructure ?
-
-- Vérifier que les bonnes ressources sont créées
-- S'assurer que les politiques de sécurité sont respectées
-- Détecter les régressions avant le déploiement
-- Documenter le comportement attendu de l'infra
-
-### 9.2 Types de tests
-
-| Type | Description | Outil |
-|---|---|---|
-| **Snapshot** | Compare le template CFN généré à un snapshot | Jest |
-| **Fine-grained assertions** | Vérifie des propriétés spécifiques de ressources | `aws-cdk-lib/assertions` |
-| **Validation** | Vérifie que la stack se synthétise sans erreur | `cdk synth` |
-
-### 9.3 Assertions (recommandé)
-
-```typescript
-import * as cdk from 'aws-cdk-lib'
-import { Template, Match } from 'aws-cdk-lib/assertions'
-import { MyInfraStack } from '../lib/my-infra-stack'
-
-describe('MyInfraStack', () => {
-  let template: Template
-
-  beforeAll(() => {
-    const app = new cdk.App()
-    const stack = new MyInfraStack(app, 'TestStack')
-    template = Template.fromStack(stack)
-  })
-
-  test('crée un bucket S3 avec versioning activé', () => {
-    template.hasResourceProperties('AWS::S3::Bucket', {
-      VersioningConfiguration: {
-        Status: 'Enabled',
-      },
-    })
-  })
-
-  test('crée exactement 2 fonctions Lambda', () => {
-    template.resourceCountIs('AWS::Lambda::Function', 2)
-  })
-
-  test('la Lambda a les bonnes variables d\'environnement', () => {
-    template.hasResourceProperties('AWS::Lambda::Function', {
-      Environment: {
-        Variables: {
-          TABLE_NAME: Match.anyValue(),
-          NODE_ENV: 'production',
-        },
-      },
-    })
-  })
-
-  test('la table DynamoDB est en mode PAY_PER_REQUEST', () => {
-    template.hasResourceProperties('AWS::DynamoDB::Table', {
-      BillingMode: 'PAY_PER_REQUEST',
-    })
-  })
-
-  test('le bucket S3 bloque l\'accès public', () => {
-    template.hasResourceProperties('AWS::S3::Bucket', {
-      PublicAccessBlockConfiguration: {
-        BlockPublicAcls: true,
-        BlockPublicPolicy: true,
-        IgnorePublicAcls: true,
-        RestrictPublicBuckets: true,
-      },
-    })
-  })
-})
-```
-
-### 9.4 Snapshot testing
-
-```typescript
-test('correspond au snapshot', () => {
-  const app = new cdk.App()
-  const stack = new MyInfraStack(app, 'TestStack')
-  const template = Template.fromStack(stack)
-
-  expect(template.toJSON()).toMatchSnapshot()
-})
-```
-
-> **Attention** : Les snapshots sont fragiles. Préférez les assertions ciblées pour les propriétés critiques.
+Le L1 (`CfnBucket`) n'a **aucune** valeur par défaut de sécurité : oublier `blockPublicAccess` en L1 laisse le bucket exposable. Le L2 (`Bucket`) applique les bonnes pratiques par défaut. Reste en **L2** sauf propriété manquante réelle.
 
 ---
 
-## 10. Bonnes pratiques
+## 5. Ancrage TribuZen
 
-### 10.1 Structure de projet
+Le CDK est le **socle infra** de tout le backend TribuZen des modules 06+. Ce module pose la **première stack** ; les suivantes viendront s'y greffer.
+
+**`StorageStack` (ce module)** — le bucket S3 des avatars de familles (Exemple 1). C'est la brique la plus simple à décrire, donc le point d'entrée idéal pour apprendre CDK avant d'y ajouter du compute.
+
+**Ce qui s'y ajoutera ensuite (aperçu, pas ce module) :**
 
 ```
-my-infra/
-├── bin/
-│   └── app.ts                   ← Point d'entrée unique
-├── lib/
-│   ├── stacks/
-│   │   ├── api-stack.ts         ← Stack API (Gateway + Lambda)
-│   │   ├── database-stack.ts    ← Stack BDD (DynamoDB)
-│   │   └── messaging-stack.ts   ← Stack Messaging (SQS, SNS)
-│   └── constructs/
-│       ├── secure-bucket.ts     ← Construct réutilisable
-│       └── monitored-lambda.ts  ← Lambda avec alarmes CloudWatch
-├── lambda/
-│   ├── api/index.ts
-│   └── workers/email.ts
-├── test/
-│   ├── api-stack.test.ts
-│   └── database-stack.test.ts
-└── cdk.json
+tribuzen-infra/
+  bin/tribuzen-infra.ts        ← App : instancie toutes les stacks
+  lib/
+    storage-stack.ts           ← CE MODULE : bucket avatars S3
+    api-stack.ts               ← module 06-07 : Lambda + API Gateway
+    data-stack.ts              ← module 09 : table DynamoDB (feed)
+    auth-stack.ts              ← module 11 : Cognito User Pool
 ```
 
-### 10.2 Règles essentielles
-
-1. **Une stack par domaine** : séparez API, database, messaging en stacks distinctes
-2. **Utilisez les Constructs L2** : ils appliquent les bonnes pratiques de sécurité par défaut
-3. **Utilisez `grant*()`** : `table.grantReadWriteData(lambda)` au lieu de politiques IAM manuelles
-4. **Nommez les ressources avec parcimonie** : laissez CDK générer les noms pour éviter les conflits
-5. **Testez vos stacks** : au minimum des assertions sur les propriétés de sécurité
-6. **Utilisez `RemovalPolicy.RETAIN`** en production pour les données persistantes (DynamoDB, S3)
-7. **Versionnez `cdk.json`** et le fichier `cdk.context.json` dans Git
-8. **Pas de secrets en dur** : utilisez `cdk.SecretValue.secretsManager()` ou SSM Parameter Store
-
-### 10.3 Anti-patterns à éviter
-
-| Anti-pattern | Meilleure alternative |
-|---|---|
-| Noms de ressources en dur | Laisser CDK générer les noms |
-| Politique IAM `Action: *` | Utiliser les méthodes `grant*()` |
-| Une seule stack monolithique | Séparer par domaine |
-| `CfnParameter` pour la config | Utiliser le context CDK |
-| Secrets dans le code | `SecretValue.secretsManager()` |
+Chaque service TribuZen étudié plus loin deviendra un construct dans une stack CDK, revu en pull request sur `smaurier/tribuzen-infra`. Le `bucket.grantReadWrite(lambdaRole)` de ce module est exactement ce qui reliera la future Lambda d'upload d'avatar au bucket, **sans policy IAM écrite à la main**.
 
 ---
 
-## 11. SST — Le framework serverless moderne pour TypeScript
+## 6. Points clés
 
-### Qu'est-ce que SST ?
+1. L'IaC remplace le ClickOps : infra décrite en code versionné, reproductible, revue en PR, détruisible en une commande.
+2. Le CDK écrit ton infra en TypeScript, la **synthétise en CloudFormation**, et c'est CloudFormation qui provisionne et gère l'état.
+3. CDK v2 = **un seul paquet `aws-cdk-lib`** (+ `constructs`) ; les paquets `@aws-cdk/*` sont du v1 périmé.
+4. Hiérarchie **App → Stack → Construct** ; chaque Stack = une stack CloudFormation ; chaque construct s'instancie avec `(scope, id, props)`.
+5. **L1** = mapping 1:1 CFN (`Cfn…`, aucun défaut) ; **L2** = curated, défauts sûrs + `grant*()` (à privilégier) ; **L3** = patterns multi-ressources.
+6. `grant*()` (L2) génère la policy IAM au moindre privilège sans l'écrire à la main.
+7. Cycle : `cdk init → bootstrap (1×/compte+région) → synth → diff → deploy → destroy`. Toujours lire `diff` avant `deploy`.
+8. Pour ne rien laisser payer : `removalPolicy: DESTROY` + `autoDeleteObjects: true`, puis **`cdk destroy`** en fin de séance.
 
-**SST** (anciennement Serverless Stack) est un framework open source qui simplifie le developpement d'applications serverless sur AWS. Construit au-dessus du CDK, SST ajoute des fonctionnalites qui manquent cruellement en developpement : le rechargement en temps reel des fonctions Lambda, une gestion simplifiee des environnements, et des constructs de haut niveau pour les cas d'usage courants.
+---
 
-Site officiel : [sst.dev](https://sst.dev)
-
-### Live Lambda Development
-
-La fonctionnalite phare de SST est le **Live Lambda Development**. Au lieu de deployer votre code Lambda sur AWS a chaque modification, SST cree un tunnel entre votre machine locale et AWS. Quand une Lambda est invoquee, la requete est redirigee vers votre code local. Vous editez votre code, sauvegardez, et la prochaine invocation utilise immediatement le nouveau code — sans deploiement, sans attente.
-
-```bash
-# Lancer le mode dev
-npx sst dev
-```
+## 7. Seeds Anki
 
 ```
-SST v3.x
-→ App:     my-app
-→ Stage:   dev-sophie
-→ Region:  eu-west-3
-
-✓ Deployed:
-  API: https://abc123.execute-api.eu-west-3.amazonaws.com
-
-Live Lambda connected. Watching for changes...
-```
-
-Chaque developpeur travaille dans son propre **stage** (`dev-sophie`, `dev-marc`), isole des autres. Pas de conflits, pas d'environnements de dev partages. Chaque stage deploie sa propre stack AWS.
-
-### Constructs SST de haut niveau
-
-SST fournit des constructs specialises qui encapsulent les patterns courants avec des valeurs par defaut sensees :
-
-```typescript
-// sst.config.ts
-export default $config({
-  app(input) {
-    return {
-      name: 'my-app',
-      region: 'eu-west-3',
-    };
-  },
-  async run() {
-    // API — cree API Gateway + Lambda + routes automatiquement
-    const api = new sst.aws.ApiGatewayV2('Api');
-    api.route('GET /users', 'packages/functions/src/users.list');
-    api.route('POST /users', 'packages/functions/src/users.create');
-
-    // Table DynamoDB
-    const table = new sst.aws.Dynamo('Orders', {
-      fields: { pk: 'string', sk: 'string' },
-      primaryIndex: { hashKey: 'pk', rangeKey: 'sk' },
-    });
-
-    // Site statique (React, Vue, Next.js...)
-    const site = new sst.aws.StaticSite('Web', {
-      path: 'packages/web',
-      buildCommand: 'npm run build',
-      buildOutput: 'dist',
-      environment: {
-        VITE_API_URL: api.url,
-      },
-    });
-  },
-});
-```
-
-SST injecte automatiquement les URLs et ARN entre les ressources. Le site statique recoit l'URL de l'API en variable d'environnement au moment du build, sans configuration manuelle.
-
-### Comparaison SST vs SAM vs CDK
-
-| Critere | CDK pur | SAM | SST |
-|---|---|---|---|
-| **Langage** | TypeScript, Python, etc. | YAML + code Lambda | TypeScript |
-| **Dev local** | Aucun (deploy a chaque changement) | `sam local invoke` (emulation) | Live Lambda (tunnel vers AWS reel) |
-| **Abstraction** | Constructs L1/L2/L3 | Templates serverless | Constructs haut niveau + CDK |
-| **Environnements** | Manuel (context CDK) | Parametre de stage | Un stage par dev automatique |
-| **Frontend** | Non gere | Non gere | Constructs `StaticSite`, `NextjsSite` |
-| **Courbe d'apprentissage** | Moyenne (CDK + CloudFormation) | Faible (YAML simple) | Faible (TypeScript + conventions) |
-| **Flexibilite** | Totale | Limitee au serverless | Totale (acces a CDK sous le capot) |
-
-**SAM** (Serverless Application Model) est l'outil officiel d'AWS pour le serverless. Il utilise des templates YAML etendus avec des raccourcis (`AWS::Serverless::Function`). Son emulateur local (`sam local`) est pratique mais lent et ne reproduit pas fidelement l'environnement AWS (permissions IAM, VPC, event sources).
-
-**CDK pur** est le plus flexible mais le plus verbeux. Chaque changement de code Lambda necessite un `cdk deploy` (plusieurs minutes). Pas de boucle de feedback rapide pour le developpement.
-
-**SST** combine le meilleur des deux : la flexibilite du CDK (vous pouvez utiliser n'importe quel construct CDK) avec une experience developpeur superieure (Live Lambda, stages automatiques, constructs simplifies).
-
-### Quand utiliser SST
-
-SST est particulierement adapte quand :
-
-- Votre equipe travaille en **TypeScript** sur des applications **serverless**
-- Vous voulez un cycle de developpement rapide (feedback en secondes, pas en minutes)
-- Votre projet combine **backend serverless + frontend** (React, Vue, Next.js)
-- Vous avez besoin d'**environnements isoles** par developpeur
-
-SST n'est pas adapte si vous avez une infrastructure complexe non-serverless (clusters ECS, RDS avec replication complexe) ou si vous travaillez dans un langage autre que TypeScript. Dans ces cas, le CDK pur reste le meilleur choix.
-
-```bash
-# Creer un nouveau projet SST
-npx create-sst@latest my-app
-cd my-app
-npx sst dev     # Mode developpement avec Live Lambda
-npx sst deploy  # Deployer en production
-npx sst remove  # Supprimer toutes les ressources
+Qu'est-ce que le ClickOps et pourquoi le CDK le remplace ?|ClickOps = piloter l'infra à la souris dans la console : non reproductible, non versionné, faillible, non testable. Le CDK décrit l'infra en code TypeScript versionné, reproductible et revu en PR.
+Que génère le CDK sous le capot et qui provisionne réellement les ressources ?|cdk synth transforme le code TypeScript en template CloudFormation. C'est CloudFormation qui provisionne les ressources et gère leur état (rollback, drift). Le CDK ne parle pas directement aux services AWS.
+En CDK v2, combien de paquets npm pour toute la bibliothèque de constructs stables ?|Un seul : aws-cdk-lib (+ le paquet constructs pour la classe de base). Les paquets @aws-cdk/aws-* sont du CDK v1 déprécié. On importe des sous-chemins : aws-cdk-lib/aws-s3.
+Quelle est la différence entre un construct L1, L2 et L3 ?|L1 (Cfn…) = mapping 1:1 avec une ressource CloudFormation, aucun défaut. L2 (curated) = abstraction intent-based, valeurs par défaut sûres, méthodes grant*(). L3 (patterns) = plusieurs ressources combinées pour un cas d'usage complet. On privilégie L2.
+Quels sont les trois arguments d'un construct et à quoi sert l'id ?|(scope, id, props). scope = parent dans l'arbre (souvent this). id = identifiant unique dans le scope, sert à générer l'ID logique CloudFormation — ce n'est PAS le nom physique de la ressource (auto-généré). props = configuration.
+À quoi sert cdk bootstrap et à quelle fréquence le lancer ?|Il déploie la stack CDKToolkit (bucket d'assets S3 + rôles IAM) nécessaire au déploiement. Une seule fois par couple compte+région. Sans lui, le premier cdk deploy échoue avec une erreur sur les assets.
+Différence entre cdk synth, cdk diff et cdk deploy ?|synth génère le template CloudFormation sans rien déployer. diff compare le code au déployé ([+]/[-]/[~]) sans rien déployer. Seul deploy provisionne réellement sur AWS. Toujours lire diff avant deploy.
+Comment garantir qu'un cdk destroy supprime bien un bucket S3 sans échouer ni laisser de coûts ?|removalPolicy: RemovalPolicy.DESTROY (sinon RETAIN par défaut) + autoDeleteObjects: true pour vider le bucket avant suppression, puis cdk destroy. Sans autoDeleteObjects, CloudFormation refuse de supprimer un bucket non vide.
 ```
 
 ---
 
-## 12. Récapitulatif
+## Pont vers le lab
 
-| Concept | Description |
-|---|---|
-| **CDK** | Framework IaC qui génère du CloudFormation à partir de TypeScript |
-| **App** | Racine de l'arbre CDK, contient une ou plusieurs Stacks |
-| **Stack** | Unité de déploiement, correspond à une stack CloudFormation |
-| **Construct L1** | Mapping 1:1 avec CloudFormation (préfixe `Cfn`) |
-| **Construct L2** | Abstraction haut niveau avec valeurs par défaut sensées |
-| **Construct L3** | Pattern combinant plusieurs ressources |
-| **`cdk synth`** | Génère le template CloudFormation |
-| **`cdk diff`** | Compare le code local avec ce qui est déployé |
-| **`cdk deploy`** | Déploie la stack sur AWS |
-| **Aspects** | Applique des règles/modifications à toutes les ressources |
-| **Context** | Valeurs de configuration passées au déploiement |
-| **Assertions** | Tests unitaires sur le template CloudFormation généré |
-| **`grant*()`** | Méthodes L2 pour accorder des permissions IAM minimales |
+> Lab associé : `labs/lab-05-cdk-constructs/README.md`. Tu initialises un vrai projet CDK, tu bootstrap, tu déploies la `StorageStack` de TribuZen sur ton compte AWS, tu lis un `cdk diff`, puis tu **détruis** tout avec `cdk destroy` — vrai outil, zéro harnais simulé.

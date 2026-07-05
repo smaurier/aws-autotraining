@@ -1,643 +1,405 @@
-# 13 — CloudFront — CDN
+---
+titre: "CloudFront : CDN devant S3"
+cours: 12-aws-cloud
+notions: [distributions, "origins (S3, ALB, custom)", "cache behaviors (path patterns)", "TTL (min/default/max)", cache policy, "Origin Access Control (OAC)", invalidation, "CloudFront Functions vs Lambda@Edge", "HTTPS et certificats ACM"]
+outcomes:
+  - sait créer une distribution CloudFront devant un bucket S3 privé
+  - sait sécuriser l'accès S3 avec OAC et une bucket policy sur le service principal cloudfront.amazonaws.com
+  - sait configurer cache behaviors, TTL et cache policy pour piloter le cache au edge
+  - sait invalider le cache et sait pourquoi préférer le versioning de fichiers
+  - sait choisir entre CloudFront Functions et Lambda@Edge
+prerequis: [modules 00-12 du cours 12-aws-cloud (dont 04-s3 bucket privé, BPA, bucket policy)]
+next: 14-cloudwatch-xray-observabilite
+libs: []
+tribuzen: infra cloud TribuZen — CDN CloudFront devant le bucket S3 des avatars/assets (HTTPS, cache, OAC)
+last-reviewed: 2026-07
+---
 
-> **Duree estimee** : 4h00
-> **Difficulte** : 3/5
-> **Prerequis** : Module 04 (S3), Module 06 (API Gateway), notions HTTP
-> **Objectifs** :
-> - Comprendre les concepts fondamentaux d'un **CDN** (Content Delivery Network)
-> - Creer et configurer des **distributions CloudFront**
-> - Maitriser les **cache behaviors**, TTL et **invalidation**
-> - Securiser le contenu avec **OAC**, signed URLs et geo-restriction
-> - Utiliser **Lambda@Edge** et **CloudFront Functions** pour le edge computing
+# CloudFront : CDN devant S3
+
+> **Outcomes — tu sauras FAIRE :** créer une distribution CloudFront devant un bucket S3 **privé**, sécuriser l'accès avec **OAC** (bucket policy), régler les **cache behaviors / TTL**, **invalider** le cache et choisir entre **CloudFront Functions** et **Lambda@Edge**.
+> **Difficulté :** :star::star::star:
+>
+> **Portée :** ce module met **CloudFront devant le bucket S3 du module 04**. On couvre distributions, origins, cache behaviors, TTL, OAC, invalidation, l'edge computing (survol) et HTTPS/ACM. Les **règles HTTP de cache pures** (`Cache-Control`, `ETag`, revalidation côté navigateur) sont le **cours 11 (HTTP caching)** — ici on ne fait que **relier** ces headers au comportement de CloudFront. Route 53 / DNS avancé et le contenu privé signé (signed URLs/cookies) sont mentionnés mais approfondis ailleurs.
+
+## 1. Cas concret d'abord
+
+Au module 04, tu as posé le bucket `tribuzen-avatars-<region>` : **privé**, Block Public Access aux 4 réglages, versionné. Les avatars y sont, en sécurité. Sauf que maintenant le front doit les **afficher**, et trois problèmes concrets surgissent :
+
+1. **Le bucket est privé — donc `<img src="https://tribuzen-avatars.s3...">` renvoie `403`.** Le premier réflèxe (« je rends le bucket public ») rouvre exactement la faille qu'on a fermée au module 04.
+2. **Latence.** Un membre à Tokyo qui charge un avatar hébergé dans le bucket `eu-west-3` (Paris) attend l'aller-retour transcontinental à **chaque** requête. Pour une grille de 30 avatars, ça se voit.
+3. **Coût de sortie et charge.** Chaque affichage tape S3 directement : data transfer facturé, pas de cache, pas de HTTPS sur domaine custom, pas de compression.
+
+La réponse AWS est **CloudFront** : un CDN qu'on place **devant** le bucket. Le bucket **reste strictement privé** ; seul CloudFront y accède, via **OAC** (Origin Access Control). Le contenu est **mis en cache** dans des centaines de points de présence proches des utilisateurs, servi en **HTTPS**, compressé, et le bucket ne voit plus qu'une fraction des requêtes (les cache miss).
+
+```
+AVANT (module 04)        APRÈS (ce module)
+navigateur → S3 (403     navigateur → CloudFront (edge, cache, HTTPS)
+si privé, ou public                     │ cache miss uniquement
+= faille)                               ▼
+                                    S3 privé  ←── OAC (SigV4), bucket policy
+```
+
+Ce module construit exactement ce montage.
 
 ---
 
-## Qu'est-ce qu'un CDN ?
+## 2. Théorie complète, concise
 
-### Le probleme de la latence
+### 2.1 CDN, edge locations, distribution
 
-Imaginez un utilisateur a Tokyo qui accede a un site web heberge sur un serveur a Paris. La requete doit traverser des milliers de kilometres de cables sous-marins, passer par de nombreux routeurs, et revenir avec la reponse. Ce trajet prend du temps — c'est la **latence reseau**.
+Un **CDN** (Content Delivery Network) réplique ton contenu sur des serveurs de cache répartis mondialement pour le servir **au plus près** de l'utilisateur. Vocabulaire CloudFront :
 
-Un **CDN** (Content Delivery Network) resout ce probleme en placant des copies du contenu sur des serveurs repartis dans le monde entier, au plus pres des utilisateurs.
+| Terme | Définition |
+|---|---|
+| **Edge location** | Data center de cache dans une ville (Tokyo, São Paulo…). Sert les cache hits. |
+| **Origin** | La source qui détient l'original (bucket S3, ALB, serveur HTTP custom). |
+| **Distribution** | La ressource CloudFront : elle relie des origins à des cache behaviors et expose un domaine `dxxxx.cloudfront.net`. |
+| **Cache hit / miss** | Hit = servi depuis l'edge (rapide). Miss = CloudFront va chercher à l'origin, puis met en cache. |
 
-### Vocabulaire essentiel
+À la **première** requête d'une région, cache miss → CloudFront interroge l'origin et stocke la réponse. Les requêtes suivantes de la même région sont des **hits** servis localement.
 
-| Terme | Definition |
-|-------|-----------|
-| **Edge Location** | Un data center AWS situe dans une ville (ex : Tokyo, Sao Paulo). C'est la que le contenu est mis en cache |
-| **Origin** | Le serveur source qui detient le contenu original (S3, ALB, serveur custom) |
-| **PoP** (Point of Presence) | Un regroupement de edge locations dans une region geographique |
-| **Distribution** | La configuration CloudFront qui definit quelles origines servir et comment |
-| **Cache Hit** | La requete est servie depuis le edge — rapide |
-| **Cache Miss** | Le contenu n'est pas en cache au edge, CloudFront va le chercher a l'origin |
+### 2.2 Types d'origins
 
-### Comment ca fonctionne
+Une distribution peut pointer vers plusieurs types de sources, et **plusieurs origins** dans la même distribution :
 
-```
-Utilisateur (Tokyo)
-       |
-       v
-Edge Location Tokyo  --[cache hit]--> Reponse rapide (~10ms)
-       |
-       | [cache miss]
-       v
-Origin (S3 Paris)  --> Reponse plus lente (~200ms)
-       |
-       v
-Edge Location Tokyo stocke en cache pour les prochains utilisateurs
-```
-
-A la premiere requete, CloudFront va chercher le contenu a l'origin (cache miss). Ensuite, toutes les requetes suivantes depuis la meme region sont servies directement depuis le edge (cache hit).
-
----
-
-## Distributions CloudFront
-
-### Creer une distribution
-
-Une **distribution** est la ressource principale de CloudFront. Elle definit :
-
-- **L'origin** : d'ou vient le contenu
-- **Les cache behaviors** : comment gerer les requetes
-- **Le domaine** : `d1234abcd.cloudfront.net` (ou un domaine custom)
-
-### Types d'origins
-
-CloudFront peut servir du contenu depuis plusieurs types de sources :
-
-#### 1. Origin S3
-
-Le cas le plus courant — servir des fichiers statiques depuis un bucket S3 :
+- **Origin S3** (le cas de ce module) — sert des fichiers statiques depuis un bucket. ⚠️ Un **bucket régulier** (pas un *website endpoint*) pour pouvoir utiliser OAC (voir 2.5).
+- **Origin ALB / EC2 / custom HTTP** — pour du contenu dynamique généré par un backend. N'importe quel hôte HTTP(S) accessible.
+- **Origins multiples** dans une distribution, aiguillés par les cache behaviors :
 
 ```
-Distribution CloudFront
-  └── Origin: mon-bucket.s3.eu-west-1.amazonaws.com
-        └── /images/logo.png
-        └── /css/style.css
-        └── /index.html
+Distribution TribuZen
+  ├── /api/*     → ALB (contenu dynamique, pas de cache)
+  ├── /avatars/* → S3 tribuzen-avatars (cache long)
+  └── /*         → S3 site statique (default behavior)
 ```
 
-#### 2. Origin ALB (Application Load Balancer)
+### 2.3 Cache behaviors et ordre d'évaluation
 
-Pour du contenu dynamique genere par des serveurs applicatifs :
+Un **cache behavior** est une règle : « pour les URLs qui matchent ce **path pattern**, utilise cette origin, ce protocole, cette cache policy, ces méthodes ». Une distribution a **un default behavior** (`*`, obligatoire) et 0..n behaviors additionnels.
 
-```
-Distribution CloudFront
-  └── Origin: mon-alb-123456.eu-west-1.elb.amazonaws.com
-        └── /api/users
-        └── /api/products
-```
+| Paramètre | Rôle | Exemple |
+|---|---|---|
+| **Path pattern** | Quel chemin matche | `/avatars/*`, `*.jpg`, `*` (default) |
+| **Origin** | Vers quelle source router | S3, ALB, custom |
+| **Viewer protocol policy** | HTTP/HTTPS | Redirect HTTP to HTTPS |
+| **Allowed methods** | Verbes acceptés | GET/HEAD pour du statique |
+| **Cache policy** | Comment mettre en cache (cache key, TTL) | voir 2.4 |
+| **Compress** | gzip/brotli | Oui pour texte/JS/CSS |
 
-#### 3. Origin custom (HTTP)
+CloudFront évalue les behaviors **du plus spécifique au plus général** ; le **premier** path pattern qui matche gagne. Le default (`*`) est le filet de sécurité.
 
-N'importe quel serveur accessible via HTTP/HTTPS :
+### 2.4 TTL et cache policy
 
-```
-Distribution CloudFront
-  └── Origin: api.mon-site.com (port 443)
-```
-
-#### 4. Origins multiples
-
-Une meme distribution peut avoir plusieurs origins avec des **behaviors** differents :
-
-```
-Distribution CloudFront
-  ├── /api/*     → ALB (contenu dynamique)
-  ├── /media/*   → S3 bucket media
-  └── /*         → S3 bucket site statique (default)
-```
-
----
-
-## Cache Behaviors
-
-### Qu'est-ce qu'un cache behavior ?
-
-Un **cache behavior** est une regle qui dit a CloudFront **comment traiter** les requetes correspondant a un certain pattern d'URL.
-
-### Configuration d'un behavior
-
-Chaque behavior definit :
-
-| Parametre | Description | Exemple |
-|-----------|-------------|---------|
-| **Path pattern** | Quel chemin URL correspond | `/api/*`, `/images/*`, `*` (default) |
-| **Origin** | Vers quelle origin router | S3, ALB, custom |
-| **Viewer protocol** | HTTP et/ou HTTPS | Redirect HTTP to HTTPS |
-| **Cache policy** | Comment mettre en cache | TTL, headers, query strings |
-| **Allowed methods** | GET, POST, PUT, DELETE... | GET/HEAD pour statique |
-| **Compress** | Activer la compression gzip/brotli | Oui pour texte/JS/CSS |
-
-### Ordre d'evaluation
-
-CloudFront evalue les behaviors **du plus specifique au plus general** :
-
-```
-1. /api/v2/*        → ALB (pas de cache)
-2. /api/*           → ALB (cache 60s)
-3. /static/*        → S3 (cache 1 an)
-4. *.jpg            → S3 (cache 30 jours)
-5. * (default)      → S3 site (cache 1 jour)
-```
-
-Le premier pattern qui correspond est utilise.
-
----
-
-## TTL et politique de cache
-
-### Qu'est-ce que le TTL ?
-
-Le **TTL** (Time To Live) est la duree pendant laquelle CloudFront garde un objet en cache avant de le re-verifier aupres de l'origin.
-
-### Les trois niveaux de TTL
+Le **TTL** (Time To Live) est la durée pendant laquelle CloudFront garde un objet au edge avant de re-vérifier à l'origin. AWS recommande de le piloter via une **cache policy** attachée au behavior (les anciens réglages « legacy cache settings » existent encore). Trois bornes :
 
 ```
 Minimum TTL ≤ Default TTL ≤ Maximum TTL
 ```
 
-| Parametre | Role | Valeur typique |
-|-----------|------|----------------|
-| **Minimum TTL** | Duree minimale en cache, meme si l'origin dit moins | 0s |
-| **Default TTL** | Utilise quand l'origin ne specifie pas de Cache-Control | 86400s (1 jour) |
-| **Maximum TTL** | Plafond, meme si l'origin dit plus | 31536000s (1 an) |
+| Borne | Rôle | Valeur par défaut si pas de cache policy |
+|---|---|---|
+| **Minimum TTL** | Plancher, même si l'origin dit moins | 0 s |
+| **Default TTL** | Utilisé quand l'origin n'envoie pas de `Cache-Control`/`Expires` | **86 400 s (24 h)** |
+| **Maximum TTL** | Plafond, même si l'origin dit plus | 31 536 000 s (1 an) |
 
-### Headers de cache de l'origin
-
-L'origin peut controler le cache via des headers HTTP :
+**Lien avec le cours 11 (HTTP caching).** L'origin pilote le TTL via les headers HTTP standard — c'est là que les deux cours se rejoignent :
 
 ```
-Cache-Control: max-age=3600          → cache 1h
-Cache-Control: no-cache              → toujours revalider
-Cache-Control: no-store              → ne jamais cacher
-Cache-Control: s-maxage=600          → cache CDN 10min (prioritaire sur max-age)
+Cache-Control: max-age=3600     → CloudFront cache min(3600, MaxTTL)
+Cache-Control: s-maxage=600      → prioritaire côté CDN sur max-age
+Cache-Control: no-store          → pas de cache (si MinTTL = 0)
 ```
 
-### Cache Key
+Règles vérifiées (doc AWS, MinTTL = 0) : avec `max-age`, CloudFront cache pour **le plus petit** de `max-age` et Maximum TTL ; `s-maxage` l'emporte sur `max-age` côté CDN ; sans header, c'est le **Default TTL** qui s'applique.
 
-La **cache key** determine ce qui rend deux requetes "differentes" pour le cache. Par defaut, c'est le **chemin URL** + **query strings** (selon config).
+⚠️ **Piège fréquent** : si Minimum TTL > 0, CloudFront **ignore** `no-cache`/`no-store`/`private` de l'origin et cache quand même pour la durée du Minimum TTL. Laisse Minimum TTL = 0 sauf besoin précis.
 
-Exemple : `/products?page=1` et `/products?page=2` sont deux entrees de cache differentes.
+La **cache key** détermine ce qui rend deux requêtes « différentes » pour le cache : par défaut le **chemin URL** (+ éventuellement query strings/headers/cookies selon la cache policy). `/img?w=100` et `/img?w=200` sont deux entrées distinctes **seulement si** la query string fait partie de la cache key. **Bonne pratique** : inclure le **minimum** dans la cache key → plus de cache hits.
 
-Vous pouvez inclure dans la cache key :
-- Des **query strings** specifiques
-- Des **headers** (ex : `Accept-Language` pour du contenu multilingue)
-- Des **cookies** specifiques
+### 2.5 OAC — Origin Access Control (méthode actuelle)
 
-**Bonne pratique** : inclure le minimum necessaire dans la cache key pour maximiser le taux de cache hit.
+**Le problème.** Pour que CloudFront lise un bucket privé, il faut l'y autoriser sans rendre le bucket public (sinon on contourne CloudFront en tapant S3 directement).
 
----
+**La solution actuelle : OAC** (Origin Access Control). Le bucket **reste privé** ; CloudFront **signe** chaque requête vers S3 en **SigV4**, et une **bucket policy** autorise le **service principal** `cloudfront.amazonaws.com` — mais **uniquement** pour la distribution concernée (condition `AWS:SourceArn`).
 
-## Invalidation de cache
+> **OAC remplace OAI** (Origin Access Identity), l'ancien mécanisme *legacy*. AWS **recommande OAC** : il supporte tous les buckets de **toutes les régions** (y compris les régions opt-in récentes), le chiffrement **SSE-KMS**, et les requêtes **dynamiques** `PUT`/`DELETE`. OAI ne fait rien de tout ça. Pour toute nouvelle distribution : **OAC**.
 
-### Pourquoi invalider ?
+Contraintes vérifiées (doc AWS) :
+- Le bucket doit avoir **S3 Object Ownership = Bucket owner enforced** (le défaut des nouveaux buckets — ACL désactivées).
+- Un bucket configuré en **website endpoint** ne peut **pas** utiliser OAC (il faut le traiter en *custom origin*). Ici on garde un **bucket régulier** privé.
+- Pour toujours signer (recommandé), le **Signing behavior** de l'OAC doit être `always`.
 
-Vous avez deploye une nouvelle version de votre site, mais CloudFront sert encore l'ancienne version depuis son cache. Vous devez **invalider** le cache pour forcer CloudFront a aller chercher le nouveau contenu.
-
-### Creer une invalidation
-
-```bash
-# Invalider un fichier specifique
-aws cloudfront create-invalidation \
-  --distribution-id E1234567890 \
-  --paths "/index.html"
-
-# Invalider un repertoire entier
-aws cloudfront create-invalidation \
-  --distribution-id E1234567890 \
-  --paths "/css/*"
-
-# Invalider TOUT le cache
-aws cloudfront create-invalidation \
-  --distribution-id E1234567890 \
-  --paths "/*"
-```
-
-### Cout et limites
-
-- Les **1 000 premiers chemins** par mois sont gratuits
-- Au-dela : $0.005 par chemin
-- Un wildcard (`/*`) compte comme **un seul chemin**
-- L'invalidation prend generalement **60 a 300 secondes**
-
-### Alternative : versionner les fichiers
-
-Plutot que d'invalider, une meilleure pratique est de **versionner** les noms de fichiers :
-
-```
-/css/style.v1.css  → ancienne version
-/css/style.v2.css  → nouvelle version (nouvelle URL = nouveau cache)
-```
-
-Ou avec des hashes :
-
-```
-/js/app.a3f5b2c.js  → le hash change a chaque build
-```
-
-Ainsi, chaque nouvelle version a une URL unique et pas besoin d'invalidation.
-
----
-
-## OAC — Origin Access Control
-
-### Le probleme
-
-Si votre bucket S3 est public pour que CloudFront puisse y acceder, alors n'importe qui peut acceder directement au bucket en contournant CloudFront. On perd le controle du cache, les metriques et la securite.
-
-### La solution : OAC
-
-**OAC** (Origin Access Control) est le mecanisme **recommande** (remplace l'ancien OAI — Origin Access Identity) pour securiser l'acces S3 via CloudFront.
-
-Principe : le bucket S3 reste **prive**, et seul CloudFront est autorise a y acceder via une **signature SigV4**.
-
-### Comment ca fonctionne
-
-```
-Utilisateur → CloudFront (signe la requete avec SigV4) → S3 prive
-                                                           ↓
-                                                    Bucket policy verifie
-                                                    la signature CloudFront
-```
-
-### Bucket policy avec OAC
+Bucket policy OAC (lecture seule) — telle que la doc la donne :
 
 ```json
 {
   "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "AllowCloudFrontServicePrincipal",
-      "Effect": "Allow",
-      "Principal": {
-        "Service": "cloudfront.amazonaws.com"
-      },
-      "Action": "s3:GetObject",
-      "Resource": "arn:aws:s3:::mon-bucket/*",
-      "Condition": {
-        "StringEquals": {
-          "AWS:SourceArn": "arn:aws:cloudfront::123456789012:distribution/E1234567890"
-        }
+  "Statement": [{
+    "Sid": "AllowCloudFrontServicePrincipalReadOnly",
+    "Effect": "Allow",
+    "Principal": { "Service": "cloudfront.amazonaws.com" },
+    "Action": "s3:GetObject",
+    "Resource": "arn:aws:s3:::tribuzen-avatars-eu-west-3/*",
+    "Condition": {
+      "StringEquals": {
+        "AWS:SourceArn": "arn:aws:cloudfront::111122223333:distribution/E1234567890"
       }
     }
-  ]
+  }]
 }
 ```
 
-### OAC vs OAI
+| Critère | OAI (legacy) | **OAC (actuel)** |
+|---|---|---|
+| Signature | Identité spéciale | **SigV4** standard |
+| SSE-KMS | Non | **Oui** |
+| Toutes régions (opt-in) | Non | **Oui** |
+| `PUT`/`DELETE` dynamiques vers S3 | Non | **Oui** |
 
-| Critere | OAI (ancien) | OAC (recommande) |
-|---------|-------------|-------------------|
-| Signature | Identite speciale | SigV4 standard |
-| SSE-KMS | Non supporte | Supporte |
-| Toutes regions | Non | Oui |
-| Granularite | Par distribution | Par origin |
+### 2.6 Invalidation vs versioning de fichiers
 
-**Utilisez toujours OAC** pour les nouvelles distributions.
+Tu déploies une nouvelle version, mais CloudFront sert encore l'ancienne (TTL non expiré). Deux façons de forcer la fraîcheur :
 
----
+**Invalidation** — supprimer un chemin du cache edge. La prochaine requête repart à l'origin.
 
-## Lambda@Edge vs CloudFront Functions
+```bash
+# Un fichier / un préfixe / tout
+aws cloudfront create-invalidation --distribution-id E123 --paths "/index.html"
+aws cloudfront create-invalidation --distribution-id E123 --paths "/avatars/*"
+aws cloudfront create-invalidation --distribution-id E123 --paths "/*"
+```
 
-### Edge computing avec CloudFront
+Coût/limites vérifiés (doc AWS) : **les 1 000 premiers chemins d'invalidation par mois sont gratuits** (total sur **toutes** tes distributions du compte) ; au-delà, chaque chemin est facturé (facturation **par chemin**, même bundlés dans une requête). Un chemin avec **`*` compte pour UN seul chemin** même s'il invalide des milliers de fichiers.
 
-CloudFront permet d'executer du code **au edge**, c'est-a-dire directement sur les serveurs de cache. Deux options existent :
+**Versioning de fichiers** — la méthode **recommandée** par AWS pour du contenu qui change souvent : donner une **URL unique** à chaque version, donc pas besoin d'invalider.
 
-### CloudFront Functions
+```
+/js/app.a3f5b2c.js   → le hash change à chaque build = nouvelle URL = nouveau cache
+```
 
-- **Langage** : JavaScript (ECMAScript 5.1)
-- **Duree max** : 1 ms
-- **Memoire** : 2 Mo
-- **Acces reseau** : Non
-- **Prix** : ~$0.10 par million d'invocations
-- **Points d'execution** : Viewer Request, Viewer Response
+AWS préfère le versioning : il maîtrise le cache **navigateur** (pas juste l'edge), il est **moins cher** (pas de frais d'invalidation) et il simplifie rollback/A-B. Réserve l'invalidation aux cas ponctuels.
 
-**Cas d'usage** : manipulations legeres de requetes/reponses :
-- Reecriture d'URL (`/about` → `/about/index.html`)
-- Ajout de headers de securite (HSTS, CSP)
-- Redirection HTTP → HTTPS
-- Validation de tokens simples
+### 2.7 CloudFront Functions vs Lambda@Edge (survol)
 
-Exemple — ajouter des headers de securite :
+CloudFront peut exécuter du code **au edge**. Deux options, à ne pas confondre (chiffres vérifiés doc AWS) :
+
+| | **CloudFront Functions** | **Lambda@Edge** |
+|---|---|---|
+| Langage | JavaScript (ECMAScript 5.1) | Node.js et Python |
+| Durée max | **Sub-milliseconde** | Jusqu'à **30 s** (viewer et origin) |
+| Mémoire | 2 Mo | 128 Mo (viewer) / 10 Go (origin) |
+| Taille code + libs | 10 Ko | 50 Mo |
+| Accès réseau / système de fichiers / body | **Non** | **Oui** |
+| Déclencheurs | Viewer Request, Viewer Response | Viewer + Origin (Request/Response) |
+| Échelle | Millions de req/s | 10 000 req/s par région |
+
+**CloudFront Functions** = manipulations légères et ultra-rapides : réécriture d'URL, normalisation de cache key, ajout de headers de sécurité (HSTS, CSP), redirections, validation de token simple (JWT).
+
+**Lambda@Edge** = logique lourde : accès réseau (autre service AWS, SDK), lecture du **body** de la requête, A/B testing avec routage d'origin, traitement d'image. Les 4 points d'exécution :
+
+```
+Client → [Viewer Request] → cache → [Origin Request] → Origin
+Client ← [Viewer Response] ← cache ← [Origin Response] ← ┘
+```
+
+Règle : **CloudFront Functions par défaut** (moins cher, plus rapide) ; Lambda@Edge **seulement** si tu as besoin de réseau, du body, de libs tierces ou d'un runtime Python/Node.
+
+Exemple CloudFront Functions — ajouter des headers de sécurité (Viewer Response) :
 
 ```javascript
 function handler(event) {
   var response = event.response;
   var headers = response.headers;
-
-  headers['strict-transport-security'] = {
-    value: 'max-age=63072000; includeSubdomains; preload'
-  };
-  headers['x-content-type-options'] = { value: 'nosniff' };
-  headers['x-frame-options'] = { value: 'DENY' };
-
+  headers['strict-transport-security'] = { value: 'max-age=63072000; includeSubdomains; preload' };
+  headers['x-content-type-options']    = { value: 'nosniff' };
+  headers['x-frame-options']           = { value: 'DENY' };
   return response;
 }
 ```
 
-### Lambda@Edge
+### 2.8 HTTPS et certificats ACM
 
-- **Langages** : Node.js, Python
-- **Duree max** : 5s (viewer) / 30s (origin)
-- **Memoire** : 128 Mo — 10 Go
-- **Acces reseau** : Oui (appels API, DynamoDB...)
-- **Prix** : ~$0.60 par million + duree
-- **Points d'execution** : Viewer Request, Viewer Response, Origin Request, Origin Response
+CloudFront sert en HTTPS **out of the box** sur le domaine `dxxxx.cloudfront.net` (certificat CloudFront par défaut). Pour un **domaine custom** (`cdn.tribuzen.app`), il faut un certificat **ACM** (AWS Certificate Manager, gratuit, renouvellement auto) :
 
-**Cas d'usage** : logique plus complexe :
-- A/B testing (routage vers differentes origines)
-- Authentification (verification JWT, OAuth)
-- Generation de contenu dynamique au edge
-- Redimensionnement d'images a la volee
-
-### Les 4 points d'execution
-
-```
-Client → [Viewer Request] → Cache CloudFront → [Origin Request] → Origin
-                                                                      |
-Client ← [Viewer Response] ← Cache CloudFront ← [Origin Response] ← ┘
-```
-
-| Point | Quand | Cas d'usage |
-|-------|-------|-------------|
-| **Viewer Request** | Avant le cache | Auth, reecriture URL, redirections |
-| **Origin Request** | Si cache miss, avant origin | A/B testing, routage dynamique |
-| **Origin Response** | Reponse de l'origin | Ajout headers, transformation |
-| **Viewer Response** | Avant envoi au client | Headers securite, CORS |
-
----
-
-## Custom Error Pages
-
-### Personnaliser les erreurs
-
-CloudFront peut intercepter les codes d'erreur de l'origin et retourner une page personnalisee :
-
-```
-Origin retourne 404
-       ↓
-CloudFront intercepte
-       ↓
-Retourne /error/404.html depuis S3 avec code 404
-```
-
-### Configuration des custom error responses
-
-| Parametre | Description |
-|-----------|-------------|
-| **Error Code** | Le code HTTP de l'origin (403, 404, 500...) |
-| **Response Page Path** | Le chemin vers la page d'erreur (`/error/404.html`) |
-| **Response Code** | Le code HTTP retourne au client (peut etre different) |
-| **Error Caching TTL** | Combien de temps cacher cette erreur |
-
-### Cas courant : SPA (Single Page Application)
-
-Pour une SPA, toutes les routes doivent retourner `index.html` :
-
-```
-Configuration custom error :
-  Error Code: 403 → Response: /index.html, Code: 200
-  Error Code: 404 → Response: /index.html, Code: 200
-```
-
-Ainsi, quand un utilisateur accede a `/dashboard/settings`, S3 retourne 404 (le fichier n'existe pas), mais CloudFront retourne `index.html` avec un code 200, et le routeur JavaScript de la SPA gere la navigation.
-
----
-
-## Geo-restriction
-
-### Restreindre l'acces par pays
-
-CloudFront peut **bloquer ou autoriser** l'acces en fonction du pays de l'utilisateur, determine par son adresse IP.
-
-### Deux modes
-
-| Mode | Description |
-|------|-------------|
-| **Allow list** | Seuls les pays listes peuvent acceder |
-| **Block list** | Les pays listes sont bloques |
-
-### Cas d'usage
-
-- **Conformite reglementaire** : contenu restreint a certains pays (ex : droits de diffusion video)
-- **Restrictions legales** : bloquer les pays sous embargo
-- **Licences logicielles** : limiter la distribution par region
-
-### Comportement
-
-Quand un utilisateur bloque tente d'acceder au contenu, CloudFront retourne une erreur **403 Forbidden**. Vous pouvez combiner cela avec une custom error page pour afficher un message explicatif.
-
----
-
-## Signed URLs et Signed Cookies
-
-### Contenu prive via CloudFront
-
-Pour distribuer du contenu prive (videos payantes, documents confidentiels), CloudFront offre deux mecanismes :
-
-### Signed URLs
-
-Une **signed URL** est une URL temporaire qui contient une signature cryptographique. Elle expire apres un delai defini.
-
-```
-https://d1234.cloudfront.net/video/premium.mp4
-  ?Policy=eyJ...                    ← politique encodee
-  &Signature=A2b3c4...             ← signature RSA
-  &Key-Pair-Id=K1234ABCDEF         ← identifiant de la cle
-```
-
-**Cas d'usage** : un fichier specifique pour un utilisateur specifique.
-
-### Signed Cookies
-
-Les **signed cookies** permettent l'acces a **plusieurs fichiers** sans modifier les URLs.
-
-**Cas d'usage** : acces a un repertoire entier (ex : tous les episodes d'une serie).
-
-### Comparaison
-
-| Critere | Signed URL | Signed Cookie |
-|---------|-----------|---------------|
-| Granularite | Un fichier | Plusieurs fichiers |
-| URL modifiee | Oui | Non |
-| RTMP streaming | Supporte | Non |
-| Cas d'usage | Telechargement unique | Acces a une section entiere |
-
-### Cle de signature
-
-Les signed URLs/cookies utilisent une paire de cles RSA :
-1. Vous generez une **paire de cles** RSA (publique/privee)
-2. Vous uploadez la **cle publique** dans CloudFront (Key Group)
-3. Votre serveur signe les URLs avec la **cle privee**
-4. CloudFront verifie la signature avec la cle publique
-
----
-
-## HTTP/2 et HTTP/3
-
-### HTTP/2 (active par defaut)
-
-CloudFront supporte HTTP/2, qui apporte :
-- **Multiplexage** : plusieurs requetes sur une seule connexion TCP
-- **Server Push** : envoyer des ressources avant que le client les demande
-- **Compression des headers** : HPACK reduit la taille des headers
-- **Priorisation** : les ressources critiques sont envoyees en premier
-
-### HTTP/3 (QUIC)
-
-HTTP/3 utilise **QUIC** (base sur UDP) au lieu de TCP :
-- **Connexion plus rapide** : 0-RTT handshake (pas de triple handshake TCP)
-- **Pas de head-of-line blocking** : une perte de paquet ne bloque pas les autres streams
-- **Migration de connexion** : le client peut changer d'IP sans reconnexion (mobile)
-
-HTTP/3 est optionnel et s'active dans les parametres de la distribution. Le client negocie automatiquement la meilleure version supportee.
-
----
-
-## Price Classes
-
-### Optimiser les couts
-
-CloudFront est present dans **450+ PoP** dans le monde, mais tous les edge locations n'ont pas le meme prix. Les **price classes** permettent de limiter les regions utilisees pour reduire les couts.
-
-| Price Class | Regions incluses | Cout relatif |
-|-------------|-----------------|--------------|
-| **Price Class All** | Toutes (y compris Amerique du Sud, Afrique) | Le plus cher |
-| **Price Class 200** | USA, Europe, Asie, Moyen-Orient, Afrique | Intermediaire |
-| **Price Class 100** | USA, Europe | Le moins cher |
-
-### Quel impact ?
-
-Si vous choisissez Price Class 100 et qu'un utilisateur au Bresil accede a votre site :
-- Le contenu sera servi depuis le PoP **le plus proche dans les regions incluses** (probablement USA)
-- La latence sera plus elevee pour cet utilisateur
-- Mais le cout sera reduit
-
-**Recommandation** : utilisez Price Class All pour une audience mondiale, Price Class 100 pour une audience principalement europeenne/americaine.
-
----
-
-## Route 53, DNS et certificats ACM
-
-Pour servir votre app sur un domaine personnalisé (ex: `app.example.com`), vous avez besoin de 3 services AWS qui fonctionnent ensemble.
-
-### Route 53 — DNS managé
-
-Route 53 est le service DNS d'AWS. Il gère les **hosted zones** (domaines) et les **records** (enregistrements DNS).
-
-```
-example.com (Hosted Zone)
-├── A     app.example.com    → CloudFront distribution
-├── AAAA  app.example.com    → CloudFront distribution (IPv6)
-├── CNAME api.example.com    → ALB ou API Gateway
-└── MX    example.com        → Service email
-```
-
-**ALIAS records** : spécificité AWS — comme un CNAME mais fonctionne à la racine du domaine (`example.com`) et ne coûte rien en requêtes DNS.
-
-### ACM — Certificats TLS gratuits
-
-AWS Certificate Manager fournit des certificats TLS **gratuits** avec renouvellement automatique.
+- Le certificat pour CloudFront **doit** être créé dans **`us-east-1`**, quelle que soit la région de ton bucket (contrainte AWS).
+- Validation **DNS** : ACM te donne un CNAME à ajouter à ta zone ; une fois validé, le certificat est émis et renouvelé seul.
+- On associe le certificat à la distribution + les *alternate domain names* (CNAMEs), puis un **ALIAS record** (Route 53) pointe le domaine vers la distribution.
 
 ```bash
-# Créer un certificat via CLI
 aws acm request-certificate \
-  --domain-name "*.example.com" \
-  --subject-alternative-names "example.com" \
+  --domain-name "cdn.tribuzen.app" \
   --validation-method DNS \
-  --region us-east-1  # OBLIGATOIRE pour CloudFront
+  --region us-east-1        # OBLIGATOIRE pour CloudFront
 ```
 
-**Important** : les certificats pour CloudFront **doivent** être créés dans `us-east-1`, même si votre app est en `eu-west-1`.
+Côté behavior, force **Redirect HTTP to HTTPS** (ou HTTPS only) pour ne jamais servir en clair.
 
-Validation DNS : ACM vous donne un record CNAME à ajouter à votre hosted zone. Une fois validé, le certificat est émis et renouvelé automatiquement.
+---
 
-### Workflow complet : domaine → CloudFront
+## 3. Worked examples
+
+### Exemple 1 — CloudFront + OAC devant le bucket privé d'avatars (de zéro, CLI)
+
+Objectif : servir `avatars/tribu-42/alice.jpg` en HTTPS via CloudFront, le bucket restant **privé**. Le flux général :
+
+```bash
+BUCKET="tribuzen-avatars-eu-west-3"
+
+# 1. Créer l'OAC (signe toujours, SigV4)
+aws cloudfront create-origin-access-control \
+  --origin-access-control-config \
+  Name=oac-tribuzen-avatars,SigningBehavior=always,SigningProtocol=sigv4,OriginAccessControlOriginType=s3
+# → note l'Id de l'OAC dans la sortie
+
+# 2. Créer la distribution avec le bucket comme origin S3 + l'OAC attaché
+#    (via un fichier de config JSON généré puis édité)
+aws cloudfront create-distribution --distribution-config file://dist-config.json
+# → note l'Id (E123...) et le DomainName (dxxxx.cloudfront.net)
+
+# 3. Autoriser CloudFront à lire le bucket, SANS le rendre public :
+cat > bucket-policy.json <<'EOF'
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "AllowCloudFrontServicePrincipalReadOnly",
+    "Effect": "Allow",
+    "Principal": { "Service": "cloudfront.amazonaws.com" },
+    "Action": "s3:GetObject",
+    "Resource": "arn:aws:s3:::tribuzen-avatars-eu-west-3/*",
+    "Condition": {
+      "StringEquals": {
+        "AWS:SourceArn": "arn:aws:cloudfront::111122223333:distribution/E123"
+      }
+    }
+  }]
+}
+EOF
+aws s3api put-bucket-policy --bucket "$BUCKET" --policy file://bucket-policy.json
+
+# 4. Attendre le déploiement (Status: Deployed), puis tester
+curl -I "https://dxxxx.cloudfront.net/avatars/tribu-42/alice.jpg"
+#   1re requête : X-Cache: Miss from cloudfront
+#   2e requête : X-Cache: Hit from cloudfront
+```
+
+Ce que ce montage garantit :
+- Le bucket reste **privé** : `curl` directement sur l'URL S3 renvoie `403`, seul CloudFront (signature SigV4, SourceArn = cette distribution) passe.
+- La 2ᵉ requête est un **hit** au edge : latence réduite, S3 n'est pas retapé.
+- HTTPS de bout en bout, sans exposer une seule clé.
+
+### Exemple 2 — Déployer un nouvel avatar et rafraîchir le cache
+
+Un membre change d'avatar (même key `alice.jpg`). CloudFront sert l'ancienne image tant que le TTL n'a pas expiré.
+
+```bash
+# On ré-uploade la nouvelle image sous la même key
+aws s3 cp alice-new.jpg s3://tribuzen-avatars-eu-west-3/avatars/tribu-42/alice.jpg
+
+# Option A (ponctuel) : invalider ce chemin — 1 chemin, gratuit sous 1000/mois
+aws cloudfront create-invalidation \
+  --distribution-id E123 \
+  --paths "/avatars/tribu-42/alice.jpg"
+
+# Option B (recommandée pour des assets qui changent souvent) :
+# versionner la key → /avatars/tribu-42/alice.v2.jpg (nouvelle URL = pas d'invalidation)
+```
+
+Pour un avatar (changement rare, une key stable attendue par le front), l'invalidation ponctuelle est OK. Pour du **JS/CSS de build** qui change à chaque déploiement, le **versioning par hash** est la bonne réponse — pas 1 000 invalidations par mois.
+
+---
+
+## 4. Pièges & misconceptions
+
+### PIÈGE #1 — « Je rends le bucket public pour que CloudFront lise »
+
+C'est annuler tout le module 04. Le bon montage est **bucket privé + OAC** : la bucket policy autorise `cloudfront.amazonaws.com` **pour cette distribution seulement** (`AWS:SourceArn`), et Block Public Access reste actif. CloudFront devient le **seul** chemin d'accès.
+
+### PIÈGE #2 — Utiliser OAI (l'ancien mécanisme)
+
+OAI est *legacy*. Il ne supporte ni **SSE-KMS**, ni les buckets des **régions opt-in** récentes, ni les requêtes **`PUT`/`DELETE`**. Pour toute nouvelle distribution : **OAC**. Si tu tombes sur de l'OAI dans un projet existant, la doc AWS décrit la migration (bucket policy à deux statements pendant la transition, puis on retire l'OAI).
+
+### PIÈGE #3 — Confondre CloudFront et le cache HTTP du cours 11
+
+CloudFront est un **CDN** (cache **partagé** au edge, géré par TTL/cache policy). Le cours 11 traite du cache **HTTP** au sens protocole (`Cache-Control`, `ETag`, `304`, cache **navigateur**). Ils se **branchent** l'un sur l'autre — l'origin envoie `Cache-Control`, CloudFront l'interprète — mais ce ne sont pas la même couche. Ici on configure le CDN ; le détail des directives HTTP est le cours 11.
+
+### PIÈGE #4 — Croire que l'invalidation `/*` coûte « des milliers de chemins »
+
+Un chemin avec `*` compte pour **UN seul** chemin de facturation, même s'il vide des milliers de fichiers. Le piège inverse est plus courant : **abuser** de l'invalidation à chaque déploiement au lieu de **versionner les fichiers** (moins cher, maîtrise aussi le cache navigateur).
+
+### PIÈGE #5 — Minimum TTL > 0 qui « ignore » `no-store`
+
+Si tu mets un Minimum TTL > 0, CloudFront **cache quand même** pour cette durée, même si l'origin envoie `no-cache`/`no-store`/`private`. Résultat : du contenu que tu croyais non caché reste au edge. Laisse **Minimum TTL = 0** sauf raison précise, et pilote la durée via `Cache-Control` de l'origin.
+
+### PIÈGE #6 — Certificat ACM créé dans la mauvaise région
+
+Un certificat ACM pour CloudFront **doit** vivre dans **`us-east-1`**, même si ton bucket et ton app sont en `eu-west-3`. Un certificat créé dans la région de l'app ne sera **pas** proposé à la distribution. C'est l'erreur classique du premier domaine custom.
+
+### PIÈGE #7 — CloudFront Functions vs Lambda@Edge sur le mauvais besoin
+
+CloudFront Functions est **sub-milliseconde**, sans réseau ni accès au body. Si tu as besoin d'appeler DynamoDB, de lire le corps de la requête ou d'une lib tierce → **Lambda@Edge**. Vouloir faire un appel réseau depuis une CloudFront Function échoue par conception.
+
+---
+
+## 5. Ancrage TribuZen
+
+Dans l'infra `tribuzen`, CloudFront est le **CDN devant la couche médias S3** posée au module 04. Le bucket `tribuzen-avatars-<region>` reste **privé** ; CloudFront (OAC) est le seul à le lire, et le front ne connaît que le domaine CDN.
 
 ```
-1. Acheter/transférer le domaine vers Route 53
-2. Créer un certificat ACM dans us-east-1 (wildcard *.example.com)
-3. Valider le certificat via DNS (ajouter le CNAME dans Route 53)
-4. Configurer CloudFront avec le certificat ACM et les alternate domain names
-5. Créer un ALIAS record dans Route 53 pointant vers la distribution CloudFront
+front (Nuxt)  ──GET https://cdn.tribuzen.app/avatars/tribu-42/alice.jpg──▶ CloudFront
+                                                          │ cache miss
+                                                          ▼
+                                    S3 privé tribuzen-avatars ←── OAC (SigV4)
+                                    bucket policy: cloudfront.amazonaws.com + SourceArn
 ```
 
-### Exemple CDK
+- **Lecture des avatars** : le front pointe `src` vers `cdn.tribuzen.app` (certificat ACM us-east-1, Redirect HTTP→HTTPS), jamais vers l'URL S3. Cache long (`Cache-Control: max-age` posé sur les objets), compression activée.
+- **Écriture** reste inchangée : upload direct navigateur → S3 par **presigned URL** (module 04). CloudFront est en **lecture** ; l'écriture ne passe pas par lui.
+- **Assets de build** (JS/CSS du front) : servis via CloudFront avec **versioning par hash** (`app.<hash>.js`) → pas d'invalidation à chaque déploiement.
+- **Headers de sécurité** (HSTS, `X-Content-Type-Options`, `X-Frame-Options`) ajoutés par une **CloudFront Function** en Viewer Response — pas besoin de Lambda@Edge ici.
 
-```typescript
-import { HostedZone, ARecord, RecordTarget } from 'aws-cdk-lib/aws-route53';
-import { CloudFrontTarget } from 'aws-cdk-lib/aws-route53-targets';
-import { Certificate, CertificateValidation } from 'aws-cdk-lib/aws-certificatemanager';
-import { Distribution } from 'aws-cdk-lib/aws-cloudfront';
+Fichiers cibles dans `smaurier/tribuzen` :
+```
+tribuzen/
+  infra/
+    cloudfront-avatars.ts   ← distribution + OAC + cache policy (CDK, module 05)
+    s3-avatars.ts           ← bucket privé du module 04 (référencé comme origin)
+  edge/
+    security-headers.js     ← CloudFront Function (Viewer Response)
+```
 
-// Récupérer la hosted zone existante
-const zone = HostedZone.fromLookup(this, 'Zone', {
-  domainName: 'example.com',
-});
+> La distribution est **définie en CDK** (module 05) : `Distribution`, `S3BucketOrigin.withOriginAccessControl(bucket)`, cache policy. Ici on l'a montée en CLI pour comprendre chaque pièce ; en prod, c'est du code.
 
-// Certificat TLS (cross-region pour CloudFront)
-const certificate = new Certificate(this, 'Cert', {
-  domainName: '*.example.com',
-  subjectAlternativeNames: ['example.com'],
-  validation: CertificateValidation.fromDns(zone),
-});
+---
 
-// Distribution CloudFront avec le certificat
-const distribution = new Distribution(this, 'CDN', {
-  defaultBehavior: { origin: s3Origin },
-  domainNames: ['app.example.com'],
-  certificate,
-});
+## 6. Points clés
 
-// Record DNS pointant vers CloudFront
-new ARecord(this, 'AppRecord', {
-  zone,
-  recordName: 'app',
-  target: RecordTarget.fromAlias(new CloudFrontTarget(distribution)),
-});
+1. **CloudFront** est un **CDN** : cache le contenu au **edge** proche des utilisateurs ; la **distribution** relie origins et cache behaviors et expose un domaine HTTPS.
+2. On met CloudFront **devant un bucket S3 privé** — jamais public : c'est OAC qui donne l'accès, pas l'ouverture du bucket.
+3. Un **cache behavior** = règle par **path pattern** (origin, méthodes, cache policy) ; évaluation du plus spécifique au plus général ; le default `*` est obligatoire.
+4. Le **TTL** (min ≤ default ≤ max) pilote le cache ; Default TTL = **24 h** sans header ; l'origin ajuste via `Cache-Control`/`s-maxage` — **c'est le pont avec le cours 11** (HTTP caching).
+5. **OAC** (méthode actuelle, remplace **OAI**) : bucket privé, CloudFront signe en **SigV4**, bucket policy sur `cloudfront.amazonaws.com` + condition `AWS:SourceArn` ; supporte SSE-KMS, toutes régions, `PUT`/`DELETE`.
+6. **Invalidation** : 1 000 chemins/mois gratuits (compte entier), `*` = **1 chemin** ; AWS recommande plutôt le **versioning de fichiers** (moins cher, gère aussi le cache navigateur).
+7. **CloudFront Functions** (JS, sub-ms, sans réseau) pour les manipulations légères ; **Lambda@Edge** (Node/Python, ≤ 30 s, réseau + body) pour la logique lourde.
+8. **HTTPS/ACM** : domaine custom = certificat ACM dans **`us-east-1`** (obligatoire pour CloudFront), validation DNS, Redirect HTTP→HTTPS.
+
+---
+
+## 7. Seeds Anki
+
+```
+Pourquoi mettre CloudFront devant un bucket S3 privé plutôt que rendre le bucket public ?|Public rouvre la faille : n'importe qui tape S3 directement, contournant cache/HTTPS/sécurité. Avec CloudFront + OAC, le bucket reste privé (Block Public Access actif) et CloudFront est le SEUL à y accéder, via signature SigV4 autorisée par la bucket policy.
+OAC ou OAI pour sécuriser un origin S3, et pourquoi ?|OAC (Origin Access Control) est la méthode ACTUELLE ; OAI est legacy. OAC seul supporte SSE-KMS, tous les buckets de toutes régions (opt-in incluses) et les requêtes PUT/DELETE. Toute nouvelle distribution : OAC.
+Que contient la bucket policy pour autoriser CloudFront via OAC ?|Principal = service cloudfront.amazonaws.com, Action s3:GetObject, et une Condition StringEquals sur AWS:SourceArn = l'ARN de la distribution. Ça limite l'accès à CETTE distribution, bucket restant privé.
+Quel est le Default TTL de CloudFront sans cache policy, et qui peut le surcharger ?|24 h (86 400 s) quand l'origin n'envoie ni Cache-Control ni Expires. L'origin surcharge via Cache-Control: max-age (CloudFront cache min(max-age, Max TTL)) ; s-maxage est prioritaire côté CDN sur max-age.
+Combien coûte une invalidation, et que compte un chemin avec un wildcard ?|Les 1000 premiers chemins/mois sont gratuits (sur tout le compte). Au-delà, facturation par chemin. Un chemin avec * (ex : /* ) compte pour UN seul chemin même s'il invalide des milliers de fichiers. AWS recommande plutôt le versioning de fichiers.
+Quand choisir CloudFront Functions plutôt que Lambda@Edge ?|CloudFront Functions (JS ES5.1, sub-milliseconde, 2 Mo, PAS de réseau ni body) pour manipulations légères : réécriture d'URL, headers de sécurité, cache key. Lambda@Edge (Node/Python, jusqu'à 30 s, accès réseau + body + libs) pour la logique lourde. Par défaut : Functions.
+Pourquoi préférer le versioning de fichiers à l'invalidation de cache ?|Le versioning (URL unique par version, ex : app.<hash>.js) maîtrise aussi le cache NAVIGATEUR (pas juste l'edge), ne coûte rien (pas de frais d'invalidation), et simplifie rollback/A-B. L'invalidation reste pour les cas ponctuels.
+Dans quelle région créer un certificat ACM pour CloudFront ?|us-east-1 OBLIGATOIREMENT, même si le bucket/l'app sont ailleurs (eu-west-3). Un certificat créé dans la région de l'app ne sera pas proposé à la distribution.
 ```
 
 ---
 
-## Bonnes pratiques
+## Pont vers le lab
 
-### Performance
-- Activez la **compression** (gzip/brotli) pour les fichiers texte
-- Utilisez des **TTL longs** pour les assets statiques versionnees
-- Activez **HTTP/3** pour les clients mobiles
-- Minimisez la **cache key** (moins de variations = plus de cache hits)
-
-### Securite
-- Utilisez **OAC** pour securiser les origins S3
-- Forcez **HTTPS** (redirect HTTP to HTTPS)
-- Ajoutez des **headers de securite** via CloudFront Functions
-- Utilisez des **signed URLs/cookies** pour le contenu prive
-
-### Cout
-- Choisissez la **price class** adaptee a votre audience
-- **Versionnez les fichiers** au lieu d'invalider le cache
-- Monitorer le **cache hit ratio** (objectif : > 90%)
-- Utilisez **CloudFront Functions** plutot que Lambda@Edge quand possible
-
-### Monitoring
-- **Cache hit ratio** : pourcentage de requetes servies depuis le cache
-- **Error rate** : taux d'erreurs 4xx/5xx
-- **Latence** : temps de reponse au edge
-- **Transfer out** : volume de donnees servies (impact sur la facturation)
-
----
-
-## Recapitulatif
-
-| Concept | A retenir |
-|---------|-----------|
-| **CDN** | Cache le contenu au plus pres des utilisateurs |
-| **Distribution** | Configuration CloudFront (origins + behaviors) |
-| **Cache Behavior** | Regle par pattern URL (origin, TTL, methodes) |
-| **OAC** | Securise l'acces S3 via signature SigV4 |
-| **Invalidation** | Force le rafraichissement du cache (preferer le versioning) |
-| **CloudFront Functions** | Code leger au edge (< 1ms, JS) |
-| **Lambda@Edge** | Code complexe au edge (Node.js/Python, acces reseau) |
-| **Signed URL/Cookie** | Distribution de contenu prive temporaire |
-| **Price Class** | Limiter les regions pour reduire les couts |
+> Lab associé : `labs/lab-13-cloudfront-cdn/README.md`. Monter une **vraie** distribution CloudFront devant un bucket S3 **privé** avec **OAC** + bucket policy, prouver le hit/miss au `curl`, invalider un chemin — avec rappel **teardown** (coût AWS). Corrigé CLI intégral, feedback coach en session.

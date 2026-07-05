@@ -1,858 +1,379 @@
-# Module 04 — S3 : Stockage d'Objets
+---
+titre: "S3 : stockage d'objets"
+cours: 12-aws-cloud
+notions: [buckets et objets, "classes de stockage (Standard, IA, Glacier)", versioning, lifecycle, "bucket policy vs IAM", block public access, presigned URLs, static website hosting]
+outcomes:
+  - sait créer un bucket, uploader/lister des objets en Console et en CLI
+  - sait choisir une classe de stockage selon la fréquence d'accès et le coût
+  - sait activer le versioning et poser une lifecycle rule
+  - sait distinguer bucket policy et politique IAM et sécuriser un bucket avec Block Public Access
+  - sait générer une presigned URL pour un upload direct navigateur vers S3
+prerequis: [modules 00-03 du cours 12-aws-cloud (compte, régions, IAM, réseau, EC2)]
+next: 05-cdk-infrastructure-code
+libs: []
+tribuzen: infra cloud TribuZen — stockage S3 des avatars et photos de tribu, upload direct par presigned URL
+last-reviewed: 2026-07
+---
 
-> **Objectif** : Maîtriser Amazon S3 : stockage, classes, sécurité, cycle de vie, et exploiter les fonctionnalités avancées comme le versioning, les notifications et l'hébergement statique.
-> **Difficulté** : ⭐⭐⭐
-> **Prérequis** : Module 01
-> **Durée estimée** : 5 heures
+# S3 : stockage d'objets
+
+> **Outcomes — tu sauras FAIRE :** créer et remplir un bucket (Console + CLI), choisir une classe de stockage, activer le versioning + une lifecycle rule, sécuriser un bucket (bucket policy vs IAM, Block Public Access), générer une presigned URL d'upload.
+> **Difficulté :** :star::star::star:
+>
+> **Portée :** ce module couvre **S3 seul**. Mettre un CDN **CloudFront devant S3** (HTTPS, cache, OAC) est le sujet du **module 13**. Le chiffrement KMS avancé et Object Lock relèvent du **module 15 (sécurité AWS avancée)**. Ici on reste sur le stockage, l'accès et le cycle de vie des objets.
+
+## 1. Cas concret d'abord
+
+Tu travailles sur l'infra TribuZen. La première demande produit : les membres d'une tribu doivent pouvoir **uploader une photo d'avatar**. Un dev a codé ça dans le back Node :
+
+```
+Navigateur ──(POST fichier 3 Mo)──▶ API Node (EC2) ──(PutObject)──▶ S3
+```
+
+Trois problèmes concrets apparaissent en prod :
+
+1. **Le fichier transite par ton serveur.** Chaque avatar de 3 Mo occupe la RAM et la bande passante de l'instance EC2. À 500 uploads simultanés, l'API sature — alors que S3, lui, encaisserait sans broncher.
+2. **Où sont les credentials AWS ?** Le serveur a une clé pour écrire dans S3. Si tu voulais laisser le navigateur écrire *directement*, il te faudrait exposer une clé AWS au client — inacceptable.
+3. **Le bucket est-il public ?** Le premier réflexe (« je mets le bucket en public pour que les avatars s'affichent ») ouvre la porte à n'importe qui pour lister et écraser tes fichiers.
+
+Ce module répond aux trois : **presigned URL** pour que le navigateur écrive dans S3 sans credential et sans passer par ton serveur, **Block Public Access + bucket policy** pour n'exposer que ce qui doit l'être, et **classes de stockage + lifecycle** pour ne pas payer le prix fort sur des vieilles photos jamais reconsultées.
 
 ---
 
-## Table des matières
+## 2. Théorie complète, concise
 
-1. [Qu'est-ce que S3 ?](#quest-ce-que-s3)
-2. [Buckets, objets et clés](#buckets-objets-et-clés)
-3. [Classes de stockage](#classes-de-stockage)
-4. [Versioning](#versioning)
-5. [Lifecycle Policies](#lifecycle-policies)
-6. [Sécurité : Bucket Policies vs ACL](#sécurité--bucket-policies-vs-acl)
-7. [Chiffrement côté serveur (SSE)](#chiffrement-côté-serveur)
-8. [S3 Event Notifications](#s3-event-notifications)
-9. [Hébergement de site statique](#hébergement-de-site-statique)
-10. [Transfer Acceleration](#transfer-acceleration)
-11. [Multipart Upload](#multipart-upload)
-12. [Fonctionnalités avancées](#fonctionnalités-avancées)
-13. [Bonnes pratiques](#bonnes-pratiques)
+### 2.1 Buckets et objets
 
----
+**S3** (Simple Storage Service) est un stockage **d'objets** : tu ranges des fichiers, pas des blocs (EBS) ni un système de fichiers (EFS). Deux niveaux seulement :
 
-## Qu'est-ce que S3 ?
+- **Bucket** — le conteneur. Son nom est **unique dans tout AWS** (pas juste ton compte), 3 à 63 caractères, minuscules/chiffres/tirets. Un bucket vit dans **une région**.
+- **Objet** — un fichier + ses métadonnées, identifié par sa **key** (chemin complet). Un objet pèse de 0 octet à **5 To**.
 
-**S3** (Simple Storage Service) est un service de stockage d'objets offrant une durabilité de **99,999999999%** (11 neufs). Vos données sont automatiquement répliquées sur au moins **3 AZ** dans une région.
-
-**Analogie** : S3 est un **entrepôt géant** avec des casiers infinis. Chaque casier (bucket) a un nom unique au monde. À l'intérieur, vous rangez des objets (fichiers) dans des dossiers virtuels. L'entrepôt ne tombe jamais en panne et peut stocker une quantité illimitée d'objets.
-
-### Caractéristiques fondamentales
-
-- Stockage **illimité** (pas de provisionnement de capacité)
-- Taille d'un objet : 0 octets à **5 To**
-- Durabilité : 99,999999999% (11 neufs)
-- Disponibilité : 99,99% (Standard)
-- Accès via HTTP/HTTPS (API REST)
+Il n'y a **pas de vrais dossiers** dans S3. `avatars/tribu-42/alice.jpg` est une seule key ; le `/` n'est qu'une convention de préfixe que la Console affiche comme une arborescence.
 
 ```bash
-# Créer un bucket
-aws s3 mb s3://mon-app-production-eu-west-3-2026
+# Créer un bucket (région explicite)
+aws s3 mb s3://tribuzen-avatars-eu-west-3 --region eu-west-3
 
-# Uploader un fichier
-aws s3 cp mon-fichier.zip s3://mon-app-production-eu-west-3-2026/backups/
+# Uploader un objet
+aws s3 cp alice.jpg s3://tribuzen-avatars-eu-west-3/avatars/tribu-42/alice.jpg
 
-# Lister le contenu
-aws s3 ls s3://mon-app-production-eu-west-3-2026/backups/
+# Lister sous un préfixe
+aws s3 ls s3://tribuzen-avatars-eu-west-3/avatars/tribu-42/
 
-# Synchroniser un répertoire
-aws s3 sync ./dist s3://mon-app-production-eu-west-3-2026/static/ --delete
+# Synchroniser un dossier local (utile pour un site statique)
+aws s3 sync ./dist s3://tribuzen-site --delete
 ```
 
----
+> Durabilité annoncée : **99,999999999 %** (« 11 neufs ») — les objets sont répliqués sur **au moins 3 zones de disponibilité** pour les classes multi-AZ (voir 2.2). Durabilité ≠ disponibilité : la première dit « tes octets ne sont pas perdus », la seconde « le service répond ».
 
-## Buckets, objets et clés
+### 2.2 Classes de stockage
 
-### Buckets
+Une classe de stockage se choisit **par objet**, selon la fréquence d'accès. Toutes offrent la même durabilité (11 neufs) sauf `REDUCED_REDUNDANCY` (déconseillée). Chiffres vérifiés sur la doc AWS :
 
-Un **bucket** est le conteneur de niveau supérieur dans S3.
+| Classe (constante API) | AZ | Durée min de stockage | Taille min facturée | Usage type |
+|---|---|---|---|---|
+| S3 Standard (`STANDARD`) | ≥ 3 | aucune | aucune | Données chaudes, accès fréquent |
+| S3 Intelligent-Tiering (`INTELLIGENT_TIERING`) | ≥ 3 | aucune | aucune | Accès imprévisible (frais de monitoring/objet) |
+| S3 Standard-IA (`STANDARD_IA`) | ≥ 3 | 30 jours | 128 Ko | Accès rare mais immédiat requis |
+| S3 One Zone-IA (`ONEZONE_IA`) | 1 | 30 jours | 128 Ko | Données recréables (1 seule AZ) |
+| S3 Glacier Instant Retrieval (`GLACIER_IR`) | ≥ 3 | 90 jours | 128 Ko | Archive avec accès milliseconde |
+| S3 Glacier Flexible Retrieval (`GLACIER`) | ≥ 3 | 90 jours | — | Archive, restauration minutes→heures |
+| S3 Glacier Deep Archive (`DEEP_ARCHIVE`) | ≥ 3 | 180 jours | — | Archive froide, restauration en heures |
 
-- Le nom doit être **globalement unique** (dans tout AWS, pas juste votre compte)
-- Entre 3 et 63 caractères, minuscules, chiffres, tirets
-- Créé dans une **région** spécifique
-- Pas de limite de nombre d'objets
+Points à retenir :
 
-### Objets
-
-Un **objet** est composé de :
-
-| Composant | Description | Limite |
-|-----------|------------|--------|
-| **Key** | Chemin complet de l'objet | 1 024 octets UTF-8 |
-| **Value** | Le contenu du fichier | 5 To max |
-| **Metadata** | Paires clé-valeur (system + user) | 2 Ko |
-| **Version ID** | Identifiant de version (si activé) | — |
-| **Tags** | Paires clé-valeur pour la gestion | 10 max |
-
-### Structure des clés
-
-```
-s3://mon-bucket/photos/2026/03/vacances.jpg
-│               │                          │
-│               └── Key (chemin complet) ──┘
-└── Bucket
-
-Il n'y a PAS de vrais dossiers dans S3.
-"photos/2026/03/" est un préfixe, pas un répertoire.
-```
-
-### Avec SDK TypeScript v3
-
-```typescript
-import {
-  S3Client,
-  PutObjectCommand,
-  GetObjectCommand,
-  ListObjectsV2Command,
-} from '@aws-sdk/client-s3';
-
-const s3 = new S3Client({ region: 'eu-west-3' });
-
-// Upload un objet
-await s3.send(new PutObjectCommand({
-  Bucket: 'mon-app-production',
-  Key: 'reports/2026/03/monthly.pdf',
-  Body: Buffer.from('contenu du rapport'),
-  ContentType: 'application/pdf',
-  Metadata: {
-    'generated-by': 'report-service',
-    'report-month': '2026-03',
-  },
-}));
-
-// Lire un objet
-const response = await s3.send(new GetObjectCommand({
-  Bucket: 'mon-app-production',
-  Key: 'reports/2026/03/monthly.pdf',
-}));
-const body = await response.Body?.transformToString();
-
-// Lister les objets avec un préfixe
-const list = await s3.send(new ListObjectsV2Command({
-  Bucket: 'mon-app-production',
-  Prefix: 'reports/2026/',
-  MaxKeys: 100,
-}));
-
-for (const obj of list.Contents ?? []) {
-  console.log(`${obj.Key} — ${obj.Size} octets — ${obj.LastModified}`);
-}
-```
-
----
-
-## Classes de stockage
-
-S3 propose plusieurs classes de stockage pour optimiser les coûts selon la fréquence d'accès.
-
-### Tableau comparatif
-
-| Classe | Disponibilité | AZ min | Latence accès | Coût stockage | Coût récupération | Cas d'usage |
-|--------|--------------|--------|--------------|---------------|-------------------|-------------|
-| **Standard** | 99,99% | ≥ 3 | Millisecondes | $$$  | Gratuit | Données fréquemment accédées |
-| **Intelligent-Tiering** | 99,9% | ≥ 3 | Millisecondes | $$$ (auto) | Gratuit | Accès imprévisible |
-| **Standard-IA** | 99,9% | ≥ 3 | Millisecondes | $$ | $ par Go | Accès moins fréquent (>30j) |
-| **One Zone-IA** | 99,5% | 1 | Millisecondes | $ | $ par Go | Données reproductibles |
-| **Glacier Instant** | 99,9% | ≥ 3 | Millisecondes | $ | $$ par Go | Archives avec accès immédiat |
-| **Glacier Flexible** | 99,99% | ≥ 3 | Minutes à heures | ¢ | $$$ par Go | Archives, accès rare |
-| **Glacier Deep Archive** | 99,99% | ≥ 3 | 12 à 48 heures | ¢¢ | $$$$ par Go | Conformité, rétention longue |
-
-### Intelligent-Tiering
-
-S3 Intelligent-Tiering déplace automatiquement les objets entre les niveaux :
-
-```
-Accès fréquent (par défaut)
-    ↓ (30 jours sans accès)
-Accès peu fréquent (-40% coût)
-    ↓ (90 jours sans accès)
-Archive Instant Access (-68% coût)
-    ↓ (opt-in, 90-730 jours)
-Archive Access
-    ↓ (opt-in, 180-730 jours)
-Deep Archive Access
-```
+- **IA et Glacier facturent la récupération** (frais par Go) + une durée minimale : supprimer un objet `STANDARD_IA` avant 30 jours te facture quand même 30 jours. Ne mets pas des données chaudes en IA « pour économiser » : tu paieras plus.
+- **One Zone-IA** est sur **une seule AZ** : moins cher, mais un sinistre de cette AZ perd les données. Réservé au recréable.
+- **Intelligent-Tiering** déplace *automatiquement* les objets entre paliers selon l'accès réel — pas de frais de récupération, mais un petit **frais de monitoring par objet**. Les objets **< 128 Ko ne sont pas monitorés** et restent en accès fréquent. Transitions automatiques : 30 jours sans accès → Infrequent Access, 90 jours → Archive Instant Access ; paliers asynchrones optionnels Archive Access (≥ 90 j) et Deep Archive Access (≥ 180 j).
 
 ```bash
-# Uploader directement en Intelligent-Tiering
-aws s3 cp fichier.zip s3://mon-bucket/data/ \
-  --storage-class INTELLIGENT_TIERING
+# Uploader directement dans une classe précise
+aws s3 cp export.zip s3://mon-bucket/archives/ --storage-class GLACIER_IR
 ```
 
-### Glacier : options de récupération
+### 2.3 Versioning
 
-| Tier | Glacier Flexible | Glacier Deep Archive |
-|------|-----------------|---------------------|
-| Expedited | 1-5 minutes | — |
-| Standard | 3-5 heures | 12 heures |
-| Bulk | 5-12 heures | 48 heures |
+Le **versioning** conserve chaque version d'un objet au lieu de l'écraser. Un bucket est dans **un des trois états** : `Unversioned` (défaut), `Enabled`, `Suspended`.
 
----
-
-## Versioning
-
-Le **versioning** conserve toutes les versions d'un objet. Chaque modification crée une nouvelle version au lieu d'écraser l'ancienne.
-
-### Activation
+Règle importante (doc AWS) : **une fois activé, un bucket ne peut jamais redevenir `Unversioned`** — on peut seulement *suspendre* le versioning. Les objets présents avant activation ont un version ID `null` ; ils ne changent pas, seul le traitement des futures requêtes change.
 
 ```bash
-# Activer le versioning
 aws s3api put-bucket-versioning \
-  --bucket mon-bucket \
+  --bucket tribuzen-avatars-eu-west-3 \
   --versioning-configuration Status=Enabled
-
-# Vérifier l'état
-aws s3api get-bucket-versioning --bucket mon-bucket
 ```
 
-### Comportement
+Comportement une fois activé :
 
-```
-PUT photo.jpg (v1) → Version ID: aaa111
-PUT photo.jpg (v2) → Version ID: bbb222  (v1 toujours là)
-DELETE photo.jpg    → Delete Marker ajouté (v1 et v2 toujours là)
-```
+- Chaque `PUT` crée une **nouvelle version** (version ID unique) ; l'ancienne reste.
+- Un `DELETE` sans version ID **n'efface pas** l'objet : il pose un **delete marker** qui devient la version courante. L'objet « disparaît » des listings normaux mais toutes ses versions sont récupérables. Supprimer le delete marker « ressuscite » l'objet.
+- Chaque version est **facturée comme un objet entier** (pas un diff). D'où l'intérêt d'une lifecycle rule pour purger les versions non courantes.
 
-```bash
-# Lister toutes les versions d'un objet
-aws s3api list-object-versions \
-  --bucket mon-bucket \
-  --prefix photo.jpg
+### 2.4 Lifecycle
 
-# Récupérer une version spécifique
-aws s3api get-object \
-  --bucket mon-bucket \
-  --key photo.jpg \
-  --version-id aaa111 \
-  photo-v1.jpg
-
-# Supprimer définitivement une version spécifique
-aws s3api delete-object \
-  --bucket mon-bucket \
-  --key photo.jpg \
-  --version-id bbb222
-```
-
-### MFA Delete
-
-Pour une protection maximale, activez **MFA Delete** : la suppression définitive d'une version nécessite un code MFA.
-
-```bash
-# Activer MFA Delete (nécessite le root)
-aws s3api put-bucket-versioning \
-  --bucket mon-bucket \
-  --versioning-configuration Status=Enabled,MFADelete=Enabled \
-  --mfa "arn:aws:iam::123456789012:mfa/root-device 123456"
-```
-
----
-
-## Lifecycle Policies
-
-Les **Lifecycle Policies** automatisent la transition entre classes de stockage et la suppression des objets.
-
-### Exemple complet
+Une **lifecycle rule** automatise transitions de classe et expirations. Deux familles d'actions : sur la version **courante** (`Transitions`, `Expiration`) et sur les versions **non courantes** (`NoncurrentVersionTransitions`, `NoncurrentVersionExpiration`), plus le nettoyage des uploads multipart inachevés.
 
 ```json
 {
   "Rules": [
     {
-      "ID": "optimize-storage-costs",
+      "ID": "avatars-refroidissement",
       "Status": "Enabled",
-      "Filter": {
-        "Prefix": "logs/"
-      },
+      "Filter": { "Prefix": "avatars/" },
       "Transitions": [
-        {
-          "Days": 30,
-          "StorageClass": "STANDARD_IA"
-        },
-        {
-          "Days": 90,
-          "StorageClass": "GLACIER"
-        },
-        {
-          "Days": 365,
-          "StorageClass": "DEEP_ARCHIVE"
-        }
+        { "Days": 90,  "StorageClass": "STANDARD_IA" },
+        { "Days": 365, "StorageClass": "GLACIER_IR" }
       ],
-      "Expiration": {
-        "Days": 2555
-      }
-    },
-    {
-      "ID": "cleanup-incomplete-uploads",
-      "Status": "Enabled",
-      "Filter": {},
-      "AbortIncompleteMultipartUpload": {
-        "DaysAfterInitiation": 7
-      }
-    },
-    {
-      "ID": "delete-old-versions",
-      "Status": "Enabled",
-      "Filter": {},
-      "NoncurrentVersionTransitions": [
-        {
-          "NoncurrentDays": 30,
-          "StorageClass": "STANDARD_IA"
-        }
-      ],
-      "NoncurrentVersionExpiration": {
-        "NoncurrentDays": 90
-      }
+      "NoncurrentVersionExpiration": { "NoncurrentDays": 30 },
+      "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 7 }
     }
   ]
 }
 ```
 
 ```bash
-# Appliquer la policy
 aws s3api put-bucket-lifecycle-configuration \
-  --bucket mon-bucket \
+  --bucket tribuzen-avatars-eu-west-3 \
   --lifecycle-configuration file://lifecycle.json
 ```
 
-### Flux visuel
+### 2.5 Bucket policy vs IAM
 
-```
-Jour 0        Jour 30          Jour 90          Jour 365        Jour 2555
-  │              │                │                │                │
-Standard → Standard-IA → Glacier Flexible → Deep Archive → Suppression
-```
+Deux mécanismes d'autorisation cohabitent, et il faut savoir lequel utiliser :
 
----
+- **Politique IAM** — attachée à une **identité** (user, groupe, role). Elle répond à « *ce principal* peut-il faire quoi, où ? ». Idéale pour donner à ton API TribuZen (via un **role**) le droit d'écrire dans le bucket.
+- **Bucket policy** — attachée à la **ressource** (le bucket). Elle répond à « qui peut accéder à *ce bucket* ? ». Idéale pour un accès **cross-account** ou pour autoriser un **service** (ex. CloudFront) à lire, ou pour interdire globalement une condition.
 
-## Sécurité : Bucket Policies vs ACL
-
-### Bucket Policies (recommandé)
-
-Les **Bucket Policies** sont des politiques JSON attachées au bucket. C'est le mécanisme de contrôle d'accès principal.
+Les deux sont du JSON de même grammaire (`Effect`, `Action`, `Resource`, `Condition`). L'accès est **la somme des deux** : un `Deny` explicite dans l'une gagne toujours. Règle pratique : **permissions d'une identité → IAM ; règles portant sur le bucket lui-même → bucket policy.** Les **ACL** sont un mécanisme *legacy* — AWS recommande de les désactiver (`BucketOwnerEnforced`).
 
 ```json
+// Bucket policy : forcer HTTPS (refuse tout accès en HTTP clair)
 {
   "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "AllowCloudFrontOAC",
-      "Effect": "Allow",
-      "Principal": {
-        "Service": "cloudfront.amazonaws.com"
-      },
-      "Action": "s3:GetObject",
-      "Resource": "arn:aws:s3:::mon-site-statique/*",
-      "Condition": {
-        "StringEquals": {
-          "AWS:SourceArn": "arn:aws:cloudfront::123456789012:distribution/E1ABC2DEF3GH"
-        }
-      }
-    },
-    {
-      "Sid": "DenyUnencryptedUploads",
-      "Effect": "Deny",
-      "Principal": "*",
-      "Action": "s3:PutObject",
-      "Resource": "arn:aws:s3:::mon-bucket-secure/*",
-      "Condition": {
-        "StringNotEquals": {
-          "s3:x-amz-server-side-encryption": "aws:kms"
-        }
-      }
-    },
-    {
-      "Sid": "DenyHTTP",
-      "Effect": "Deny",
-      "Principal": "*",
-      "Action": "s3:*",
-      "Resource": [
-        "arn:aws:s3:::mon-bucket-secure",
-        "arn:aws:s3:::mon-bucket-secure/*"
-      ],
-      "Condition": {
-        "Bool": {
-          "aws:SecureTransport": "false"
-        }
-      }
-    }
-  ]
-}
-```
-
-### ACL (déconseillé)
-
-Les **ACL** (Access Control Lists) sont un ancien mécanisme. AWS recommande de les désactiver :
-
-```bash
-# Désactiver les ACL (recommandé depuis 2023)
-aws s3api put-bucket-ownership-controls \
-  --bucket mon-bucket \
-  --ownership-controls '{
-    "Rules": [{"ObjectOwnership": "BucketOwnerEnforced"}]
-  }'
-```
-
-### Block Public Access
-
-```bash
-# Bloquer tout accès public (au niveau du compte)
-aws s3control put-public-access-block \
-  --account-id 123456789012 \
-  --public-access-block-configuration '{
-    "BlockPublicAcls": true,
-    "IgnorePublicAcls": true,
-    "BlockPublicPolicy": true,
-    "RestrictPublicBuckets": true
-  }'
-```
-
-### Comparaison
-
-| Critère | Bucket Policy | ACL |
-|---------|--------------|-----|
-| Format | JSON (comme IAM) | XML |
-| Granularité | Fine (conditions, IP, MFA) | Grossière (read/write) |
-| Cross-account | Oui (via Principal) | Oui (mais limité) |
-| Recommandation | **Oui** | **Non** (legacy) |
-
----
-
-## Chiffrement côté serveur
-
-### Options de chiffrement
-
-| Type | Clé gérée par | Rotation | Coût supplémentaire |
-|------|--------------|----------|-------------------|
-| **SSE-S3** | AWS (transparent) | Automatique | Gratuit |
-| **SSE-KMS** | AWS KMS | Configurable | KMS API calls |
-| **SSE-C** | Le client | À votre charge | Gratuit (mais vous gérez) |
-| **CSE** | Le client (avant upload) | À votre charge | Gratuit |
-
-### SSE-S3 (par défaut depuis 2023)
-
-```bash
-# Depuis janvier 2023, tous les nouveaux objets sont chiffrés SSE-S3 par défaut
-# Pas d'action requise
-
-# Vérifier le chiffrement d'un objet
-aws s3api head-object \
-  --bucket mon-bucket \
-  --key document.pdf \
-  --query 'ServerSideEncryption'
-```
-
-### SSE-KMS
-
-```bash
-# Configurer le chiffrement par défaut avec KMS
-aws s3api put-bucket-encryption \
-  --bucket mon-bucket-secure \
-  --server-side-encryption-configuration '{
-    "Rules": [{
-      "ApplyServerSideEncryptionByDefault": {
-        "SSEAlgorithm": "aws:kms",
-        "KMSMasterKeyID": "arn:aws:kms:eu-west-3:123456789012:key/abc-123"
-      },
-      "BucketKeyEnabled": true
-    }]
-  }'
-```
-
-**Bucket Key** : réduit les appels KMS (et les coûts) en générant une clé intermédiaire au niveau du bucket.
-
-### SSE-C
-
-```bash
-# Upload avec une clé fournie par le client
-aws s3api put-object \
-  --bucket mon-bucket \
-  --key secret.dat \
-  --body secret.dat \
-  --sse-customer-algorithm AES256 \
-  --sse-customer-key "$(openssl rand -base64 32)" \
-  --sse-customer-key-md5 "$(echo -n '<key>' | openssl dgst -md5 -binary | base64)"
-```
-
-**Attention** : avec SSE-C, si vous perdez la clé, les données sont **irrécupérables**.
-
----
-
-## S3 Event Notifications
-
-S3 peut déclencher des actions automatiques quand des événements se produisent sur un bucket.
-
-### Destinations supportées
-
-| Destination | Latence | Cas d'usage |
-|-------------|---------|-------------|
-| **Lambda** | Secondes | Traitement d'image, indexation |
-| **SQS** | Secondes | File d'attente de traitement |
-| **SNS** | Secondes | Notification multi-destinataires |
-| **EventBridge** | Secondes | Routage avancé, règles complexes |
-
-### Configuration
-
-```bash
-aws s3api put-bucket-notification-configuration \
-  --bucket mon-bucket-images \
-  --notification-configuration '{
-    "LambdaFunctionConfigurations": [
-      {
-        "Id": "resize-images",
-        "LambdaFunctionArn": "arn:aws:lambda:eu-west-3:123456789012:function:resize-image",
-        "Events": ["s3:ObjectCreated:*"],
-        "Filter": {
-          "Key": {
-            "FilterRules": [
-              {"Name": "prefix", "Value": "uploads/"},
-              {"Name": "suffix", "Value": ".jpg"}
-            ]
-          }
-        }
-      }
+  "Statement": [{
+    "Sid": "DenyInsecureTransport",
+    "Effect": "Deny",
+    "Principal": "*",
+    "Action": "s3:*",
+    "Resource": [
+      "arn:aws:s3:::tribuzen-avatars-eu-west-3",
+      "arn:aws:s3:::tribuzen-avatars-eu-west-3/*"
     ],
-    "EventBridgeConfiguration": {}
-  }'
-```
-
-### Avec TypeScript (handler Lambda)
-
-```typescript
-import { S3Event, Context } from 'aws-lambda';
-import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
-
-const s3 = new S3Client({});
-
-export async function handler(event: S3Event, context: Context) {
-  for (const record of event.Records) {
-    const bucket = record.s3.bucket.name;
-    const key = decodeURIComponent(record.s3.object.key.replace(/\+/g, ' '));
-    const size = record.s3.object.size;
-
-    console.log(`Nouvel objet : s3://${bucket}/${key} (${size} octets)`);
-
-    const object = await s3.send(new GetObjectCommand({
-      Bucket: bucket,
-      Key: key,
-    }));
-
-    // Traitement de l'objet...
-  }
-}
-```
-
----
-
-## Hébergement de site statique
-
-S3 peut héberger un site web statique (HTML, CSS, JS) sans serveur.
-
-### Configuration
-
-```bash
-# Activer l'hébergement statique
-aws s3 website s3://mon-site-statique \
-  --index-document index.html \
-  --error-document error.html
-
-# Uploader le site
-aws s3 sync ./dist s3://mon-site-statique --delete
-
-# URL du site :
-# http://mon-site-statique.s3-website.eu-west-3.amazonaws.com
-```
-
-### Bucket Policy pour l'accès public
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "PublicReadGetObject",
-      "Effect": "Allow",
-      "Principal": "*",
-      "Action": "s3:GetObject",
-      "Resource": "arn:aws:s3:::mon-site-statique/*"
-    }
-  ]
-}
-```
-
-### Architecture recommandée (production)
-
-```
-Utilisateur → CloudFront (CDN + HTTPS) → S3 (origin, accès privé via OAC)
-                  │
-            Certificat ACM (HTTPS)
-            Route 53 (DNS)
-```
-
-En production, **ne jamais exposer S3 directement**. Utilisez CloudFront avec un OAC (Origin Access Control) pour :
-- HTTPS avec votre domaine
-- Cache global (latence réduite)
-- Protection DDoS (AWS Shield)
-- Accès S3 privé
-
----
-
-## Transfer Acceleration
-
-**S3 Transfer Acceleration** accélère les uploads longue distance en utilisant les edge locations CloudFront.
-
-```
-Client (Australie) → Edge Location Sydney → Backbone AWS → Bucket (eu-west-3)
-                     (réseau optimisé AWS, pas l'Internet public)
-```
-
-```bash
-# Activer Transfer Acceleration
-aws s3api put-bucket-accelerate-configuration \
-  --bucket mon-bucket \
-  --accelerate-configuration Status=Enabled
-
-# Utiliser l'endpoint accéléré
-aws s3 cp gros-fichier.zip \
-  s3://mon-bucket/uploads/ \
-  --endpoint-url https://mon-bucket.s3-accelerate.amazonaws.com
-```
-
-**Coût** : supplément de ~0,04 $/Go (en plus du transfert standard). Utile uniquement pour les uploads intercontinentaux.
-
----
-
-## Multipart Upload
-
-Le **Multipart Upload** divise un fichier volumineux en parties uploadées en parallèle.
-
-### Quand l'utiliser
-
-| Taille du fichier | Recommandation |
-|-------------------|---------------|
-| < 100 Mo | Upload simple (PutObject) |
-| 100 Mo – 5 Go | Multipart recommandé |
-| > 5 Go | Multipart **obligatoire** |
-
-### Avec la CLI
-
-```bash
-# La CLI utilise automatiquement le multipart pour les gros fichiers
-aws s3 cp fichier-10go.zip s3://mon-bucket/backups/ \
-  --expected-size 10737418240
-
-# Configurer les seuils
-aws configure set default.s3.multipart_threshold 100MB
-aws configure set default.s3.multipart_chunksize 50MB
-```
-
-### Avec SDK TypeScript v3
-
-```typescript
-import { S3Client } from '@aws-sdk/client-s3';
-import { Upload } from '@aws-sdk/lib-storage';
-import { createReadStream } from 'node:fs';
-
-const s3 = new S3Client({ region: 'eu-west-3' });
-
-async function uploadLargeFile(filePath: string, key: string) {
-  const upload = new Upload({
-    client: s3,
-    params: {
-      Bucket: 'mon-bucket',
-      Key: key,
-      Body: createReadStream(filePath),
-      ContentType: 'application/octet-stream',
-    },
-    queueSize: 4,        // Uploads parallèles
-    partSize: 50 * 1024 * 1024, // 50 Mo par partie
-    leavePartsOnError: false,
-  });
-
-  upload.on('httpUploadProgress', (progress) => {
-    const pct = Math.round((progress.loaded! / progress.total!) * 100);
-    console.log(`Upload : ${pct}% (${progress.loaded} / ${progress.total})`);
-  });
-
-  await upload.done();
-  console.log('Upload terminé');
-}
-```
-
-### Nettoyage des uploads incomplets
-
-Les uploads multipart incomplets **consomment du stockage**. Ajoutez toujours une lifecycle rule :
-
-```json
-{
-  "Rules": [{
-    "ID": "abort-incomplete-multipart",
-    "Status": "Enabled",
-    "Filter": {},
-    "AbortIncompleteMultipartUpload": {
-      "DaysAfterInitiation": 7
-    }
+    "Condition": { "Bool": { "aws:SecureTransport": "false" } }
   }]
 }
 ```
 
----
+### 2.6 Block Public Access (BPA)
 
-## Fonctionnalités avancées
+**Block Public Access** est un garde-fou *au-dessus* des policies et ACL : même si une policy rend le bucket public, BPA peut refuser l'accès. Depuis avril 2023, **les nouveaux buckets ont BPA activé par défaut** (aucun accès public). Quatre réglages indépendants, combinables, applicables au niveau **compte, bucket, access point** (et organisation) — S3 applique la combinaison **la plus restrictive** :
 
-### S3 Select et S3 Glacier Select
-
-Exécutez des requêtes SQL directement sur les objets S3 (CSV, JSON, Parquet) sans les télécharger entièrement :
-
-```bash
-aws s3api select-object-content \
-  --bucket mon-bucket \
-  --key logs/2026-03.csv \
-  --expression "SELECT s.timestamp, s.status FROM S3Object s WHERE s.status = '500'" \
-  --expression-type SQL \
-  --input-serialization '{"CSV": {"FileHeaderInfo": "USE"}}' \
-  --output-serialization '{"CSV": {}}' \
-  output.csv
-```
-
-### S3 Object Lock
-
-Empêche la suppression ou la modification d'un objet pendant une durée définie (conformité WORM) :
-
-| Mode | Comportement |
-|------|-------------|
-| **Governance** | Protégé sauf avec permission spéciale |
-| **Compliance** | Protégé pour TOUS, y compris le root |
-
-### Requester Pays
-
-Le demandeur (pas le propriétaire du bucket) paie les frais de transfert :
+| Réglage | Effet (mis à `TRUE`) |
+|---|---|
+| `BlockPublicAcls` | Rejette tout `PUT` de bucket/objet qui inclut une ACL publique |
+| `IgnorePublicAcls` | Ignore toutes les ACL publiques existantes et futures |
+| `BlockPublicPolicy` | Rejette une bucket policy qui autorise l'accès public |
+| `RestrictPublicBuckets` | Si la policy est publique, limite l'accès aux principals de services AWS et aux users du compte propriétaire (coupe le cross-account) |
 
 ```bash
-aws s3api put-bucket-request-payment \
-  --bucket mon-bucket-partage \
-  --request-payment-configuration Payer=Requester
+aws s3api put-public-access-block \
+  --bucket tribuzen-avatars-eu-west-3 \
+  --public-access-block-configuration \
+  BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+```
+
+> BPA **ne modifie pas** les policies/ACL existantes ; il les *neutralise*. Retirer BPA rend de nouveau public un bucket qui a une policy publique. Recommandation AWS : **les quatre activés partout**, et n'ouvrir que via CloudFront (module 13).
+
+### 2.7 Presigned URLs
+
+Une **presigned URL** est une URL signée qui accorde un accès **temporaire** à **une** opération sur **un** objet (GET pour télécharger, PUT pour uploader), sans exposer de credential. Elle porte les droits **du principal qui l'a générée** : ton serveur signe avec son role, le navigateur utilise l'URL sans jamais voir de clé AWS.
+
+Limites d'expiration (doc AWS, signatures SigV4) :
+
+- via **AWS CLI** : maximum **7 jours** (`--expires-in`, en secondes, max 604800) ;
+- via la **Console S3** : maximum **12 heures**.
+
+```bash
+# GET presigned URL (téléchargement), valable 1 heure
+aws s3 presign s3://tribuzen-avatars-eu-west-3/avatars/tribu-42/alice.jpg \
+  --expires-in 3600
+```
+
+Le flux d'upload direct résout le cas concret §1 :
+
+```
+1. Navigateur ──▶ API TribuZen : "je veux uploader alice.jpg"
+2. API (role S3) ──▶ génère une presigned PUT URL (expire 5 min) ──▶ Navigateur
+3. Navigateur ──(PUT fichier)──▶ S3 directement  (l'API ne voit jamais l'octet)
+```
+
+Sécurité : **expiration courte** (5–15 min pour un upload), figer le `Content-Type`, configurer le **CORS** du bucket pour accepter le domaine front, et limiter la taille via `createPresignedPost` (`content-length-range`) plutôt qu'un simple PUT si tu veux borner le poids.
+
+### 2.8 Static website hosting
+
+S3 peut servir un site **statique** (HTML/CSS/JS) via un *website endpoint* (`http://mon-site.s3-website.<region>.amazonaws.com`). Cela impose un accès **public en lecture** — donc désactiver les réglages BPA concernés *et* poser une bucket policy `s3:GetObject` publique.
+
+```bash
+aws s3 website s3://tribuzen-site --index-document index.html --error-document 404.html
+```
+
+> Le website endpoint est en **HTTP seul**, sans domaine custom ni cache. En production on ne l'expose jamais nu : on garde le bucket **privé** et on met **CloudFront devant** (HTTPS, cache, OAC) — c'est le **module 13**. Ici, retiens juste que S3 *peut* héberger un statique, et pourquoi ce n'est pas suffisant seul.
+
+---
+
+## 3. Worked examples
+
+### Exemple 1 — Bucket d'avatars TribuZen sécurisé, de zéro
+
+Objectif : un bucket privé, versionné, prêt pour l'upload par presigned URL.
+
+```bash
+# 1. Créer le bucket dans la région du produit
+aws s3 mb s3://tribuzen-avatars-eu-west-3 --region eu-west-3
+
+# 2. Verrouiller l'accès public (les 4 réglages BPA)
+aws s3api put-public-access-block \
+  --bucket tribuzen-avatars-eu-west-3 \
+  --public-access-block-configuration \
+  BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+
+# 3. Activer le versioning (protège contre l'écrasement d'un avatar)
+aws s3api put-bucket-versioning \
+  --bucket tribuzen-avatars-eu-west-3 \
+  --versioning-configuration Status=Enabled
+
+# 4. Poser la lifecycle : purge des versions non courantes après 30 j,
+#    et nettoyage des uploads multipart inachevés après 7 j
+aws s3api put-bucket-lifecycle-configuration \
+  --bucket tribuzen-avatars-eu-west-3 \
+  --lifecycle-configuration file://lifecycle.json
+
+# 5. Générer une presigned PUT URL pour un nouvel avatar (expire 5 min)
+aws s3 presign s3://tribuzen-avatars-eu-west-3/avatars/tribu-42/bob.jpg \
+  --expires-in 300
+```
+
+Ce que garantit cette configuration :
+- Personne ne peut lister/lire le bucket depuis Internet (BPA + pas de policy publique).
+- Un avatar écrasé reste récupérable (versioning), mais les vieilles versions ne s'accumulent pas indéfiniment (lifecycle).
+- Le front uploade **directement** vers S3 avec l'URL signée, sans clé AWS et sans charger l'API.
+
+### Exemple 2 — Lire une ancienne version après un écrasement accidentel
+
+Un membre a remplacé son avatar par une image floue ; on veut restaurer le précédent.
+
+```bash
+# Lister toutes les versions de la key
+aws s3api list-object-versions \
+  --bucket tribuzen-avatars-eu-west-3 \
+  --prefix avatars/tribu-42/alice.jpg
+# → chaque version a un VersionId ; la plus récente est IsLatest=true
+
+# Récupérer une version antérieure précise dans un fichier local
+aws s3api get-object \
+  --bucket tribuzen-avatars-eu-west-3 \
+  --key avatars/tribu-42/alice.jpg \
+  --version-id 3sL4kqtJlcpXroDTDmJ+rmSpXd3dIbrHY+MTRCxf3vjVBH40Nr8X8gdRQBpUMLUo \
+  alice-restaure.jpg
+
+# Re-uploader comme nouvelle version courante
+aws s3 cp alice-restaure.jpg s3://tribuzen-avatars-eu-west-3/avatars/tribu-42/alice.jpg
+```
+
+Sans versioning, l'octet d'origine serait **définitivement perdu** dès le premier écrasement.
+
+---
+
+## 4. Pièges & misconceptions
+
+### PIÈGE #1 — « Je mets le bucket en public pour afficher les avatars »
+
+Rendre le bucket public expose *tout* le bucket à la lecture/listing par n'importe qui, et c'est l'origine de fuites de données massives. **Le bon réflexe :** bucket **privé** + presigned URL (accès temporaire par objet) ou **CloudFront + OAC** (module 13). Public = uniquement un vrai site statique assumé.
+
+### PIÈGE #2 — Confondre durabilité et disponibilité
+
+« 11 neufs » (99,999999999 %) est la **durabilité** : la probabilité de ne pas perdre un octet. La **disponibilité** (99,99 % en Standard) est la probabilité que le service réponde. One Zone-IA a la *même* durabilité de conception que Standard-IA mais une disponibilité et une résilience moindres (1 seule AZ).
+
+### PIÈGE #3 — Mettre des données chaudes en Standard-IA « pour payer moins »
+
+IA et Glacier facturent la **récupération** (par Go) et imposent une **durée minimale** (30 j pour IA, 90/180 j pour Glacier). Sur des données souvent lues ou vite supprimées, tu paies *plus* qu'en Standard. IA/Glacier = données **froides et stables**. Pour un accès imprévisible, laisse **Intelligent-Tiering** décider.
+
+### PIÈGE #4 — Bucket policy vs IAM : mettre la règle au mauvais endroit
+
+Pour donner à *ton* service le droit d'écrire : **politique IAM sur son role**. Pour autoriser un *autre compte* ou un *service AWS* à lire le bucket, ou interdire une condition globale : **bucket policy**. Se tromper mène soit à un accès qui ne marche pas, soit à une policy trop large. Rappel : un `Deny` explicite l'emporte toujours sur un `Allow`.
+
+### PIÈGE #5 — Croire qu'on peut « désactiver » le versioning
+
+Une fois le versioning **activé**, un bucket ne redevient **jamais** `Unversioned` — au mieux `Suspended`. En état suspendu, les nouveaux objets prennent un version ID `null`, mais les versions déjà créées restent (et restent facturées). Pour vraiment purger, il faut une **lifecycle** sur les versions non courantes.
+
+### PIÈGE #6 — Presigned URL « permanente »
+
+Une presigned URL a une expiration : **max 7 jours** en CLI (SigV4), **12 h** en Console. Elle porte les droits de celui qui l'a signée : si ce principal perd le droit avant l'expiration, l'URL cesse de fonctionner. Ne t'en sers pas comme d'un lien public durable — pour ça, c'est CloudFront.
+
+---
+
+## 5. Ancrage TribuZen
+
+Dans l'infra `tribuzen`, S3 est la **couche de stockage des médias** : avatars de membres et photos partagées dans une tribu.
+
+**Bucket `tribuzen-avatars-<region>`** (Exemple 1) — privé, BPA aux 4 réglages, versioning activé, lifecycle qui purge les versions non courantes à 30 jours. C'est la brique posée dès ce module.
+
+**Upload d'avatar par presigned URL** — c'est *le* pattern TribuZen pour tout média :
+
+```
+front (Nuxt) ──▶ POST /api/avatars/presign  (API Lambda, module 06)
+API ──▶ génère une presigned PUT URL (expire 5 min) ──▶ front
+front ──(PUT image)──▶ S3   (aucun octet ne traverse l'API)
+```
+
+L'API n'écrit jamais l'image elle-même : elle **signe**, le navigateur **uploade**. Le role IAM de la fonction porte `s3:PutObject` sur `arn:aws:s3:::tribuzen-avatars-*/avatars/*` (politique IAM — 2.5), pas une bucket policy publique.
+
+**Cycle de vie des photos de tribu** — les photos d'événements passés sont rarement reconsultées : une lifecycle les fait glisser vers `STANDARD_IA` à 90 jours puis `GLACIER_IR` à 1 an, divisant le coût de stockage sans code applicatif.
+
+Fichiers cibles dans `smaurier/tribuzen` :
+```
+tribuzen/
+  infra/
+    s3-avatars.ts          ← bucket avatars (défini en CDK au module 05)
+  server/
+    api/
+      avatars/
+        presign.post.ts    ← génère la presigned PUT URL (module 06/07)
+```
+
+> La distribution CloudFront **devant** ce bucket (lecture publique cachée, HTTPS, OAC) est ajoutée au **module 13** — ici le bucket reste strictement privé.
+
+---
+
+## 6. Points clés
+
+1. S3 stocke des **objets** dans des **buckets** au nom **globalement unique** et régional ; la key est un chemin plat, pas un dossier.
+2. La **classe de stockage** se choisit par objet selon l'accès : Standard (chaud), IA (froid, min 30 j + frais de récupération), Glacier (archive, min 90/180 j), Intelligent-Tiering (accès imprévisible, auto).
+3. Le **versioning** protège de l'écrasement/suppression ; une fois activé il ne peut être que **suspendu**, jamais désactivé ; un DELETE sans version pose un **delete marker**.
+4. Les **lifecycle rules** automatisent transitions de classe et expiration, y compris la purge des **versions non courantes** et des multipart inachevés.
+5. **IAM** = droits d'une identité ; **bucket policy** = règles sur la ressource (cross-account, services) ; un `Deny` explicite gagne toujours ; les **ACL** sont legacy.
+6. **Block Public Access** (4 réglages, activés par défaut sur les nouveaux buckets) neutralise les policies/ACL publiques ; garde-les tous activés et ouvre via CloudFront.
+7. Une **presigned URL** donne un accès temporaire par objet, aux droits du signataire — max **7 j** (CLI) / **12 h** (Console) ; c'est le pattern d'upload direct navigateur → S3.
+8. S3 peut héberger un **site statique** (website endpoint HTTP public) mais en prod on le met **privé derrière CloudFront** (module 13).
+
+---
+
+## 7. Seeds Anki
+
+```
+Pourquoi ne jamais rendre un bucket d'avatars public pour l'afficher ?|Public expose tout le bucket au listing/lecture par n'importe qui (source de fuites). Bon pattern : bucket privé + presigned URL par objet, ou CloudFront+OAC. Public = uniquement un site statique assumé.
+Quelle différence entre durabilité et disponibilité S3 ?|Durabilité (11 neufs, 99,999999999 %) = probabilité de ne pas perdre un octet. Disponibilité (99,99 % Standard) = probabilité que le service réponde. One Zone-IA : même durabilité de conception mais moins disponible (1 seule AZ).
+Quand choisir Standard-IA plutôt que Standard, et quel est le piège ?|IA = données froides et stables, accès rare mais immédiat requis. Piège : durée min facturée 30 jours + frais de récupération par Go. Sur données chaudes ou vite supprimées, IA coûte PLUS cher que Standard.
+Peut-on désactiver le versioning d'un bucket S3 une fois activé ?|Non. Un bucket versionné ne redevient jamais Unversioned, seulement Suspended. En suspendu les nouveaux objets ont un version ID null, mais les versions existantes restent (et restent facturées). Purge via lifecycle sur versions non courantes.
+Bucket policy ou politique IAM : où mettre la règle ?|IAM = droits attachés à une identité (donner à un role le droit d'écrire). Bucket policy = règles sur la ressource (cross-account, autoriser un service AWS, interdire une condition). Un Deny explicite l'emporte toujours.
+À quoi servent les 4 réglages de Block Public Access ?|BlockPublicAcls (refuse PUT avec ACL publique), IgnorePublicAcls (ignore ACL publiques), BlockPublicPolicy (refuse policy publique), RestrictPublicBuckets (coupe le cross-account si policy publique). Activés par défaut sur nouveaux buckets ; S3 applique le plus restrictif.
+Qu'est-ce qu'une presigned URL et quelle est son expiration max ?|URL signée donnant un accès temporaire à UNE opération (GET/PUT) sur UN objet, aux droits du principal qui l'a générée, sans exposer de credential. Max 7 jours en CLI (SigV4), 12 h en Console. Sert à l'upload direct navigateur → S3.
+Que se passe-t-il lors d'un DELETE sans version-id sur un bucket versionné ?|S3 n'efface pas l'objet : il pose un delete marker qui devient la version courante. L'objet disparaît des listings normaux mais toutes ses versions restent récupérables ; supprimer le delete marker restaure l'objet.
 ```
 
 ---
 
-## Presigned URLs — Upload direct depuis le navigateur
+## Pont vers le lab
 
-Les **presigned URLs** permettent de donner un accès temporaire à un objet S3 sans exposer les credentials AWS. C'est essentiel pour les uploads directs depuis le navigateur.
-
-### Pourquoi ?
-
-Sans presigned URL, le flux est : `Navigateur → Serveur Node.js → S3`. Le fichier transite par votre serveur, consommant de la bande passante et de la mémoire. Avec presigned URL : `Navigateur → S3 directement`. Le serveur ne fait que générer l'URL signée.
-
-### Générer une presigned URL (SDK v3)
-
-```typescript
-import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
-import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
-
-const s3 = new S3Client({ region: 'eu-west-1' });
-
-// Upload presigned URL (PUT)
-async function getUploadUrl(key: string, contentType: string): Promise<string> {
-  const command = new PutObjectCommand({
-    Bucket: 'mon-bucket',
-    Key: key,
-    ContentType: contentType,
-  });
-  return getSignedUrl(s3, command, { expiresIn: 300 }); // 5 minutes
-}
-
-// Download presigned URL (GET)
-async function getDownloadUrl(key: string): Promise<string> {
-  const command = new GetObjectCommand({
-    Bucket: 'mon-bucket',
-    Key: key,
-  });
-  return getSignedUrl(s3, command, { expiresIn: 3600 }); // 1 heure
-}
-```
-
-### Upload depuis le frontend
-
-```typescript
-// 1. Le frontend demande une URL signée au backend
-const { uploadUrl } = await fetch('/api/upload-url', {
-  method: 'POST',
-  body: JSON.stringify({ filename: 'photo.jpg', contentType: 'image/jpeg' }),
-}).then(r => r.json());
-
-// 2. Upload direct vers S3
-await fetch(uploadUrl, {
-  method: 'PUT',
-  headers: { 'Content-Type': 'image/jpeg' },
-  body: file, // File object du <input type="file">
-});
-```
-
-### Sécurité
-
-- **Expiration courte** : 5-15 min pour les uploads, 1h max pour les downloads
-- **CORS** : configurer le bucket pour accepter les requêtes du domaine frontend
-- **Content-Type** : forcer le type MIME dans la presigned URL pour éviter les abus
-- **Taille max** : utiliser `createPresignedPost()` avec `Content-Length-Range` pour limiter la taille
-
-```typescript
-import { createPresignedPost } from '@aws-sdk/s3-presigned-post';
-
-const { url, fields } = await createPresignedPost(s3, {
-  Bucket: 'mon-bucket',
-  Key: 'uploads/${filename}',
-  Conditions: [
-    ['content-length-range', 0, 10_000_000], // Max 10 MB
-    ['starts-with', '$Content-Type', 'image/'],
-  ],
-  Expires: 300,
-});
-```
-
----
-
-## Bonnes pratiques
-
-### Checklist S3
-
-1. **Sécurité**
-   - [ ] Block Public Access activé au niveau du compte
-   - [ ] ACL désactivées (BucketOwnerEnforced)
-   - [ ] Bucket Policy pour DenyHTTP (forcer HTTPS)
-   - [ ] SSE-KMS pour les données sensibles
-   - [ ] Versioning activé sur les buckets critiques
-   - [ ] MFA Delete pour les données réglementées
-
-2. **Coûts**
-   - [ ] Intelligent-Tiering pour les accès imprévisibles
-   - [ ] Lifecycle policies pour les transitions automatiques
-   - [ ] Nettoyage des uploads multipart incomplets
-   - [ ] S3 Storage Lens pour l'analyse des coûts
-
-3. **Performance**
-   - [ ] Multipart upload pour les fichiers > 100 Mo
-   - [ ] Transfer Acceleration pour les uploads intercontinentaux
-   - [ ] VPC Gateway Endpoint pour le trafic depuis EC2/Lambda
-
-4. **Nommage**
-   - [ ] Nom de bucket descriptif : `{app}-{env}-{region}-{suffix}`
-   - [ ] Préfixes organisés : `logs/`, `uploads/`, `reports/`
-   - [ ] Pas de données sensibles dans les noms de clés
-
----
-
-## Résumé du module
-
-| Concept | Points clés |
-|---------|-------------|
-| Buckets | Nom unique mondial, régional, stockage illimité |
-| Classes | Standard → IA → Glacier → Deep Archive (coût décroissant) |
-| Versioning | Conserve toutes les versions, protège contre la suppression |
-| Lifecycle | Automatise transitions et expirations |
-| Sécurité | Bucket Policy (JSON), Block Public Access, SSE par défaut |
-| Chiffrement | SSE-S3 (défaut), SSE-KMS (audit), SSE-C (clé client) |
-| Events | Déclenchement Lambda/SQS/SNS/EventBridge sur modifications |
-| Static Hosting | Site statique, idéalement derrière CloudFront |
-| Performance | Multipart (>100 Mo), Transfer Acceleration (intercontinental) |
-
----
-
-## Pour aller plus loin
-
-- [S3 User Guide (AWS)](https://docs.aws.amazon.com/AmazonS3/latest/userguide/)
-- [S3 Pricing](https://aws.amazon.com/s3/pricing/)
-- [S3 Storage Classes](https://aws.amazon.com/s3/storage-classes/)
-- [S3 Security Best Practices](https://docs.aws.amazon.com/AmazonS3/latest/userguide/security-best-practices.html)
+> Lab associé : `labs/lab-04-s3/README.md`. Créer un vrai bucket privé, l'uploader/versionner en Console + CLI, générer une presigned URL d'upload et poser une bucket policy — avec rappel de **teardown** (coût AWS). Corrigé commandes intégral, feedback coach en session.

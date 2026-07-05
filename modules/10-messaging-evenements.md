@@ -1,580 +1,371 @@
-# Module 10 — SQS, SNS & EventBridge — Messaging et événements
+---
+titre: Messaging et événements — SQS, SNS, EventBridge
+cours: 12-aws-cloud
+notions: [SQS standard, SQS FIFO, "at-least-once (doublons possibles)", exactly-once, "ordre best-effort vs strict FIFO", visibility timeout, in-flight messages, long polling, Dead Letter Queue, redrive policy, maxReceiveCount, "SNS pub/sub", topic, subscription, filter policy, "fan-out SNS vers SQS", SNS FIFO, EventBridge, event bus, "règle (rule)", target, event pattern, detail-type, "message group ID", "deduplication ID"]
+outcomes:
+  - sait choisir entre SQS, SNS et EventBridge selon le besoin de découplage
+  - sait distinguer une queue SQS standard (at-least-once, ordre best-effort) d'une queue FIFO (exactly-once, ordre strict) et configurer visibility timeout et DLQ
+  - sait câbler un fan-out SNS vers plusieurs queues SQS et le tester au CLI
+  - sait router un événement métier avec un event bus EventBridge, une règle et un event pattern
+prerequis: [Modules 00-09 — compte, IAM, Lambda (module 06) comme consumer, DynamoDB (module 09)]
+next: 11-cognito-authentification
+libs: []
+tribuzen: infra cloud TribuZen — diffusion des événements métier (nouvelle sortie familiale, nouveau message feed) vers email, push et projections, via fan-out SNS vers SQS et bus EventBridge
+last-reviewed: 2026-07
+---
 
-> **Objectif** : Comprendre les trois services de messaging AWS, savoir quand utiliser SQS, SNS ou EventBridge, implémenter les patterns courants (queue worker, fan-out, event-driven) et utiliser le SDK TypeScript v3.
+# Messaging et événements — SQS, SNS, EventBridge
+
+> **Outcomes — tu sauras FAIRE :** choisir entre SQS / SNS / EventBridge, configurer une queue (standard vs FIFO, visibility timeout, DLQ), câbler un fan-out SNS→SQS, router un événement avec EventBridge.
+> **Difficulté :** :star::star::star:
 >
-> **Difficulté** : ⭐⭐⭐ (avancé)
->
-> **Prérequis** : Module 05 (Lambda), Module 07 (DynamoDB)
->
-> **Durée estimée** : 3h30
+> **Portée :** ce module couvre le **messaging et les événements** — files (SQS), publication/abonnement (SNS), bus d'événements (EventBridge) et leurs patterns (fan-out, DLQ). La **Lambda** qui consomme une queue est vue au **module 06** : ici elle n'est qu'un *consumer* au bout du tuyau. L'**orchestration** de plusieurs étapes avec état (Step Functions, saga orchestrée) est le sujet du **module 16 (architectures serverless)**. Ici on répond à une seule question : *comment faire communiquer deux composants sans les coupler ?*
+
+## 1. Cas concret d'abord
+
+Tu montes le back de TribuZen. Un parent publie une **nouvelle sortie familiale** (« Rando dimanche 10h »). Au moment du clic « Publier », il faut :
+
+1. envoyer un **email** aux membres de la famille,
+2. envoyer une **notification push** aux mobiles,
+3. mettre à jour une **projection** (le compteur « sorties à venir » du tableau de bord),
+4. écrire une ligne dans le **journal d'audit**.
+
+Le collègue propose ce handler « pour aller vite » — tout en synchrone dans la Lambda qui reçoit le POST :
+
+```ts
+// postOuting — version couplée, tout en synchrone (à NE PAS faire)
+export async function handler(event) {
+  const outing = JSON.parse(event.body)
+  await db.putOuting(outing)          // 40 ms
+  await sendEmails(outing)            // 1 200 ms — dépend d'un SMTP externe
+  await sendPush(outing)             // 800 ms  — dépend d'APNs/FCM
+  await updateDashboard(outing)       // 60 ms
+  await writeAudit(outing)            // 30 ms
+  return { statusCode: 201 }          // total ~2,1 s, et si l'email plante, TOUT plante
+}
+```
+
+Trois problèmes concrets :
+
+1. **Latence** : le parent attend ~2 s pour un « OK, publié » qui ne devrait prendre que le temps d'écrire en base.
+2. **Couplage à la panne** : si le fournisseur d'email est down, l'`await sendEmails` jette → la sortie n'est **pas** enregistrée, alors qu'elle n'a rien à voir avec l'email.
+3. **Pas de reprise** : un push raté est perdu. Aucun mécanisme ne le rejoue.
+
+Ce qu'on veut : la Lambda **enregistre la sortie**, **émet un événement** « SortieCréée », et rend la main en ~50 ms. Email, push, projection et audit réagissent **chacun de leur côté**, en asynchrone, avec reprise sur panne. À la fin de ce module, tu sais câbler exactement ça — et choisir, à chaque flèche, entre SQS, SNS et EventBridge.
 
 ---
 
-## Table des matières
+## 2. Théorie complète, concise
 
-1. [Introduction au messaging](#1-introduction-au-messaging)
-2. [SQS — Simple Queue Service](#2-sqs--simple-queue-service)
-3. [SNS — Simple Notification Service](#3-sns--simple-notification-service)
-4. [EventBridge](#4-eventbridge)
-5. [Comparaison SQS vs SNS vs EventBridge](#5-comparaison-sqs-vs-sns-vs-eventbridge)
-6. [Patterns d'architecture](#6-patterns-darchitecture)
-7. [TypeScript SDK v3](#7-typescript-sdk-v3)
-8. [Bonnes pratiques](#8-bonnes-pratiques)
-9. [Récapitulatif](#9-récapitulatif)
+### 2.1 Le point commun : découpler avec de l'asynchrone
 
----
+Un appel **synchrone** (`await autreService()`) crée un couplage temporel : l'appelant est bloqué et tombe si l'appelé tombe. Le messaging insère un **intermédiaire managé** entre producteur et consommateur : le producteur dépose le message et rend la main ; le consommateur le traite à son rythme. Trois services AWS, trois modèles :
 
-## 1. Introduction au messaging
+| Service | Modèle | En une phrase |
+|---------|--------|---------------|
+| **SQS** | file d'attente (queue) | un message → **un** consommateur le prend, le traite, le supprime |
+| **SNS** | publication/abonnement (pub/sub) | un message → **tous** les abonnés du topic en reçoivent une copie |
+| **EventBridge** | bus d'événements | un événement → routé vers des cibles selon des **règles** qui filtrent son **contenu** |
 
-### 1.1 Pourquoi le messaging ?
+### 2.2 SQS — la file d'attente
 
-Dans une architecture monolithique, les composants s'appellent directement (appels de fonction synchrones). Si un composant tombe, tout le système tombe. Le messaging introduit un **découplage asynchrone** entre les composants.
+Un **producteur** envoie un message dans la queue (`SendMessage`). Un **consommateur** le récupère (`ReceiveMessage`), le traite, puis le supprime (`DeleteMessage`). Tant qu'il n'est pas supprimé, le message reste dans la queue — rien n'est perdu si le consommateur plante.
 
-```
-Synchrone (couplé) :
-  API → Traitement → Email → Réponse au client (5s)
-
-Asynchrone (découplé) :
-  API → File d'attente → Réponse au client (200ms)
-                ↓
-          Worker → Email (en arrière-plan)
-```
-
-> **Analogie** : Le messaging, c'est comme le courrier postal. Au lieu de vous déplacer personnellement pour remettre un message (appel synchrone), vous le déposez dans une boîte aux lettres (queue). Le facteur (worker) le distribuera quand il sera disponible. Si le destinataire est absent, le courrier attend dans la boîte — rien n'est perdu.
-
-### 1.2 Les trois piliers du messaging AWS
-
-| Service | Modèle | Analogie |
-|---|---|---|
-| **SQS** | File d'attente (queue) | Boîte aux lettres : un seul destinataire |
-| **SNS** | Publication/abonnement (pub/sub) | Mégaphone : tous les abonnés reçoivent le message |
-| **EventBridge** | Bus d'événements (event bus) | Standard téléphonique intelligent : route selon le contenu |
-
----
-
-## 2. SQS — Simple Queue Service
-
-### 2.1 Concept
-
-SQS est une **file d'attente de messages** entièrement managée. Un producteur envoie un message dans la queue, un consommateur le récupère, le traite, puis le supprime.
-
-```
-Producteur → [SQS Queue] → Consommateur
-              message 1
-              message 2
-              message 3
-```
-
-### 2.2 Standard vs FIFO
+**Standard vs FIFO** (comparaison vérifiée sur la doc SQS) :
 
 | Caractéristique | Standard | FIFO |
-|---|---|---|
-| **Ordre** | Best-effort (pas garanti) | Strictement FIFO |
-| **Débit** | Illimité | 3 000 msg/s (avec batching) |
-| **Duplication** | Possible (at-least-once) | Exactement une fois (exactly-once) |
-| **Nom de la queue** | Libre | Doit finir par `.fifo` |
-| **Coût** | 0,40 $/million req | 0,50 $/million req |
-| **Cas d'usage** | Tâches en arrière-plan, déclencher des workers | Commandes e-commerce, transactions financières |
+|-----------------|----------|------|
+| **Ordre** | best-effort (non garanti) | strict FIFO garanti (par `message group ID`) |
+| **Livraison** | **at-least-once** — un message peut être livré **plus d'une fois** (doublons possibles) | **exactly-once** — déduplication intégrée |
+| **Débit** | illimité | jusqu'à **300 msg/s** sans batching, **3 000 msg/s** avec batching (mode high-throughput au-delà) |
+| **Nom de la queue** | libre | doit se terminer par **`.fifo`** |
 
-### 2.3 Cycle de vie d'un message
+Corollaire pédagogique majeur : sur une queue **standard**, ton consommateur **doit être idempotent** (traiter deux fois le même message sans double effet). La queue FIFO garantit l'ordre *dans un même* `message group ID` et déduplique via un `deduplication ID` (fenêtre de déduplication de 5 minutes).
 
-```
-1. Le producteur envoie un message → la queue le stocke
-2. Le consommateur appelle ReceiveMessage → le message devient "invisible"
-3. Le consommateur traite le message
-4. Le consommateur appelle DeleteMessage → le message est supprimé
-   (si pas supprimé avant le timeout → le message redevient visible)
-```
+### 2.3 Visibility timeout — le mécanisme central de SQS
 
-### 2.4 Visibility Timeout
+Quand un consommateur reçoit un message, celui-ci **reste dans la queue** mais devient **temporairement invisible** aux autres consommateurs : c'est le **visibility timeout** (doc SQS). Objectif : empêcher deux consommateurs de traiter le même message en parallèle.
 
-Le **Visibility Timeout** est la durée pendant laquelle un message est invisible aux autres consommateurs après avoir été reçu. Par défaut : **30 secondes**.
+- **Défaut : 30 secondes.** Le compte à rebours démarre **dès la livraison** du message.
+- Si le consommateur **traite puis supprime** (`DeleteMessage`) avant l'expiration → le message disparaît. Bien.
+- Si le consommateur **plante ou dépasse le délai** → le message **redevient visible** et un autre consommateur le reprend. C'est la reprise sur panne.
+- Règle : **cale le visibility timeout sur le temps max de traitement.** Trop court → un message lent est repris et traité en double. Trop long → un message raté met longtemps à réapparaître.
+- On peut l'allonger en cours de traitement avec `ChangeMessageVisibility` (pattern *heartbeat*), et le mettre à `0` pour rendre le message immédiatement visible. **Maximum : 12 heures** à partir de la première réception (l'allonger ne remet pas ce plafond à zéro).
+- Même avec un visibility timeout, le modèle **at-least-once** de SQS ne garantit **pas** qu'un message ne sera jamais livré deux fois → idempotence obligatoire côté consommateur.
 
-- Si le consommateur traite le message et le supprime avant le timeout → tout va bien
-- Si le consommateur plante → le message redevient visible et un autre consommateur le traite
-- Ajustez le timeout selon la durée de traitement de vos messages
+Les messages reçus mais pas encore supprimés sont dits **in-flight**. Une queue standard en supporte environ **120 000** simultanément ; au-delà, `ReceiveMessage` renvoie `OverLimit` (en short polling).
 
-```bash
-# Créer une queue avec un visibility timeout de 60 secondes
-aws sqs create-queue \
-  --queue-name order-processing \
-  --attributes VisibilityTimeout=60
-```
+### 2.4 Long polling vs short polling
 
-### 2.5 Dead Letter Queue (DLQ)
+`ReceiveMessage` peut attendre qu'un message arrive au lieu de répondre « vide » immédiatement :
 
-Quand un message échoue plusieurs fois (dépassement de `maxReceiveCount`), il est déplacé vers une **Dead Letter Queue**. Cela empêche les messages "poison pill" de bloquer la queue.
+- **Short polling** : réponse immédiate, même si la queue est vide → beaucoup de requêtes vides, plus coûteux.
+- **Long polling** (`WaitTimeSeconds` jusqu'à **20 s**) : la requête attend qu'un message arrive (ou 20 s) → moins de requêtes vides. **À activer par défaut.**
 
-```bash
-# Créer la DLQ
-aws sqs create-queue --queue-name order-processing-dlq
+### 2.5 Dead Letter Queue (DLQ) et redrive
 
-# Configurer la redrive policy sur la queue principale
-aws sqs set-queue-attributes \
-  --queue-url https://sqs.eu-west-1.amazonaws.com/123456789/order-processing \
-  --attributes '{
-    "RedrivePolicy": "{\"deadLetterTargetArn\":\"arn:aws:sqs:eu-west-1:123456789:order-processing-dlq\",\"maxReceiveCount\":\"3\"}"
-  }'
-```
+Un message « poison » (mal formé, qui fait toujours planter le consommateur) reviendrait indéfiniment après chaque visibility timeout, bloquant la queue. La **Dead Letter Queue** l'isole (doc SQS DLQ) :
 
-### 2.6 Long Polling vs Short Polling
+- Sur la queue source, on configure une **redrive policy** avec un **`maxReceiveCount`** : le nombre de fois qu'un message peut être reçu **sans être supprimé** avant d'être déplacé vers la DLQ. Ex. `maxReceiveCount = 3` → après 3 échecs, direction DLQ.
+- La DLQ sert au **debug** : on inspecte les messages non consommés pour comprendre *pourquoi* le traitement a échoué. On peut ensuite les **redrive** (renvoyer vers la source) une fois le bug corrigé.
+- Contraintes vérifiées : **la DLQ doit être dans le même compte et la même région** que la source, et **du même type** — une queue FIFO cible une DLQ FIFO, une standard une DLQ standard.
+- Bonne pratique : **rétention de la DLQ plus longue** que celle de la source (l'horodatage d'enqueue d'origine est conservé sur une queue standard), et **alarme CloudWatch** sur la profondeur de la DLQ — un message en DLQ = un problème à regarder.
 
-| Mode | Comportement | Coût |
-|---|---|---|
-| **Short Polling** (défaut) | Retourne immédiatement, même si la queue est vide | Plus de requêtes = plus cher |
-| **Long Polling** | Attend jusqu'à 20s qu'un message arrive | Moins de requêtes vides |
+### 2.6 SNS — publication / abonnement (fan-out)
 
-```bash
-# Activer le long polling (WaitTimeSeconds = 20)
-aws sqs receive-message \
-  --queue-url https://sqs.eu-west-1.amazonaws.com/123456789/order-processing \
-  --wait-time-seconds 20
-```
+SNS délivre des messages de **publishers** vers des **subscribers** de façon asynchrone via un **topic** (« logical access point and communication channel », doc SNS). Le publisher publie **une fois** ; **chaque abonné** reçoit sa copie. Types d'endpoints d'abonnement (doc SNS) : **Amazon SQS, Lambda, HTTP(S), email, mobile push, SMS, Amazon Data Firehose**, et certains fournisseurs tiers.
 
-### 2.7 Commandes CLI essentielles
+Le pattern phare est le **fan-out** : un message publié sur un topic est **répliqué** vers plusieurs endpoints (queues SQS, Lambda, HTTP…) pour un traitement **parallèle et asynchrone** (scénario « Fanout » de la doc SNS). En pratique, on branche **SNS → plusieurs queues SQS**, et chaque queue est consommée par sa propre Lambda. Chaque queue agit comme un **buffer indépendant** : si le service email est down, ses messages s'accumulent dans *sa* queue sans affecter le push ni la projection.
 
-```bash
-# Envoyer un message
-aws sqs send-message \
-  --queue-url https://sqs.eu-west-1.amazonaws.com/123456789/order-processing \
-  --message-body '{"orderId": "ord-001", "action": "process"}'
+**Filter policy** : par défaut un abonné reçoit **tous** les messages du topic. Une **filter policy** (JSON) sur l'abonnement fait que celui-ci ne reçoit **que** les messages correspondants — filtrage sur les **attributs** du message ou sur le **corps** JSON selon le `FilterPolicyScope` (doc SNS filtering).
 
-# Envoyer un message FIFO
-aws sqs send-message \
-  --queue-url https://sqs.eu-west-1.amazonaws.com/123456789/order-processing.fifo \
-  --message-body '{"orderId": "ord-001"}' \
-  --message-group-id "customer-42" \
-  --message-deduplication-id "ord-001-v1"
+**SNS FIFO** : comme SQS, SNS propose des topics **FIFO** (ordre + déduplication) conçus pour s'intégrer aux **queues SQS FIFO** — l'ordre strict de bout en bout n'est garanti que si les abonnés sont des queues **SQS FIFO** (doc SNS FIFO).
 
-# Purger une queue (supprimer tous les messages)
-aws sqs purge-queue \
-  --queue-url https://sqs.eu-west-1.amazonaws.com/123456789/order-processing
-```
+### 2.7 EventBridge — le bus d'événements
 
----
+EventBridge est un service **serverless** qui « uses events to connect application components together » (doc EventBridge). Un **event bus** est un routeur qui reçoit des **événements** et les délivre à zéro ou plusieurs **targets**, en fonction de **règles**.
 
-## 3. SNS — Simple Notification Service
+| Composant | Rôle |
+|-----------|------|
+| **Event bus** | canal qui reçoit les événements. **default bus** (événements des services AWS), **custom bus** (tes événements applicatifs), **partner bus** (SaaS tiers) |
+| **Rule** | associe un **event pattern** (ou une planification) à une ou plusieurs targets |
+| **Target** | destination : Lambda, SQS, SNS, Step Functions, autre bus… |
+| **Event pattern** | filtre **sur le contenu** de l'événement |
 
-### 3.1 Concept
-
-SNS est un service de **publication/abonnement** (pub/sub). Un éditeur publie un message sur un **topic**, et tous les **abonnés** du topic reçoivent le message.
-
-```
-Éditeur → [SNS Topic: order-events]
-              ├── Abonné 1 : SQS Queue (traitement)
-              ├── Abonné 2 : Lambda (email)
-              ├── Abonné 3 : HTTP endpoint (webhook)
-              └── Abonné 4 : Email (notification admin)
-```
-
-### 3.2 Types d'abonnés supportés
-
-| Protocole | Description |
-|---|---|
-| **SQS** | Envoie le message dans une queue |
-| **Lambda** | Invoque une fonction Lambda |
-| **HTTP/HTTPS** | Appelle un endpoint HTTP |
-| **Email** | Envoie un email (texte brut) |
-| **Email-JSON** | Envoie un email au format JSON |
-| **SMS** | Envoie un SMS |
-| **Kinesis Data Firehose** | Écrit dans un flux Firehose |
-
-### 3.3 Création d'un topic et abonnements
-
-```bash
-# Créer un topic
-aws sns create-topic --name order-events
-# → Retourne le TopicArn
-
-# Abonner une queue SQS
-aws sns subscribe \
-  --topic-arn arn:aws:sns:eu-west-1:123456789:order-events \
-  --protocol sqs \
-  --notification-endpoint arn:aws:sqs:eu-west-1:123456789:order-processing
-
-# Abonner une Lambda
-aws sns subscribe \
-  --topic-arn arn:aws:sns:eu-west-1:123456789:order-events \
-  --protocol lambda \
-  --notification-endpoint arn:aws:lambda:eu-west-1:123456789:function:send-email
-
-# Publier un message
-aws sns publish \
-  --topic-arn arn:aws:sns:eu-west-1:123456789:order-events \
-  --message '{"orderId": "ord-001", "status": "confirmed"}' \
-  --subject "Nouvelle commande"
-```
-
-### 3.4 Message Filtering
-
-SNS permet de filtrer les messages côté abonné grâce aux **filter policies**. Chaque abonné ne reçoit que les messages qui correspondent à sa politique de filtrage.
-
-```bash
-# L'abonné ne reçoit que les commandes de type "premium"
-aws sns set-subscription-attributes \
-  --subscription-arn arn:aws:sns:eu-west-1:123456789:order-events:sub-abc \
-  --attribute-name FilterPolicy \
-  --attribute-value '{"orderType": ["premium"]}'
-```
-
-### 3.5 SNS FIFO
-
-Comme SQS, SNS propose des topics **FIFO** qui garantissent l'ordre et la déduplication. Un topic SNS FIFO ne peut envoyer qu'à des queues SQS FIFO.
-
----
-
-## 4. EventBridge
-
-### 4.1 Concept
-
-EventBridge est un **bus d'événements serverless** qui route les événements selon des **règles** vers des **cibles**. C'est l'évolution de CloudWatch Events, avec un support natif pour les événements SaaS et les schémas.
-
-```
-Source d'événement → [Event Bus] → Règle 1 → Cible (Lambda)
-                                  → Règle 2 → Cible (SQS)
-                                  → Règle 3 → Cible (Step Functions)
-```
-
-> **Analogie** : EventBridge est comme un aiguillage ferroviaire intelligent. Les trains (événements) arrivent sur les voies, et l'aiguillage les dirige vers la bonne destination en fonction de leur contenu (type de marchandise, destination, priorité).
-
-### 4.2 Composants clés
-
-| Composant | Description |
-|---|---|
-| **Event Bus** | Canal qui reçoit les événements (default bus, custom bus, partner bus) |
-| **Rule** | Filtre qui matche les événements selon un pattern |
-| **Target** | Destination de l'événement (Lambda, SQS, SNS, Step Functions, etc.) |
-| **Schema** | Structure de l'événement (découverte automatique possible) |
-| **Archive** | Stockage d'événements pour replay |
-
-### 4.3 Structure d'un événement
+**Structure d'un événement** (doc EventBridge, format vérifié) :
 
 ```json
 {
   "version": "0",
-  "id": "12345678-1234-1234-1234-123456789012",
-  "source": "com.myapp.orders",
-  "detail-type": "OrderPlaced",
-  "account": "123456789012",
-  "time": "2025-03-14T10:30:00Z",
-  "region": "eu-west-1",
-  "detail": {
-    "orderId": "ord-001",
-    "customerId": "cust-42",
-    "total": 149.99,
-    "items": ["item-a", "item-b"]
-  }
+  "id": "6a7e8feb-b491-4cf7-a9f1-bf3703467718",
+  "detail-type": "OutingCreated",
+  "source": "tribuzen.outings",
+  "account": "111122223333",
+  "time": "2026-07-03T09:00:00Z",
+  "region": "eu-west-3",
+  "resources": [],
+  "detail": { "outingId": "out-42", "familyId": "fam-7", "startsAt": "2026-07-06T10:00:00Z" }
 }
 ```
 
-### 4.4 Création de règles
+Quand tu émets ton propre événement via **`PutEvents`**, tu fournis **`Source`**, **`DetailType`** et **`Detail`** ; `EventBusName` est optionnel (défaut : `default`). EventBridge génère automatiquement `version`, `id`, `time`, `account`, `region` (doc PutEvents).
 
-```bash
-# Créer un event bus custom
-aws events create-event-bus --name my-app-bus
-
-# Créer une règle qui matche les événements "OrderPlaced"
-aws events put-rule \
-  --name order-placed-rule \
-  --event-bus-name my-app-bus \
-  --event-pattern '{
-    "source": ["com.myapp.orders"],
-    "detail-type": ["OrderPlaced"]
-  }'
-
-# Ajouter une cible Lambda
-aws events put-targets \
-  --rule order-placed-rule \
-  --event-bus-name my-app-bus \
-  --targets '[{
-    "Id": "send-confirmation",
-    "Arn": "arn:aws:lambda:eu-west-1:123456789:function:send-order-confirmation"
-  }]'
-
-# Publier un événement
-aws events put-events \
-  --entries '[{
-    "Source": "com.myapp.orders",
-    "DetailType": "OrderPlaced",
-    "Detail": "{\"orderId\": \"ord-001\", \"total\": 149.99}",
-    "EventBusName": "my-app-bus"
-  }]'
-```
-
-### 4.5 Event Patterns avancés
+Un **event pattern** matche le contenu. Ex. « sorties créées dans le futur » :
 
 ```json
-// Commandes de plus de 100 € provenant de clients premium
 {
-  "source": ["com.myapp.orders"],
-  "detail-type": ["OrderPlaced"],
-  "detail": {
-    "total": [{ "numeric": [">", 100] }],
-    "customerTier": ["premium"]
-  }
+  "source": ["tribuzen.outings"],
+  "detail-type": ["OutingCreated"],
+  "detail": { "familyId": [{ "exists": true }] }
 }
 ```
 
-Opérateurs disponibles : `prefix`, `suffix`, `anything-but`, `numeric`, `exists`, `cidr`.
+EventBridge fournit aussi un **scheduler** (expressions `cron(...)` et `rate(...)`) pour les tâches planifiées — il remplace l'ancien CloudWatch Events.
 
-### 4.6 Scheduled Rules (CRON)
-
-EventBridge remplace CloudWatch Events pour les tâches planifiées :
-
-```bash
-# Exécuter une Lambda tous les jours à 8h UTC
-aws events put-rule \
-  --name daily-cleanup \
-  --schedule-expression "cron(0 8 * * ? *)"
-
-# Exécuter toutes les 5 minutes
-aws events put-rule \
-  --name health-check \
-  --schedule-expression "rate(5 minutes)"
-```
-
----
-
-## 5. Comparaison SQS vs SNS vs EventBridge
-
-| Critère | SQS | SNS | EventBridge |
-|---|---|---|---|
-| **Modèle** | Queue (point-to-point) | Pub/Sub (fan-out) | Event Bus (routage intelligent) |
-| **Consommateurs** | 1 consommateur par message | N abonnés par topic | N cibles par règle |
-| **Rétention** | Jusqu'à 14 jours | Pas de rétention | Archive + replay |
-| **Filtrage** | Côté consommateur | Filter policies (attributs) | Event patterns (contenu) |
-| **Ordre** | FIFO disponible | FIFO disponible | Best-effort |
-| **Latence** | ~10-50 ms | ~20-100 ms | ~500 ms |
-| **Intégrations natives** | Lambda, EC2 | Lambda, SQS, HTTP, Email | 20+ cibles AWS |
-| **Coût** | 0,40 $/M req | 0,50 $/M notifications | 1,00 $/M événements |
-| **Cas d'usage** | Workers, buffers, découplage | Notifications, fan-out | Event-driven, SaaS, CRON |
-
-### Arbre de décision
+### 2.8 Quand utiliser quoi — l'arbre de décision
 
 ```
 Besoin de découpler A et B ?
-  ├── Un seul consommateur → SQS
-  ├── Plusieurs consommateurs en même temps ?
-  │     ├── Filtrage simple par attributs → SNS + SQS
-  │     └── Filtrage avancé par contenu → EventBridge
-  └── Tâche planifiée (CRON) → EventBridge Scheduler
+├── Un seul consommateur, buffer/reprise/back-pressure ......... SQS
+├── Plusieurs consommateurs reçoivent le MÊME message ..........  SNS (fan-out),
+│     souvent SNS → plusieurs SQS (buffer par consommateur)
+└── Routage selon le CONTENU, écosystème événementiel,
+      événements de services AWS ou SaaS, planification CRON ....  EventBridge
 ```
+
+Repères de discrimination :
+
+- **SQS = tampon 1-vers-1.** Absorbe les pics, garantit la reprise, un consommateur par message.
+- **SNS = diffusion 1-vers-N.** Filtrage simple par **attributs**, latence faible, endpoints variés (email/SMS/push inclus).
+- **EventBridge = routage riche 1-vers-N** par **contenu**, avec catalogue de cibles AWS, intégrations SaaS, archive/replay et planification. Latence un peu plus élevée que SNS.
+
+Combinaison fréquente : **EventBridge** décide *quoi* réagit à un événement métier, et derrière chaque cible on met une **SQS** pour bufferiser le consommateur.
 
 ---
 
-## 6. Patterns d'architecture
+## 3. Worked examples
 
-### 6.1 Queue Worker Pattern
+### Exemple 1 — Fan-out « SortieCréée » : SNS → 3 queues SQS + DLQ (TribuZen)
 
-Le pattern le plus simple : une Lambda (ou un service) consomme les messages d'une queue SQS.
-
-```
-API Gateway → Lambda (API) → SQS Queue → Lambda (Worker)
-                                              ↓
-                                         Traitement lourd
-                                         (resize image, envoi email, etc.)
-```
-
-### 6.2 Fan-out Pattern (SNS + SQS)
-
-Un message unique est distribué à plusieurs consommateurs indépendants.
+On reprend le cas concret. La Lambda `postOuting` enregistre la sortie puis **publie un seul message** sur un topic SNS. Trois queues SQS y sont abonnées (email, push, projection), chacune consommée par sa Lambda, chacune protégée par une DLQ.
 
 ```
-Événement "CommandeConfirmée"
-    ↓
-  SNS Topic
-    ├── SQS → Lambda : Envoi email de confirmation
-    ├── SQS → Lambda : Mise à jour du stock
-    ├── SQS → Lambda : Envoi au système comptable
-    └── SQS → Lambda : Notification Slack
+postOuting (Lambda) ──publish──▶ SNS topic  tribuzen-outing-events
+                                     ├──▶ SQS  outing-email       ──▶ Lambda email      (+ DLQ)
+                                     ├──▶ SQS  outing-push        ──▶ Lambda push       (+ DLQ)
+                                     └──▶ SQS  outing-projection  ──▶ Lambda projection (+ DLQ)
 ```
 
-Chaque queue SQS agit comme un **buffer indépendant**. Si le service email tombe, les messages s'accumulent dans sa queue sans affecter les autres.
-
-### 6.3 Event-Driven Architecture (EventBridge)
-
-Architecture complète où chaque service émet des événements et réagit aux événements des autres.
-
-```
-Service Commandes → EventBridge ← Service Stock
-                         ↑↓
-                    Service Paiement
-                         ↑↓
-                    Service Notification
-```
-
-Chaque service est indépendant, communique via des événements, et peut être déployé, scalé et mis à jour séparément.
-
-### 6.4 Saga Pattern (SQS + SNS)
-
-Pour les transactions distribuées sans ACID global :
-
-```
-1. Service Commande → crée la commande (status: PENDING)
-2. → SQS → Service Paiement → débite le compte
-3.   → succès → SNS → Service Stock → réserve le stock
-4.     → succès → SNS → Service Commande → status: CONFIRMED
-4.     → échec  → SNS → Service Paiement → rembourse (compensation)
-```
-
----
-
-## 7. TypeScript SDK v3
-
-### 7.1 Installation
+**Étape 1 — créer le topic et les queues (AWS CLI) :**
 
 ```bash
-pnpm add @aws-sdk/client-sqs @aws-sdk/client-sns @aws-sdk/client-eventbridge
+# Topic SNS
+aws sns create-topic --name tribuzen-outing-events
+# → note le TopicArn renvoyé
+
+# Une queue par consommateur (ici la queue email)
+aws sqs create-queue --queue-name outing-email
+aws sqs create-queue --queue-name outing-email-dlq
 ```
 
-### 7.2 SQS — Envoyer et recevoir des messages
+**Étape 2 — brancher la DLQ sur la queue email (redrive policy, maxReceiveCount=3) :**
 
-```typescript
-import {
-  SQSClient,
-  SendMessageCommand,
-  ReceiveMessageCommand,
-  DeleteMessageCommand,
-} from '@aws-sdk/client-sqs'
-
-const sqs = new SQSClient({ region: 'eu-west-1' })
-const queueUrl = 'https://sqs.eu-west-1.amazonaws.com/123456789/order-processing'
-
-// Envoyer un message
-await sqs.send(new SendMessageCommand({
-  QueueUrl: queueUrl,
-  MessageBody: JSON.stringify({ orderId: 'ord-001', action: 'process' }),
-  DelaySeconds: 10, // délai de livraison optionnel
-  MessageAttributes: {
-    orderType: { DataType: 'String', StringValue: 'premium' },
-  },
-}))
-
-// Recevoir des messages (long polling)
-const { Messages } = await sqs.send(new ReceiveMessageCommand({
-  QueueUrl: queueUrl,
-  MaxNumberOfMessages: 10,
-  WaitTimeSeconds: 20,
-  MessageAttributeNames: ['All'],
-}))
-
-if (Messages) {
-  for (const msg of Messages) {
-    const body = JSON.parse(msg.Body!)
-    console.log('Traitement de la commande :', body.orderId)
-
-    // Supprimer le message après traitement
-    await sqs.send(new DeleteMessageCommand({
-      QueueUrl: queueUrl,
-      ReceiptHandle: msg.ReceiptHandle!,
-    }))
-  }
-}
+```bash
+aws sqs set-queue-attributes \
+  --queue-url https://sqs.eu-west-3.amazonaws.com/111122223333/outing-email \
+  --attributes '{
+    "RedrivePolicy": "{\"deadLetterTargetArn\":\"arn:aws:sqs:eu-west-3:111122223333:outing-email-dlq\",\"maxReceiveCount\":\"3\"}",
+    "VisibilityTimeout": "60"
+  }'
 ```
 
-### 7.3 SNS — Publier un message
+- `maxReceiveCount: 3` : après 3 réceptions **sans suppression**, le message part en DLQ (isole le message poison).
+- `VisibilityTimeout: 60` : cale l'invisibilité sur ~60 s, le temps qu'un envoi d'email lent aboutisse.
 
-```typescript
-import { SNSClient, PublishCommand } from '@aws-sdk/client-sns'
+**Étape 3 — abonner la queue au topic :**
 
-const sns = new SNSClient({ region: 'eu-west-1' })
-
-await sns.send(new PublishCommand({
-  TopicArn: 'arn:aws:sns:eu-west-1:123456789:order-events',
-  Message: JSON.stringify({
-    orderId: 'ord-001',
-    status: 'confirmed',
-    total: 149.99,
-  }),
-  MessageAttributes: {
-    orderType: { DataType: 'String', StringValue: 'premium' },
-  },
-}))
+```bash
+aws sns subscribe \
+  --topic-arn arn:aws:sns:eu-west-3:111122223333:tribuzen-outing-events \
+  --protocol sqs \
+  --notification-endpoint arn:aws:sqs:eu-west-3:111122223333:outing-email
 ```
 
-### 7.4 EventBridge — Émettre un événement
+(Il faut aussi une policy sur la queue autorisant le topic à y écrire — voir le lab.)
 
-```typescript
-import {
-  EventBridgeClient,
-  PutEventsCommand,
-} from '@aws-sdk/client-eventbridge'
+**Étape 4 — publier UN événement, vérifier qu'il arrive dans CHAQUE queue :**
 
-const eb = new EventBridgeClient({ region: 'eu-west-1' })
+```bash
+aws sns publish \
+  --topic-arn arn:aws:sns:eu-west-3:111122223333:tribuzen-outing-events \
+  --message '{"outingId":"out-42","familyId":"fam-7","startsAt":"2026-07-06T10:00:00Z"}'
 
-const result = await eb.send(new PutEventsCommand({
-  Entries: [
-    {
-      Source: 'com.myapp.orders',
-      DetailType: 'OrderPlaced',
-      Detail: JSON.stringify({
-        orderId: 'ord-001',
-        customerId: 'cust-42',
-        total: 149.99,
-      }),
-      EventBusName: 'my-app-bus',
-    },
-  ],
-}))
-
-console.log('Événements échoués :', result.FailedEntryCount)
+# Le même message est apparu dans les 3 queues :
+aws sqs receive-message \
+  --queue-url https://sqs.eu-west-3.amazonaws.com/111122223333/outing-email \
+  --wait-time-seconds 20
 ```
 
-### 7.5 Lambda handler pour SQS
+**Analyse.** La Lambda `postOuting` a fait **un seul** `publish` et rendu la main en ~50 ms. Le fan-out SNS a répliqué le message dans les trois queues. Si la Lambda email échoue 3 fois (SMTP down), son message tombe en DLQ **sans** toucher au push ni à la projection — les deux autres flux avancent normalement. C'est exactement le découplage que le cas concret réclamait.
 
-```typescript
-import type { SQSHandler } from 'aws-lambda'
+### Exemple 2 — Router le même événement métier avec EventBridge
 
-export const handler: SQSHandler = async (event) => {
-  const failedIds: string[] = []
+Autre approche du même besoin : au lieu de publier sur un topic dédié, `postOuting` émet un **événement métier** sur un **custom bus**, et des **règles** décident quelles cibles réagissent. Avantage : ajouter un nouveau consommateur = ajouter une **règle**, sans toucher au producteur.
 
-  for (const record of event.Records) {
-    try {
-      const body = JSON.parse(record.body)
-      console.log('Traitement :', body.orderId)
-      // ... logique métier
-    } catch (error) {
-      console.error('Échec pour le message :', record.messageId, error)
-      failedIds.push(record.messageId)
-    }
-  }
+```bash
+# 1. Bus custom
+aws events create-event-bus --name tribuzen-bus
 
-  // Partial batch failure : ne retente que les messages échoués
-  return {
-    batchItemFailures: failedIds.map((id) => ({
-      itemIdentifier: id,
-    })),
-  }
-}
+# 2. Règle : matcher les sorties créées
+aws events put-rule \
+  --name outing-created-rule \
+  --event-bus-name tribuzen-bus \
+  --event-pattern '{
+    "source": ["tribuzen.outings"],
+    "detail-type": ["OutingCreated"]
+  }'
+
+# 3. Cible : la Lambda de notification (Detail requis, Source/DetailType requis)
+aws events put-targets \
+  --rule outing-created-rule \
+  --event-bus-name tribuzen-bus \
+  --targets '[{"Id":"notify","Arn":"arn:aws:lambda:eu-west-3:111122223333:function:notify-family"}]'
+
+# 4. Émettre l'événement métier
+aws events put-events \
+  --entries '[{
+    "Source": "tribuzen.outings",
+    "DetailType": "OutingCreated",
+    "Detail": "{\"outingId\":\"out-42\",\"familyId\":\"fam-7\"}",
+    "EventBusName": "tribuzen-bus"
+  }]'
+```
+
+**Analyse.** `postOuting` ne connaît **aucun** consommateur : il émet `OutingCreated` sur le bus, point. La règle `outing-created-rule` matche le pattern et déclenche `notify-family`. Demain, si on veut aussi indexer la sortie dans un moteur de recherche, on ajoute une **deuxième règle** avec une cible SQS → nouvelle Lambda, **sans modifier le producteur**. C'est la différence clé avec SNS : EventBridge filtre sur le **contenu** (`detail.familyId`, `detail.startsAt`…) et route selon des règles, là où SNS diffuse à tous les abonnés (filtrés au mieux par attributs).
+
+---
+
+## 4. Pièges & misconceptions
+
+### PIÈGE #1 — Croire qu'une queue standard préserve l'ordre / ne double jamais
+
+Une queue **standard** est **best-effort** sur l'ordre et **at-least-once** sur la livraison : un message peut arriver **dans le désordre** et être livré **plusieurs fois**. Si ton traitement suppose l'ordre ou n'est pas idempotent, tu auras des bugs intermittents en prod. Solutions : rendre le consommateur **idempotent** (clé d'idempotence), ou passer en **FIFO** si l'ordre strict et l'exactly-once sont vraiment nécessaires (au prix du débit).
+
+### PIÈGE #2 — Régler le visibility timeout plus court que le traitement
+
+Si le traitement prend 90 s mais que le visibility timeout est à 30 s (le défaut), le message **redevient visible** à 30 s alors qu'il est encore en cours → un second consommateur le reprend, et tu traites **deux fois** le même message. Cale toujours le visibility timeout sur le **temps max** de traitement (ou allonge-le en vol via `ChangeMessageVisibility`).
+
+### PIÈGE #3 — Confondre SNS et EventBridge « parce que les deux font du 1-vers-N »
+
+- **SNS** : pub/sub, filtrage par **attributs** de message, endpoints A2P inclus (email, SMS, push), latence faible. On **s'abonne** à un topic.
+- **EventBridge** : bus qui route par **event pattern sur le contenu**, catalogue de cibles AWS, intégrations SaaS, archive/replay, planification. On écrit des **règles**.
+Choisir SNS quand tu veux juste diffuser vite à N abonnés (souvent des queues) ; EventBridge quand tu veux **router selon le contenu** et brancher/débrancher des consommateurs sans toucher au producteur.
+
+### PIÈGE #4 — Fan-out en abonnant directement des Lambdas au lieu de SNS→SQS→Lambda
+
+Abonner une **Lambda directement** à SNS marche, mais si la Lambda échoue, il n'y a **pas de buffer** : SNS retente selon sa propre politique puis abandonne (ou envoie à une DLQ SNS). Le pattern robuste est **SNS → SQS → Lambda** : la queue SQS **bufferise**, applique un **visibility timeout** et une **DLQ SQS**, et absorbe les pics. Buffer par consommateur = panne isolée.
+
+### PIÈGE #5 — Oublier la policy qui autorise SNS à écrire dans la queue SQS
+
+Abonner une queue à un topic ne suffit pas : il faut une **policy sur la queue SQS** avec un `Principal` `sns.amazonaws.com` et une `Condition` `aws:SourceArn` = ARN du topic. Sans elle, l'abonnement se crée mais **aucun message n'arrive** dans la queue (les livraisons échouent silencieusement). Symptôme classique : « j'ai publié, la queue reste vide ».
+
+### PIÈGE #6 — Utiliser une DLQ d'un autre type / région / compte
+
+La DLQ doit être **du même type** (FIFO↔FIFO, standard↔standard), dans le **même compte** et la **même région** que la source (doc SQS). Une DLQ standard sur une source FIFO, ou dans une autre région, est **refusée** ou ne reçoit rien. Et attention : mettre une DLQ sur une queue **FIFO** casse l'ordre strict des messages déplacés (à éviter si l'ordre est critique).
+
+---
+
+## 5. Ancrage TribuZen
+
+Le messaging est la colonne asynchrone de TribuZen : chaque événement métier (nouvelle sortie, nouveau message feed, invitation acceptée) est **émis une fois** et **consommé par plusieurs réactions indépendantes**.
+
+| Flux TribuZen | Service | Pourquoi ce choix |
+|---------------|---------|-------------------|
+| « SortieCréée » → email + push + projection + audit | **SNS fan-out → 4× SQS → 4× Lambda** | un événement, N consommateurs indépendants, buffer + DLQ par consommateur |
+| Envoi d'emails de rappel (traitement lourd, pics) | **SQS standard** | tampon 1-vers-1, reprise sur panne, back-pressure sur le SMTP |
+| Débit/crédit du « pot commun » famille (ordre critique) | **SQS FIFO** | ordre strict + exactly-once sur les opérations d'argent (`message group ID` = familyId) |
+| Routage des événements métier vers de nouveaux consommateurs sans toucher aux producteurs | **EventBridge** (`tribuzen-bus`) | règles + event pattern par contenu, brancher/débrancher sans redéploier le producteur |
+| Job planifié « rappel des sorties de demain, 18h » | **EventBridge Scheduler** (`cron`) | planification serverless native |
+
+Principes appliqués côté TribuZen :
+
+- **Aucun `await` synchrone** entre deux domaines métier : on émet un événement, on rend la main.
+- **Idempotence** systématique sur les consommateurs de queues standard (clé = `outingId` + type de réaction).
+- **DLQ + alarme CloudWatch** sur chaque queue : un message en DLQ déclenche une alerte.
+- Les ARN de topics/queues/bus seront produits par le **CDK** (module 05) et les roles des consommateurs suivent le **moindre privilège** (module 01) : la Lambda email n'a que `sqs:ReceiveMessage`/`DeleteMessage` sur *sa* queue.
+
+> L'**orchestration** d'un flux multi-étapes avec état et compensation (réserver → payer → confirmer, avec rollback) relève des **Step Functions** au **module 16** — ici, chaque réaction est indépendante et sans coordination centrale.
+
+---
+
+## 6. Points clés
+
+1. **SQS = file 1-vers-1** (buffer, reprise), **SNS = pub/sub 1-vers-N** (fan-out), **EventBridge = bus** qui route par contenu selon des règles.
+2. **SQS standard** = **at-least-once** (doublons possibles) + ordre **best-effort** → consommateur **idempotent** obligatoire ; **SQS FIFO** = **exactly-once** + ordre **strict** (nom en `.fifo`, `message group ID`, `deduplication ID`), débit limité (300/s, 3 000/s avec batching).
+3. **Visibility timeout** (défaut **30 s**, max **12 h**) rend un message invisible pendant le traitement ; s'il n'est pas supprimé à temps, il **redevient visible** → cale-le sur le temps de traitement.
+4. **DLQ** via **redrive policy** + **`maxReceiveCount`** isole les messages poison ; même **type/compte/région** que la source ; surveiller avec une alarme CloudWatch.
+5. **Long polling** (`WaitTimeSeconds` jusqu'à 20 s) réduit les requêtes vides — à activer par défaut.
+6. **Fan-out** robuste = **SNS → plusieurs SQS → plusieurs Lambda** : un buffer + une DLQ par consommateur, pannes isolées ; ne pas oublier la **policy** autorisant SNS à écrire dans la queue.
+7. **EventBridge** : `PutEvents` avec `Source`/`DetailType`/`Detail` requis ; **règle** + **event pattern** filtrent sur le **contenu** ; brancher un consommateur = ajouter une règle, sans toucher au producteur.
+8. **SNS FIFO** préserve l'ordre de bout en bout **seulement** avec des abonnés **SQS FIFO**.
+
+---
+
+## 7. Seeds Anki
+
+```
+SQS standard : quelles garanties d'ordre et de livraison, et quelle conséquence pour le consommateur ?|Ordre best-effort (non garanti) et livraison at-least-once (doublons possibles). Conséquence : le consommateur DOIT être idempotent.
+SQS FIFO vs standard : qu'apporte FIFO et à quel prix ?|FIFO garantit l'ordre strict (par message group ID) et l'exactly-once (déduplication via deduplication ID), au prix d'un débit limité (300 msg/s, 3 000 avec batching) et d'un nom finissant par .fifo.
+Visibility timeout SQS : valeur par défaut, effet, et que se passe-t-il si le message n'est pas supprimé à temps ?|Défaut 30 s (max 12 h). Le message devient invisible dès la réception pour éviter un double traitement. S'il n'est pas supprimé avant l'expiration, il redevient visible et un autre consommateur le reprend.
+À quoi sert une Dead Letter Queue et comment la déclenche-t-on ?|Elle isole les messages "poison" qui échouent en boucle. On configure une redrive policy avec maxReceiveCount sur la queue source : après ce nombre de réceptions sans suppression, le message part en DLQ. La DLQ doit être du même type/compte/région.
+Différence entre SNS et EventBridge alors que les deux diffusent en 1-vers-N ?|SNS = pub/sub, filtrage par attributs, endpoints variés (SQS, Lambda, email, SMS, push), latence faible, on s'abonne à un topic. EventBridge = bus qui route par event pattern sur le CONTENU, catalogue de cibles AWS, intégrations SaaS, archive/replay, planification ; on écrit des règles.
+Quel est le pattern de fan-out robuste et pourquoi pas abonner les Lambdas directement à SNS ?|SNS → plusieurs SQS → plusieurs Lambda. Chaque queue bufferise (visibility timeout + DLQ), isole les pannes et absorbe les pics. Abonner une Lambda directement à SNS n'offre pas ce buffer par consommateur.
+Quels champs sont requis quand on émet un événement EventBridge via PutEvents ?|Source, DetailType et Detail. EventBridge génère automatiquement version, id, time, account et region ; EventBusName est optionnel (défaut : default).
+On publie sur un topic SNS mais la queue SQS abonnée reste vide : cause la plus probable ?|Il manque la policy sur la queue SQS autorisant sns.amazonaws.com à y écrire (Principal SNS + Condition aws:SourceArn = ARN du topic). L'abonnement existe mais les livraisons échouent silencieusement.
 ```
 
 ---
 
-## 8. Bonnes pratiques
+## Pont vers le lab
 
-1. **Toujours ajouter une DLQ** sur vos queues SQS pour capturer les messages en échec
-2. **Activez le long polling** (`WaitTimeSeconds: 20`) pour réduire les coûts SQS
-3. **Utilisez le partial batch failure** dans vos Lambdas SQS pour ne retenter que les messages échoués
-4. **Préférez EventBridge** pour le routage basé sur le contenu des événements
-5. **Utilisez SNS + SQS** pour le fan-out avec buffer de rétention
-6. **Idempotence** : vos consommateurs doivent pouvoir traiter le même message 2 fois sans effet de bord
-7. **Surveillez les DLQ** avec des alarmes CloudWatch — un message en DLQ signale un problème
-8. **Limitez la taille des messages** : 256 Ko max pour SQS/SNS. Pour des payloads plus gros, stockez dans S3 et passez l'URL dans le message.
-
----
-
-## 9. Récapitulatif
-
-| Service | Modèle | Cas d'usage principal |
-|---|---|---|
-| **SQS Standard** | Queue, at-least-once | Découplage, workers, buffers |
-| **SQS FIFO** | Queue, exactly-once, ordonné | Transactions, commandes séquentielles |
-| **SNS** | Pub/Sub, fan-out | Notifications multi-abonnés |
-| **EventBridge** | Event Bus, routage intelligent | Architectures event-driven, CRON, SaaS |
-
-| Pattern | Services impliqués |
-|---|---|
-| Queue Worker | SQS → Lambda |
-| Fan-out | SNS → N x SQS → N x Lambda |
-| Event-driven | EventBridge → Lambda / SQS / Step Functions |
-| Saga (compensations) | SQS + SNS, orchestrées par Step Functions |
+> Lab associé : `labs/lab-10-messaging/README.md`. Tu crées un vrai topic SNS et deux vraies queues SQS (avec DLQ + visibility timeout), tu câbles le fan-out, tu publies au CLI et tu vérifies que le message arrive dans **chaque** queue — puis tu détruis tout (teardown, Free Tier). Corrigé complet, feedback coach, variante J+30.

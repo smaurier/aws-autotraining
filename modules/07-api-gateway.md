@@ -1,516 +1,337 @@
-# Module 07 — API Gateway — Construire et securiser des API REST
+---
+titre: API Gateway — exposer une Lambda en HTTP, sécurisée et throttlée
+cours: 12-aws-cloud
+notions: [REST API vs HTTP API, WebSocket API, routes et méthodes, ressource proxy, "intégration Lambda proxy (event + réponse)", "format de réponse (statusCode/headers/body string)", "502 Bad Gateway si réponse malformée", autoriseur IAM, "autoriseur JWT (HTTP API)", autoriseur Lambda, autoriseur Cognito, stages, "déploiement (REST) vs auto-deploy (HTTP)", variables de stage, throttling, "429 Too Many Requests", CORS]
+outcomes:
+  - sait choisir entre REST API et HTTP API selon les fonctionnalités réellement nécessaires
+  - sait exposer une fonction Lambda en HTTP via une intégration Lambda proxy et respecter le format de réponse attendu
+  - sait sécuriser une route avec le bon type d'autoriseur (IAM, JWT, Lambda, Cognito) sans confondre leurs usages
+  - sait raisonner sur les stages, le throttling par défaut et la configuration CORS d'une API
+prerequis: [Module 06 — Lambda serverless (handler, event, déploiement), notions HTTP/REST de base]
+next: 08-rds-elasticache
+libs: []
+tribuzen: API TribuZen — la couche HTTP qui expose les Lambda métier (poster un message de feed, lister les membres) au front, avec autorisation JWT et CORS
+last-reviewed: 2026-07
+---
 
-> **Objectif** : Comprendre les differents types d'API Gateway AWS, configurer des ressources, methodes et integrations, securiser les acces, gerer le throttling et les deploiements par stages.
+# API Gateway — exposer une Lambda en HTTP, sécurisée et throttlée
+
+> **Outcomes — tu sauras FAIRE :** choisir REST vs HTTP API, exposer une Lambda via intégration proxy, sécuriser une route avec le bon autoriseur, raisonner sur stages / throttling / CORS.
+> **Difficulté :** :star::star::star:
 >
-> **Difficulte** : ⭐⭐ (intermediaire)
->
-> **Prerequis** : Module 05 (Lambda), notions HTTP/REST basiques
->
-> **Duree** : 3h00
+> **Portée :** ce module couvre **API Gateway seul** — la porte HTTP devant tes fonctions. La **Lambda** elle-même (handler, event, cold start) est le module 06 : ici on la suppose déjà écrite et on l'expose. L'**autoriseur Cognito** est juste *nommé* ici ; les User Pools, les flows et l'émission des JWT sont détaillés au **module 11 (Cognito)**. On répond à une seule question : *comment transformer une Lambda en endpoint HTTP appelable, sécurisé et protégé contre les pics ?*
+
+## 1. Cas concret d'abord
+
+Au module 06, tu as écrit la Lambda `postFeedMessage` de TribuZen : elle prend un message de famille et l'écrit dans DynamoDB. Elle marche… mais **rien ne peut l'appeler**. Une Lambda n'a pas d'URL HTTP par défaut : le front Vue de TribuZen ne peut pas faire un `fetch('...')` dessus. Il lui faut une **porte d'entrée HTTP**.
+
+Ton premier réflexe pourrait être : « je génère une Function URL Lambda, ou j'expose la Lambda derrière un petit serveur Express ». Mais tu veux, en production :
+
+- une **URL stable** par environnement (`/dev`, `/prod`) ;
+- **valider le JWT** de l'utilisateur avant même d'exécuter la Lambda (pas de code d'auth dans chaque fonction) ;
+- **protéger le backend** si quelqu'un envoie 50 000 requêtes/seconde ;
+- autoriser le **front sur un autre domaine** à appeler l'API (CORS) ;
+- router `POST /messages` vers cette Lambda, `GET /members` vers une autre, sans réécrire la logique HTTP à chaque fois.
+
+C'est exactement le travail d'**API Gateway** : un service managé qui reçoit la requête HTTP, l'authentifie, la throttle, la route vers la bonne Lambda, et renvoie la réponse. À la fin de ce module, tu sais exposer `postFeedMessage` sur `POST /messages`, protégée par un autoriseur JWT et CORS, sur un stage `prod` — et tu sais *pourquoi* tu choisis une HTTP API plutôt qu'une REST API pour ce cas.
 
 ---
 
-## 1. Pourquoi API Gateway
+## 2. Théorie complète, concise
 
-### 1.1 Le probleme qu'il resout
+### 2.1 Trois produits sous un même nom
 
-Quand vous construisez des microservices ou des fonctions Lambda, chaque composant a besoin d'un point d'entree HTTP. Sans API Gateway, vous devriez :
+« API Gateway » regroupe trois types d'API distincts. On ne les mélange pas dans une même API :
 
-- Gerer vous-meme le routage HTTP
-- Implementer l'authentification dans chaque service
-- Gerer le rate limiting manuellement
-- Configurer CORS sur chaque endpoint
-- Deployer et versionner vos API sans outil dedie
+| Type | Protocole | Pour quoi |
+|------|-----------|-----------|
+| **REST API** | HTTP/HTTPS requête→réponse | API riches : validation de requête, API keys, usage plans, cache, WAF, endpoints privés/edge |
+| **HTTP API** | HTTP/HTTPS requête→réponse | API simples et bon marché : proxy vers Lambda, autoriseur JWT natif, moins de fonctionnalités |
+| **WebSocket API** | WebSocket (connexion persistante) | Temps réel bidirectionnel : chat, notifications push, présence |
 
-API Gateway agit comme une **porte d'entree unique** pour toutes vos API. Il recoit les requetes HTTP, les valide, les transforme si necessaire, et les transmet au bon service backend.
+REST API et HTTP API font le **même métier** (exposer du HTTP requête/réponse). La doc AWS le dit : « REST APIs support more features than HTTP APIs, while HTTP APIs are designed with minimal features so that they can be offered at a lower price. » Autrement dit : **HTTP API = moins cher, moins de fonctionnalités**. La WebSocket API est un cas à part (pas de requête/réponse classique, mais des *routes* déclenchées par des messages sur une connexion ouverte) — on ne l'utilise que pour le temps réel.
 
-> **Analogie** : API Gateway est comme le receptionniste d'un hotel. Il accueille tous les visiteurs (requetes), verifie leur identite (authentification), les oriente vers la bonne chambre (routage), et s'assure que l'hotel n'est pas surcharge (throttling).
+### 2.2 REST vs HTTP API — le tableau qui décide (vérifié doc AWS)
 
-### 1.2 Les trois types d'API Gateway
+C'est **le** point du module. Voici, d'après la doc officielle « Choose between REST APIs and HTTP APIs », les différences qui comptent :
 
-AWS propose trois types d'API Gateway, chacun avec ses cas d'usage :
+| Fonctionnalité | REST API | HTTP API |
+|----------------|:--------:|:--------:|
+| Intégration Lambda | oui | oui |
+| Autoriseur **IAM** (SigV4) | oui | oui |
+| Autoriseur **Lambda** (custom) | oui | oui |
+| Autoriseur **JWT** natif | **non** | **oui** |
+| Autoriseur **Cognito** | oui | oui (via l'autoriseur JWT) |
+| **Validation de requête** (JSON Schema) | oui | **non** |
+| **API keys** / usage plans / rate-limit par client | oui | **non** |
+| **Cache** de réponse | oui | **non** |
+| **WAF** (pare-feu applicatif) | oui | **non** |
+| Endpoints **edge-optimized** / **privés** | oui | **non** (Regional uniquement) |
+| **CORS** | oui | oui |
+| Déploiement | **manuel** (créer un déploiement) | **auto-deploy** possible |
+| X-Ray, execution logs, canary | oui | **non** |
 
-| Caracteristique | REST API | HTTP API | WebSocket API |
-|---|---|---|---|
-| **Protocole** | HTTP/HTTPS | HTTP/HTTPS | WebSocket |
-| **Cas d'usage** | API completes, entreprise | API simples, microservices | Temps reel, chat, notifications |
-| **Latence** | ~30ms | ~10ms | Connexion persistante |
-| **Cout** | $3.50/million requetes | $1.00/million requetes | $1.00/million messages |
-| **Fonctionnalites** | Completes | Essentielles | Bidirectionnel |
-| **Validation requete** | Oui | Non | Non |
-| **Usage plans/API keys** | Oui | Non | Non |
-| **Caching** | Oui | Non | Non |
+> **Règle de décision** : pars sur **HTTP API** par défaut (plus simple, moins cher, autoriseur JWT natif — idéal pour une Lambda derrière du Cognito). Bascule sur **REST API** *seulement si* tu as besoin d'une fonctionnalité de la colonne de gauche : API keys/usage plans, validation de requête, cache, WAF, ou endpoint privé/edge. Ne prends pas REST « par habitude » : tu paierais plus cher pour des fonctions que tu n'utilises pas.
 
-> **Regle de decision** : Utilisez **HTTP API** par defaut pour les nouvelles API (moins cher, plus rapide). Passez a **REST API** si vous avez besoin de validation de requetes, caching, usage plans ou API keys. Utilisez **WebSocket API** pour le temps reel.
+Piège de vocabulaire : l'autoriseur **JWT natif** n'existe **que** sur HTTP API. Sur REST API, pour valider un JWT tu passes soit par un **autoriseur Cognito** (si le token vient d'un User Pool), soit par un **autoriseur Lambda** que tu codes.
 
----
+### 2.3 L'anatomie d'une API : routes, méthodes, intégration
 
-## 2. Concepts fondamentaux (REST API)
-
-### 2.1 Ressources et methodes
-
-Une API REST dans API Gateway est organisee en **ressources** (les chemins URL) et **methodes** (les verbes HTTP).
-
-```
-/users                 ← Ressource
-  GET                  ← Methode (lister les utilisateurs)
-  POST                 ← Methode (creer un utilisateur)
-/users/{userId}        ← Ressource avec parametre de chemin
-  GET                  ← Methode (obtenir un utilisateur)
-  PUT                  ← Methode (modifier un utilisateur)
-  DELETE               ← Methode (supprimer un utilisateur)
-```
-
-Chaque methode sur une ressource forme un **endpoint**. Un endpoint est le couple `methode + ressource`, par exemple `GET /users/{userId}`.
-
-### 2.2 Le cycle de vie d'une requete
-
-Quand une requete arrive sur API Gateway, elle traverse quatre etapes :
+Une API expose des **routes** (chemins) associées à des **méthodes** HTTP. Le couple *méthode + chemin* est un **endpoint** :
 
 ```
-Client → [Method Request] → [Integration Request] → Backend
-Client ← [Method Response] ← [Integration Response] ← Backend
+POST   /messages          → Lambda postFeedMessage
+GET    /members           → Lambda listMembers
+GET    /members/{id}      → Lambda getMember      ({id} = paramètre de chemin)
 ```
 
-1. **Method Request** : validation de la requete (parametres, headers, body)
-2. **Integration Request** : transformation de la requete avant envoi au backend
-3. **Integration Response** : reception et transformation de la reponse du backend
-4. **Method Response** : formatage final de la reponse pour le client
+Chaque route pointe vers une **intégration** : le backend qui traite la requête. L'intégration la plus courante est une **fonction Lambda**. (D'autres intégrations existent : endpoint HTTP, service AWS direct, mock — hors périmètre ici.)
 
-### 2.3 Types d'integration
+Cas spécial, la **ressource proxy** : `ANY /{proxy+}` capte *toutes* les méthodes sur *tous* les sous-chemins et les envoie à une seule Lambda. Pratique pour faire tourner un routeur applicatif (Express/Fastify) dans une Lambda unique — mais tu perds le routage géré par la gateway.
 
-L'integration definit **quel backend** traite la requete et **comment** la requete lui est transmise.
+### 2.4 L'intégration Lambda proxy — le format à respecter
 
-| Type | Description | Cas d'usage |
-|---|---|---|
-| **Lambda** | Invoque une fonction Lambda | Le plus courant |
-| **Lambda Proxy** | Transmet la requete brute a Lambda | Recommande pour les nouveaux projets |
-| **HTTP** | Proxy vers un endpoint HTTP | API existante |
-| **HTTP Proxy** | Transmet la requete brute a un endpoint HTTP | Microservices |
-| **AWS Service** | Invoque directement un service AWS | SQS, DynamoDB, Step Functions |
-| **Mock** | Retourne une reponse fixe | Tests, prototypage |
+En **intégration Lambda proxy**, API Gateway ne transforme presque rien : il passe **toute la requête** à ta Lambda dans un objet `event`, et attend une réponse dans un **format précis**. C'est le mode par défaut recommandé (pas de mapping template à écrire).
 
----
-
-## 3. Lambda Proxy Integration (la star)
-
-### 3.1 Pourquoi c'est le choix par defaut
-
-L'integration Lambda Proxy est de loin la plus utilisee. Elle transmet **toute la requete HTTP** a votre fonction Lambda dans un format standardise, et attend une reponse dans un format precis.
-
-**Avantages** :
-- Pas besoin de configurer les mappings de requete/reponse
-- Votre Lambda recoit tout le contexte HTTP
-- Le routage peut etre gere cote Lambda (avec des frameworks comme Express via `aws-serverless-express`)
-
-### 3.2 Format de l'evenement recu par Lambda
+**Ce que ta Lambda reçoit** (`event`, champs utiles) :
 
 ```json
 {
-  "httpMethod": "GET",
-  "path": "/users/123",
-  "pathParameters": { "userId": "123" },
-  "queryStringParameters": { "fields": "name,email" },
-  "headers": {
-    "Content-Type": "application/json",
-    "Authorization": "Bearer eyJhbGc..."
-  },
-  "body": null,
+  "httpMethod": "POST",
+  "path": "/messages",
+  "pathParameters": { "id": "42" },
+  "queryStringParameters": { "limit": "20" },
+  "headers": { "Authorization": "Bearer eyJ...", "Content-Type": "application/json" },
+  "body": "{\"text\":\"Coucou la famille\"}",
   "isBase64Encoded": false,
-  "requestContext": {
-    "accountId": "123456789012",
-    "stage": "prod",
-    "requestId": "abc-123",
-    "identity": {
-      "sourceIp": "203.0.113.1"
-    }
-  }
+  "requestContext": { "stage": "prod", "requestId": "abc-123",
+                      "authorizer": { "claims": null } }
 }
 ```
 
-### 3.3 Format de la reponse attendue par API Gateway
+**Ce que ta Lambda DOIT renvoyer** (format de sortie, vérifié doc AWS) :
 
 ```json
 {
   "statusCode": 200,
-  "headers": {
-    "Content-Type": "application/json",
-    "Access-Control-Allow-Origin": "*"
-  },
-  "body": "{\"id\":\"123\",\"name\":\"Alice\"}"
+  "headers": { "Content-Type": "application/json" },
+  "body": "{\"id\":\"42\"}",
+  "isBase64Encoded": false
 }
 ```
 
-> **Attention** : Le champ `body` doit etre une **chaine de caracteres**, pas un objet JSON. Utilisez `JSON.stringify()` pour convertir votre objet en chaine.
+Trois règles non négociables :
 
-### 3.4 Exemple de handler Lambda
+1. **`body` est une chaîne**, pas un objet. Tu fais `JSON.stringify(monObjet)`. Renvoyer un objet brut ne marche pas.
+2. `statusCode` est **obligatoire**. `headers` et `isBase64Encoded` sont optionnels.
+3. **Si la réponse est mal formée** (pas de `statusCode`, mauvais type…), API Gateway renvoie au client une erreur **`502 Bad Gateway`** — pas l'erreur de ta Lambda. C'est le symptôme n°1 à reconnaître : *502 = ma Lambda a répondu dans le mauvais format*.
+
+Le `body` de la requête, lui aussi, arrive **en chaîne** : tu fais `JSON.parse(event.body)` (attention, `event.body` peut être `null`).
+
+### 2.5 Autorisation — quatre portiers, quatre usages
+
+L'autoriseur s'exécute **avant** ton intégration : si l'accès est refusé, ta Lambda n'est jamais invoquée. Quatre mécanismes, à ne pas confondre :
+
+| Autoriseur | Comment | Cas d'usage typique |
+|------------|---------|---------------------|
+| **IAM** (SigV4) | le client signe la requête avec des credentials AWS | appels **service-à-service** internes AWS |
+| **JWT** (HTTP API uniquement) | la gateway valide un JWT contre un émetteur OIDC (issuer + audience) | app web/mobile avec Cognito ou autre OIDC |
+| **Cognito** (REST API) | la gateway valide le token d'un **User Pool** Cognito | app avec Cognito, côté REST API |
+| **Lambda** (custom) | une Lambda que tu écris décide et renvoie une policy Allow/Deny | logique d'auth **sur mesure**, tokens tiers non-OIDC |
+
+Points clés :
+
+- **JWT vs Cognito** : ce sont deux implémentations du même besoin (« valide un token signé »). L'**autoriseur JWT** est natif **HTTP API** et marche avec n'importe quel émetteur OIDC (dont Cognito). L'**autoriseur Cognito** est le pendant côté **REST API**. Le détail du JWT (claims, expiration, User Pool) est le sujet du **module 11**.
+- **Autoriseur Lambda** : la fonction reçoit le token (ou toute la requête) et renvoie une **policy IAM** `Allow`/`Deny` sur `execute-api:Invoke`. Son résultat est **mis en cache** (TTL configurable) pour éviter de la rappeler à chaque requête.
+- **API keys ≠ authentification** : une API key (`x-api-key`, REST API seulement) sert à **identifier** un client pour le suivi d'usage et le quota, **pas** à l'authentifier. Ne jamais s'en servir comme unique barrière de sécurité.
+
+### 2.6 Stages et déploiement
+
+Un **stage** = un environnement déployé de l'API, avec sa propre URL :
+
+```
+https://abc123.execute-api.eu-west-3.amazonaws.com/dev
+https://abc123.execute-api.eu-west-3.amazonaws.com/prod
+```
+
+Différence **REST vs HTTP** sur le déploiement (vérifiée doc) :
+
+- **REST API** : les modifications ne sont **pas actives** tant que tu ne crées pas un **déploiement** vers le stage. Piège classique : « j'ai changé ma route mais rien ne bouge » → tu as oublié de re-déployer.
+- **HTTP API** : supporte l'**auto-deploy** — le stage `$default` publie automatiquement les changements.
+
+Les **variables de stage** (`event.requestContext` / config du stage) permettent des valeurs par environnement (ex. nom de table `feed-dev` vs `feed-prod`) sans dupliquer le code.
+
+### 2.7 Throttling — la protection par défaut
+
+API Gateway throttle avec l'algorithme du **token bucket** : un débit régulier (*rate*) + une capacité de rafale (*burst*). Quotas **par défaut, par compte et par région**, partagés entre **toutes** tes API (REST + HTTP + WebSocket) — vérifiés doc AWS :
+
+- **Rate** : **10 000 requêtes/seconde** (RPS).
+- **Burst** : capacité maximale du bucket de **5 000 requêtes**.
+- Le **burst** est fixé par le service AWS et **n'est pas modifiable** par le client. Le rate peut être augmenté sur demande au support.
+- Note régionale : quelques régions récentes (Le Cap, Milan, Jakarta, Spain, Zurich, UAE…) démarrent à **2 500 RPS / burst 1 250**.
+
+Quand le trafic dépasse rate+burst, la gateway renvoie **`429 Too Many Requests`**. Le client doit réagir avec un **exponential backoff** (attendre 1 s, 2 s, 4 s…). Tu peux resserrer les limites par **stage** ou par **méthode**, et — en **REST API seulement** — par client via un usage plan.
+
+> Ces limites sont des cibles « best-effort », pas des plafonds garantis au token près (dixit la doc).
+
+### 2.8 CORS — laisser le front d'un autre domaine appeler l'API
+
+Le navigateur bloque par défaut un appel *cross-origin* (front sur `app.tribuzen.com`, API sur `execute-api…`). **CORS** l'autorise via des en-têtes. Deux points :
+
+1. Le navigateur envoie d'abord une requête **préflight** `OPTIONS` pour les requêtes « non simples ». La gateway doit y répondre avec les bons en-têtes CORS.
+2. **Piège majeur en intégration Lambda proxy** : côté **REST API**, API Gateway n'ajoute **pas** automatiquement l'en-tête `Access-Control-Allow-Origin` sur tes réponses — **ta Lambda doit l'inclure elle-même** dans *chaque* réponse (y compris les erreurs). La doc AWS est explicite : « To enable CORS for the Lambda proxy integration, you must add `Access-Control-Allow-Origin` to the output `headers`. » Côté **HTTP API**, tu peux au contraire configurer le CORS **au niveau de l'API** (la gateway gère les en-têtes et le préflight pour toi).
+
+---
+
+## 3. Worked examples
+
+### Exemple 1 — Exposer `postFeedMessage` en HTTP API + le format de réponse
+
+Objectif : `POST /messages` → Lambda `postFeedMessage`, sur un stage `prod`, en **HTTP API** (choix par défaut : simple, JWT natif prévu pour plus tard).
+
+**Étape 1 — le raisonnement de choix.** Ai-je besoin d'API keys, de validation de requête, de cache, de WAF, d'endpoint privé ? Non. Ai-je besoin d'un autoriseur JWT natif (Cognito arrive au module 11) ? Oui. → **HTTP API**.
+
+**Étape 2 — le handler Lambda au bon format.** Le point le plus fragile : le `body` en entrée est une **chaîne**, et la réponse doit avoir `statusCode` + `body` **stringifié**.
 
 ```typescript
-export const handler = async (event: APIGatewayProxyEvent) => {
-  const userId = event.pathParameters?.userId;
+// handler de postFeedMessage — intégration Lambda proxy
+export const handler = async (event: {
+  body: string | null
+  requestContext: { stage: string }
+}) => {
+  // event.body arrive en STRING (ou null) → il faut le parser
+  const input = event.body ? JSON.parse(event.body) : {}
 
-  if (!userId) {
+  if (!input.text || typeof input.text !== 'string') {
+    // erreur client — on renvoie 400 SANS throw : format proxy respecté
     return {
       statusCode: 400,
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ error: 'userId is required' }),
-    };
+      body: JSON.stringify({ error: 'text is required' }),
+    }
   }
 
-  // Simuler une requete a une base de donnees
-  const user = { id: userId, name: 'Alice', email: 'alice@example.com' };
+  // ... écriture DynamoDB (module 06/09) ...
+  const created = { id: '42', text: input.text }
 
   return {
-    statusCode: 200,
+    statusCode: 201,
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(user),
-  };
-};
-```
-
----
-
-## 4. Validation de requetes
-
-### 4.1 Modeles de requete (REST API uniquement)
-
-REST API permet de valider les requetes **avant** qu'elles n'atteignent votre backend. Cela economise des invocations Lambda et protege votre API.
-
-Vous definissez un **modele JSON Schema** qui decrit la structure attendue :
-
-```json
-{
-  "$schema": "http://json-schema.org/draft-04/schema#",
-  "title": "CreateUserRequest",
-  "type": "object",
-  "required": ["name", "email"],
-  "properties": {
-    "name": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 100
-    },
-    "email": {
-      "type": "string",
-      "format": "email"
-    },
-    "age": {
-      "type": "integer",
-      "minimum": 0,
-      "maximum": 150
-    }
+    // body DOIT être une chaîne — stringify obligatoire
+    body: JSON.stringify(created),
   }
 }
 ```
 
-### 4.2 Niveaux de validation
-
-| Niveau | Valide le body | Valide les parametres |
-|---|---|---|
-| `NONE` | Non | Non |
-| `BODY_ONLY` | Oui | Non |
-| `PARAMS_ONLY` | Non | Oui (query string, headers, path) |
-| `FULL` | Oui | Oui |
-
-Si la validation echoue, API Gateway retourne automatiquement une erreur `400 Bad Request` sans invoquer votre Lambda.
-
----
-
-## 5. Stages et deploiement
-
-### 5.1 Concept de stage
-
-Un **stage** represente un environnement de deploiement de votre API. Chaque stage a sa propre URL :
-
-```
-https://abc123.execute-api.eu-west-1.amazonaws.com/dev
-https://abc123.execute-api.eu-west-1.amazonaws.com/staging
-https://abc123.execute-api.eu-west-1.amazonaws.com/prod
-```
-
-Les stages permettent de :
-- Deployer differentes versions de votre API
-- Configurer des variables d'environnement par stage
-- Activer le caching par stage
-- Configurer le throttling par stage
-
-### 5.2 Variables de stage
-
-Les variables de stage permettent de configurer des valeurs differentes selon l'environnement :
-
-```
-Stage: dev    → stageVariables.dbTable = "users-dev"
-Stage: prod   → stageVariables.dbTable = "users-prod"
-```
-
-Dans votre Lambda, vous accedez aux variables de stage via `event.stageVariables.dbTable`.
-
-### 5.3 Deploiement
-
-Pour que vos modifications soient visibles, vous devez **deployer** votre API vers un stage. Une API non deployee n'est pas accessible.
+**Étape 3 — appeler l'endpoint.**
 
 ```bash
-# Deployer l'API vers le stage "prod"
-aws apigateway create-deployment \
-  --rest-api-id abc123 \
-  --stage-name prod \
-  --description "Version 2.1 - ajout endpoint /orders"
+curl -X POST \
+  https://abc123.execute-api.eu-west-3.amazonaws.com/prod/messages \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"Coucou la famille"}'
+# → 201 {"id":"42","text":"Coucou la famille"}
 ```
 
-> **Piege courant** : Apres avoir modifie une ressource ou methode dans la console, n'oubliez pas de **re-deployer**. Sans deploiement, vos changements ne sont pas actifs.
+Si j'avais renvoyé `return created` (l'objet brut, sans `statusCode` ni `body` stringifié), le client recevrait **`502 Bad Gateway`** : la Lambda s'exécute correctement mais la gateway ne sait pas interpréter sa sortie. C'est *le* réflexe de diagnostic à ancrer.
+
+### Exemple 2 — Choisir l'autoriseur pour trois besoins différents
+
+Trois routes de TribuZen, trois autoriseurs :
+
+1. **`POST /messages`, appelée par le front après login Cognito.** Le front envoie `Authorization: Bearer <JWT Cognito>`. En **HTTP API** → **autoriseur JWT** natif : je configure l'*issuer* (l'URL du User Pool) et l'*audience* (le client ID). La gateway valide signature + expiration avant d'invoquer la Lambda. Zéro code d'auth dans `postFeedMessage`. (Le détail Cognito = module 11.)
+
+2. **`POST /internal/reindex`, appelée par une autre Lambda backend.** Pas d'utilisateur humain, appel service-à-service dans AWS → **autoriseur IAM** : l'appelant signe la requête en SigV4 avec son role. Aucun token à gérer.
+
+3. **`GET /partner/feed`, appelée par un partenaire B2B avec un token maison non-OIDC.** Ni Cognito, ni IAM → **autoriseur Lambda** : j'écris une fonction qui reçoit le token, le vérifie (base, service tiers), et renvoie une policy `Allow`/`Deny`. J'active un **cache** (TTL 300 s) pour ne pas la rappeler à chaque requête du même client.
+
+Erreur à éviter : vouloir un **autoriseur JWT sur une REST API**. Il n'existe pas côté REST — il faudrait un autoriseur **Cognito** (token de User Pool) ou **Lambda**. Le JWT natif est une exclusivité HTTP API.
 
 ---
 
-## 6. Autorisation et securite
+## 4. Pièges & misconceptions
 
-### 6.1 Les quatre methodes d'autorisation
+### PIÈGE #1 — Renvoyer un objet au lieu du format proxy → 502
 
-| Methode | Complexite | Cas d'usage |
-|---|---|---|
-| **IAM** | Faible | Appels service-a-service (AWS SDK) |
-| **Cognito User Pools** | Moyenne | Applications web/mobile avec inscription |
-| **Lambda Authorizer** | Elevee | Logique d'auth personnalisee, tokens tiers |
-| **API Keys** | Faible | Identification (pas authentification !) |
+En intégration Lambda proxy, `return { id: 42 }` **n'est pas** une réponse valide. Il faut `{ statusCode, headers?, body: JSON.stringify(...) }`, avec `body` **en chaîne**. Une sortie malformée → **`502 Bad Gateway`** renvoyé au client (pas l'erreur de ta Lambda). Règle mnémo : *502 en Lambda proxy = format de réponse cassé*.
 
-### 6.2 Autorisation IAM
+### PIÈGE #2 — Croire que HTTP API a un autoriseur JWT ET que REST API aussi
 
-L'autorisation IAM utilise les credentials AWS (Signature V4) pour authentifier les appels. Ideal pour les appels entre services AWS.
+L'**autoriseur JWT natif** n'existe **que** sur **HTTP API**. Sur **REST API**, pour valider un JWT : autoriseur **Cognito** (token de User Pool) ou autoriseur **Lambda**. Choisir REST API « parce qu'on veut du JWT » est un contresens : c'est justement HTTP API qui l'offre nativement.
 
-```bash
-# Appel avec Signature V4 via AWS CLI
-aws apigateway test-invoke-method \
-  --rest-api-id abc123 \
-  --resource-id xyz789 \
-  --http-method GET
-```
+### PIÈGE #3 — Prendre REST API « par défaut »
 
-### 6.3 Cognito Authorizer
+REST API coûte plus cher et n'apporte que si tu utilises ses fonctions exclusives (API keys/usage plans, validation de requête, cache, WAF, endpoint privé/edge, X-Ray). Sans ce besoin, **HTTP API** est le bon défaut. Inversement, choisir HTTP API alors que tu as besoin d'API keys ou de validation de requête = tu ne les auras **pas** (indisponibles sur HTTP API).
 
-Cognito Authorizer valide automatiquement les tokens JWT emis par un User Pool Cognito :
+### PIÈGE #4 — Oublier de re-déployer une REST API
 
-```
-Client → [JWT token dans Authorization header]
-       → API Gateway → [Valide le token avec Cognito]
-                     → Lambda (si token valide)
-                     → 401 Unauthorized (si token invalide)
-```
+Sur **REST API**, modifier une route/méthode ne suffit pas : tant que tu ne crées pas un **déploiement** vers le stage, le changement n'est pas actif (« ça ne bouge pas »). Sur **HTTP API**, l'**auto-deploy** du stage `$default` évite ce piège. Ne pas généraliser le comportement de l'un à l'autre.
 
-Aucun code d'autorisation a ecrire — API Gateway gere tout.
+### PIÈGE #5 — Compter sur la gateway pour les en-têtes CORS en Lambda proxy (REST)
 
-### 6.4 Lambda Authorizer
+En **REST API** + Lambda proxy, la gateway **n'injecte pas** `Access-Control-Allow-Origin` : ta Lambda doit l'ajouter dans **chaque** réponse, erreurs comprises. Symptôme : ça marche en `curl` mais le navigateur bloque avec une erreur CORS. En **HTTP API**, on configure le CORS au niveau de l'API et la gateway s'en charge — ne pas confondre les deux modèles.
 
-Un Lambda Authorizer est une fonction Lambda dediee qui recoit le token (ou les parametres de requete) et retourne une **policy IAM** indiquant si l'acces est autorise.
+### PIÈGE #6 — Confondre API key et authentification
 
-Deux types :
-- **Token-based** : recoit un token (header Authorization)
-- **Request-based** : recoit les headers, query string, stage variables, context
+Une **API key** (`x-api-key`, REST API seulement) **identifie** un client pour l'usage plan / le quota. Elle **n'authentifie pas** et ne protège pas une API à elle seule. La sécurité vient de l'autoriseur (IAM/JWT/Cognito/Lambda), pas de la clé.
 
-```typescript
-// Lambda Authorizer simplifie
-export const handler = async (event: any) => {
-  const token = event.authorizationToken; // "Bearer xxx"
+### PIÈGE #7 — Croire que le throttling est par API
 
-  // Verifier le token (ex: JWT, base de donnees, service externe)
-  const isValid = await verifyToken(token);
-
-  if (!isValid) {
-    throw new Error('Unauthorized'); // Retourne 401
-  }
-
-  return {
-    principalId: 'user123',
-    policyDocument: {
-      Version: '2012-10-17',
-      Statement: [{
-        Action: 'execute-api:Invoke',
-        Effect: 'Allow',
-        Resource: event.methodArn,
-      }],
-    },
-  };
-};
-```
-
-> **Optimisation** : Les resultats du Lambda Authorizer peuvent etre mis en cache (TTL configurable). Un TTL de 300 secondes reduit considerablement le nombre d'invocations.
+Le quota par défaut (**10 000 RPS, burst 5 000**) est **par compte et par région**, **partagé** entre toutes tes API. Une API bruyante peut throttler les autres. Pour isoler, on configure des limites par **stage/méthode** (et par client via usage plan en REST API). Le **burst n'est pas modifiable** par le client.
 
 ---
 
-## 7. Throttling et quotas
+## 5. Ancrage TribuZen
 
-### 7.1 Limites par defaut
+API Gateway est la **couche HTTP** de TribuZen : tout ce que le front Vue appelle passe par elle avant d'atteindre une Lambda.
 
-API Gateway protege vos backends contre les pics de trafic :
+| Route TribuZen | Type d'API | Intégration | Autoriseur | Note |
+|----------------|-----------|-------------|------------|------|
+| `POST /messages` | HTTP API | Lambda `postFeedMessage` | JWT (Cognito, module 11) | body parsé, réponse 201 stringifiée |
+| `GET /members` | HTTP API | Lambda `listMembers` | JWT | CORS configuré au niveau API |
+| `GET /members/{id}` | HTTP API | Lambda `getMember` | JWT | `{id}` en `pathParameters` |
+| `POST /internal/reindex` | HTTP API | Lambda backend | IAM (SigV4) | service-à-service, pas d'humain |
 
-| Limite | Valeur par defaut |
-|---|---|
-| **Steady-state rate** | 10 000 requetes/seconde |
-| **Burst** | 5 000 requetes |
-| **Par compte/region** | Partage entre toutes les API |
+Décisions d'architecture pour TribuZen :
 
-### 7.2 Throttling a plusieurs niveaux
+- **HTTP API par défaut** : TribuZen n'a besoin ni d'API keys, ni de validation JSON Schema côté gateway (la validation applicative est dans la Lambda), ni de cache, ni de WAF au lancement → HTTP API, moins cher, autoriseur **JWT** natif branché sur Cognito.
+- **CORS au niveau de l'API** (avantage HTTP API) : le front `app.tribuzen.com` est autorisé une fois, la gateway gère le préflight `OPTIONS`.
+- **Stages `dev` et `prod`**, chacun sa table DynamoDB via variables de stage ; l'**auto-deploy** du stage évite le piège du re-déploiement.
+- **Throttling** : les limites par défaut suffisent au lancement ; en cas de campagne, on resserre par stage.
+- L'API, les routes, l'intégration Lambda et l'autoriseur seront **définis en CDK** (module 05), pas cliqués à la main — la console sert à comprendre, le CDK à produire.
 
-```
-Compte (global) → API → Stage → Methode
-```
-
-Vous pouvez configurer des limites a chaque niveau. Le throttling le plus restrictif s'applique.
-
-### 7.3 Reponse en cas de throttling
-
-Quand le throttling s'active, API Gateway retourne :
-
-```
-HTTP 429 Too Many Requests
-```
-
-Le client devrait implementer un **exponential backoff** : attendre 1s, puis 2s, puis 4s, etc.
+> Le JWT lui-même (User Pool, claims, expiration, refresh) relève du **module 11 (Cognito)** ; ici la gateway ne fait que *valider* le token que Cognito a émis. Le WAF devant l'API et le chiffrement relèvent du **module 15**.
 
 ---
 
-## 8. CORS (Cross-Origin Resource Sharing)
+## 6. Points clés
 
-### 8.1 Le probleme CORS
-
-Quand votre frontend (sur `https://app.example.com`) appelle votre API (sur `https://api.example.com`), le navigateur bloque la requete par defaut. C'est la politique de **same-origin**.
-
-CORS permet d'autoriser ces appels cross-origin en ajoutant des headers specifiques.
-
-### 8.2 Configuration CORS sur API Gateway
-
-Pour activer CORS, vous devez configurer deux choses :
-
-1. **Reponse OPTIONS (preflight)** : API Gateway repond automatiquement aux requetes OPTIONS
-2. **Headers CORS dans vos reponses** : Votre Lambda doit inclure les headers CORS
-
-```typescript
-// Headers CORS a inclure dans chaque reponse Lambda
-const corsHeaders = {
-  'Access-Control-Allow-Origin': 'https://app.example.com',
-  'Access-Control-Allow-Headers': 'Content-Type,Authorization',
-  'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS',
-};
-
-return {
-  statusCode: 200,
-  headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-  body: JSON.stringify(data),
-};
-```
-
-> **Piege** : Avec Lambda Proxy Integration, API Gateway ne peut **pas** ajouter automatiquement les headers CORS. C'est a votre Lambda de les inclure dans chaque reponse, y compris les reponses d'erreur.
+1. **API Gateway** = porte HTTP managée devant tes backends : reçoit, authentifie, throttle, route vers une Lambda, renvoie la réponse.
+2. Trois types : **REST API** (riche), **HTTP API** (simple, moins cher), **WebSocket API** (temps réel). REST et HTTP font le même métier requête/réponse.
+3. **REST vs HTTP** : API keys, validation de requête, cache, WAF, endpoint privé/edge, X-Ray = **REST seulement**. Autoriseur **JWT natif** = **HTTP seulement**. Défaut = HTTP API, REST si besoin d'une de ses fonctions exclusives.
+4. **Intégration Lambda proxy** : la Lambda reçoit tout l'`event`, `body` en chaîne ; elle **doit** renvoyer `{ statusCode, headers?, body: JSON.stringify(...) }`. Réponse malformée → **`502 Bad Gateway`**.
+5. **Autoriseurs** : IAM (service-à-service), JWT (HTTP API, OIDC/Cognito), Cognito (REST API), Lambda (custom, résultat caché). API key = identification, **pas** authentification.
+6. **Stages** = environnements avec URL propre. REST : **re-déployer** pour activer un changement ; HTTP : **auto-deploy**.
+7. **Throttling** par défaut : **10 000 RPS / burst 5 000**, par compte+région, partagé entre toutes les API ; dépassement → **`429 Too Many Requests`** (client : exponential backoff).
+8. **CORS** : en REST API + Lambda proxy, **la Lambda** ajoute `Access-Control-Allow-Origin` sur chaque réponse ; en HTTP API, on configure le CORS au niveau de l'API.
 
 ---
 
-## 9. Usage Plans et API Keys
-
-### 9.1 API Keys
-
-Les API Keys sont des identifiants que vos clients envoient dans le header `x-api-key`. Elles servent a **identifier** qui appelle votre API, pas a **authentifier**.
-
-> **Important** : Les API Keys ne remplacent pas l'authentification. Elles sont utiles pour le tracking d'usage, le throttling par client, et la facturation.
-
-### 9.2 Usage Plans
-
-Un Usage Plan lie des API Keys a des limites d'utilisation :
+## 7. Seeds Anki
 
 ```
-Usage Plan "Free"
-  - Rate: 10 req/s
-  - Burst: 20 req
-  - Quota: 1000 req/mois
-
-Usage Plan "Pro"
-  - Rate: 100 req/s
-  - Burst: 200 req
-  - Quota: 100 000 req/mois
-```
-
-### 9.3 Flux complet
-
-```
-Client envoie x-api-key → API Gateway verifie la cle
-  → Identifie le Usage Plan
-  → Verifie le throttling (rate/burst)
-  → Verifie le quota (mensuel)
-  → Transmet au backend si OK
-  → 429 si throttled, 403 si quota depasse
+API Gateway : quelle règle pour choisir entre REST API et HTTP API ?|HTTP API par défaut (plus simple, moins cher, autoriseur JWT natif). REST API seulement si besoin d'une de ses fonctions exclusives : API keys/usage plans, validation de requête, cache, WAF, endpoint privé/edge, X-Ray.
+En intégration Lambda proxy, quel est le format de réponse obligatoire et que se passe-t-il s'il est mal formé ?|La Lambda doit renvoyer { statusCode, headers?, body } avec body en CHAÎNE (JSON.stringify). Si la sortie est malformée (ex. objet brut sans statusCode), API Gateway renvoie 502 Bad Gateway au client.
+Quel type d'autoriseur JWT natif existe, et sur quel type d'API uniquement ?|L'autoriseur JWT natif existe uniquement sur HTTP API. Sur REST API, pour valider un JWT il faut un autoriseur Cognito (token de User Pool) ou un autoriseur Lambda.
+Quels sont les quatre autoriseurs d'API Gateway et leur usage ?|IAM (SigV4, service-à-service) ; JWT (HTTP API, OIDC/Cognito) ; Cognito (REST API, User Pool) ; Lambda (logique custom, renvoie une policy Allow/Deny, résultat mis en cache).
+Différence de déploiement entre REST API et HTTP API ?|REST API : un changement n'est actif qu'après création d'un déploiement vers le stage (piège du "ça ne bouge pas"). HTTP API : auto-deploy du stage $default, changements publiés automatiquement.
+Quelles sont les limites de throttling par défaut et le code renvoyé en cas de dépassement ?|10 000 RPS de rate + burst (bucket) de 5 000, par compte et par région, partagés entre toutes les API. Dépassement → 429 Too Many Requests ; le client doit faire de l'exponential backoff. Le burst n'est pas modifiable par le client.
+En Lambda proxy REST API, qui doit ajouter les en-têtes CORS ?|La Lambda elle-même doit inclure Access-Control-Allow-Origin dans chaque réponse (erreurs comprises) ; la gateway ne l'ajoute pas automatiquement. En HTTP API, on configure le CORS au niveau de l'API.
+Une API key protège-t-elle une API ? Sur quel type d'API existe-t-elle ?|Non : une API key (x-api-key, REST API uniquement) sert à identifier un client pour l'usage plan / le quota, pas à l'authentifier. La sécurité vient de l'autoriseur (IAM/JWT/Cognito/Lambda).
 ```
 
 ---
 
-## 10. Custom Domains
+## Pont vers le lab
 
-### 10.1 Pourquoi un domaine personnalise
-
-Les URL par defaut d'API Gateway sont peu pratiques :
-```
-https://abc123.execute-api.eu-west-1.amazonaws.com/prod
-```
-
-Avec un custom domain :
-```
-https://api.monapp.com
-```
-
-### 10.2 Configuration
-
-1. **Certificat SSL** : Creer un certificat dans AWS Certificate Manager (ACM)
-2. **Custom Domain** : Configurer dans API Gateway
-3. **Base Path Mapping** : Associer le domaine a un stage de votre API
-4. **DNS** : Creer un enregistrement CNAME/A pointant vers le domaine API Gateway
-
-```
-api.monapp.com → CNAME → d-abc123.execute-api.eu-west-1.amazonaws.com
-```
-
-### 10.3 Types d'endpoints
-
-| Type | Latence | Certificat |
-|---|---|---|
-| **Edge-optimized** | Basse (via CloudFront) | us-east-1 uniquement |
-| **Regional** | Variable | Meme region que l'API |
-| **Private** | Interne VPC | Meme region |
-
----
-
-## 11. Bonnes pratiques
-
-### 11.1 Architecture
-
-- Utilisez **HTTP API** par defaut, REST API seulement si vous avez besoin de ses fonctionnalites specifiques
-- Preferez **Lambda Proxy Integration** pour sa simplicite
-- Activez la **validation de requetes** cote API Gateway pour economiser des invocations Lambda
-- Utilisez des **stages** pour separer vos environnements (dev, staging, prod)
-
-### 11.2 Securite
-
-- Ne comptez **jamais** sur les API Keys seules pour l'authentification
-- Activez le **throttling** pour proteger vos backends
-- Utilisez des **Lambda Authorizers** avec cache pour les tokens personnalises
-- Activez les **logs d'acces** pour le monitoring
-
-### 11.3 Performance
-
-- Activez le **caching** (REST API) pour les endpoints peu dynamiques
-- Utilisez le **edge-optimized endpoint** si vos clients sont distribues geographiquement
-- Configurez le **TTL du Lambda Authorizer** pour eviter les appels repetitifs
-
----
-
-## 12. Recapitulatif
-
-| Concept | A retenir |
-|---|---|
-| **REST vs HTTP API** | HTTP API = moins cher, plus rapide. REST API = plus de fonctionnalites |
-| **Lambda Proxy** | Transmet la requete brute, body en string JSON dans la reponse |
-| **Validation** | REST API uniquement, economise des invocations Lambda |
-| **Stages** | Un stage = un environnement, avec sa propre URL et config |
-| **Authorizers** | IAM (service-a-service), Cognito (JWT), Lambda (custom) |
-| **Throttling** | 10k req/s par defaut, configurable par methode |
-| **CORS** | Avec Lambda Proxy, les headers CORS sont dans la reponse Lambda |
-| **API Keys** | Identification, pas authentification |
-| **Custom Domains** | Certificat ACM + CNAME DNS |
-
----
-
-> **Prochain module** : [Module 07 — DynamoDB](./07-dynamodb.md) — Vous apprendrez a stocker et requeter des donnees avec la base NoSQL serverless d'AWS.
+> Lab associé : `labs/lab-07-api-gateway/README.md`. Tu déploies une **vraie** HTTP API devant une **vraie** Lambda (AWS CLI + Console), tu appelles l'endpoint au `curl`, tu provoques puis corriges un **502** de format, tu observes le CORS — puis tu **détruis tout** (teardown, Free Tier). Corrigé complet, feedback coach, variante J+30.
