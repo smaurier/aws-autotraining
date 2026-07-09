@@ -167,7 +167,7 @@ aws iam create-role \
 
 ### 2. Le workflow — `.github/workflows/deploy.yml`
 
-Les `${{ ... }}` (contextes GitHub Actions) restent **dans ce bloc de code** — ils ne s'exécutent qu'à l'intérieur du runner.
+Les <code v-pre>${{ ... }}</code> (contextes GitHub Actions) restent **dans ce bloc de code** — ils ne s'exécutent qu'à l'intérieur du runner.
 
 ```yaml
 # .github/workflows/deploy.yml

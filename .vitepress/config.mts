@@ -8,13 +8,9 @@ export default defineConfig({
 
   // Docs statiques : neutralise l'interpolation Vue `{{ }}` en prose (et les `${{ }}`
   // GitHub Actions dans les labs CI/CD) pour ne pas casser le build SSR.
-  vue: {
-    template: {
-      compilerOptions: {
-        delimiters: ['(%(', ')%)'],
-      },
-    },
-  },
+  // NB : override `delimiters` retiré (il cassait le {{ }} du thème par défaut).
+  // cf docs/curriculum/DETTE-vitepress-delimiters.md
+
 
   // Refonte v1 : le cours vit dans modules/ + labs/. Anciens quizzes/screencasts = archive.
   srcExclude: ['quizzes/**', 'screencasts/**'],
