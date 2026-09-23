@@ -1,0 +1,10 @@
+{
+  "name": "tribuzen-api-lambda",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "API TribuZen minimale (familles), Postgres via pg, packagée pour AWS Lambda derrière API Gateway HTTP.",
+  "dependencies": {
+    "pg": "^8.13.1"
+  }
+}
